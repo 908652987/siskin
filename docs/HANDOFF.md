@@ -87,7 +87,6 @@ docs/
   SPIKE-REPORT.md          验证报告与实测数据
   IMPLEMENTATION.md        第一段实现说明与缺口
   CONVENTIONS.md           代码风格与工程约定（人读细则）
-  SUBTASK-BRIEF.md         子任务入口（派发子代理时使用）
   HANDOFF.md               本文件
 ```
 
@@ -231,7 +230,8 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 | 层 | 文件 | 作用 |
 |---|---|---|
 | 代理入口 | `AGENTS.md` | 每次会话自动加载：必读顺序、开发思路、目录边界、红线 |
-| 子任务入口 | `docs/SUBTASK-BRIEF.md` | 派发子代理时在任务上下文里点名，避免规则漂移 |
+| 子任务入口 | `SUBTASK-BRIEF.md` | 由 `.omp/config.yml` 作为额外上下文自动加载 |
+| 子代理硬规则 | `.omp/RULES.md` | sticky，子代理也会收到（AGENTS.md 会被 OMP 按文件名过滤掉） |
 | 人读细则 | `docs/CONVENTIONS.md` | 命名、错误处理、异步、数据层、测试、依赖政策、反例 |
 | 工具强制 | `rustfmt.toml`、`[workspace.lints]`、`.editorconfig` | 格式与 lint 基线 |
 | CI | `.github/workflows/ci.yml` | fmt 检查 + clippy `-D warnings` + 全量测试 |
@@ -239,4 +239,6 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 - 分支：`main`；提交信息用英文祈使句，说明“做了什么 + 为什么”。
 - 生成物不入库：`target/`、`spike/data/`、`spike/ffi-probe/gen*`、`*.db*`、spike 编译出的可执行文件。
 - 提交前跑：`cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`。
-- 派发子任务时，任务文本里必须写：「先读 `AGENTS.md` 与 `docs/SUBTASK-BRIEF.md`」。
+- OMP 的 task 子代理**不会**收到 `AGENTS.md`（按文件名过滤），但会收到项目 `.omp/RULES.md` 与 `contextFiles.extra` 中的 `SUBTASK-BRIEF.md`。两者是给子代理的正式入口，改动时与 `AGENTS.md` 保持一致。
+- 已验证（2026-10-29，OMP 18.13.2，新会话 + 实际子代理）：子代理的 `<repo-rules>` 只包含 `SUBTASK-BRIEF.md`；`RULES.md` 以 sticky 规则形式出现在 `<generic-rules>`；`AGENTS.md` 确实未传给子代理。
+- 用 Codex / Claude Code 等其他工具时仍以根目录 `AGENTS.md` 为准；`SUBTASK-BRIEF.md` 作为人工/代理入口保留。
