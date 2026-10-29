@@ -1,0 +1,19 @@
+[package]
+name = "mail-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mail-cli"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { workspace = true }
+mail-core = { path = "../mail-core" }
+mail-crypto = { path = "../mail-crypto" }
+mail-store = { path = "../mail-store" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

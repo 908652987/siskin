@@ -1,0 +1,12 @@
+/target
+/spike/data
+/spike/swift/listbench
+/spike/swift/webview-probe
+/spike/swift/ffi-bench
+/spike/ffi-probe/gen
+/spike/ffi-probe/gen-kotlin
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
+/mail.db

@@ -1,0 +1,16 @@
+[package]
+name = "mail-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+mail-crypto = { path = "../mail-crypto" }
+mail-proto = { path = "../mail-proto" }
+mail-store = { path = "../mail-store" }
+mail-sync = { path = "../mail-sync" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

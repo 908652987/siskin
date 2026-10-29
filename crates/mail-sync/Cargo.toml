@@ -1,0 +1,12 @@
+[package]
+name = "mail-sync"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+mail-proto = { path = "../mail-proto" }
+mail-store = { path = "../mail-store" }
+thiserror = { workspace = true }
+tracing = { workspace = true }

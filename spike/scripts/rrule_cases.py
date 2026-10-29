@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Defines tricky RRULE cases and writes them as JSON for the Rust probe."""
+import json
+import sys
+
+CASES = [
+    ("daily-count", "DTSTART:20240101T090000Z\nRRULE:FREQ=DAILY;COUNT=10"),
+    ("weekly-interval", "DTSTART:20240101T090000Z\nRRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=12"),
+    ("monthly-31", "DTSTART:20240131T090000Z\nRRULE:FREQ=MONTHLY;BYMONTHDAY=31;COUNT=12"),
+    ("monthly-last-friday", "DTSTART:20240101T090000Z\nRRULE:FREQ=MONTHLY;BYDAY=-1FR;COUNT=12"),
+    ("monthly-second-tuesday", "DTSTART:20240101T090000Z\nRRULE:FREQ=MONTHLY;BYDAY=2TU;COUNT=6"),
+    ("yearly-leap-day", "DTSTART:20240229T090000Z\nRRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;COUNT=5"),
+    ("weekly-until", "DTSTART:20240107T090000Z\nRRULE:FREQ=WEEKLY;BYDAY=SU;UNTIL=20240301T000000Z"),
+    ("daily-interval-3", "DTSTART:20240101T090000Z\nRRULE:FREQ=DAILY;INTERVAL=3;COUNT=20"),
+    ("hourly-interval-6", "DTSTART:20240101T000000Z\nRRULE:FREQ=HOURLY;INTERVAL=6;COUNT=10"),
+    ("minutely-interval-15", "DTSTART:20240101T000000Z\nRRULE:FREQ=MINUTELY;INTERVAL=15;COUNT=8"),
+    ("last-weekday-of-month", "DTSTART:20240101T090000Z\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;COUNT=12"),
+    ("yearly-weekno", "DTSTART:20240101T090000Z\nRRULE:FREQ=YEARLY;BYWEEKNO=20;BYDAY=MO;COUNT=5"),
+    ("monthly-last-day", "DTSTART:20240115T090000Z\nRRULE:FREQ=MONTHLY;BYMONTHDAY=-1;COUNT=12"),
+    ("weekly-wkst-sunday", "DTSTART:20240101T090000Z\nRRULE:FREQ=WEEKLY;INTERVAL=2;WKST=SU;BYDAY=MO,SU;COUNT=10"),
+    ("daily-multi-hour", "DTSTART:20240101T000000Z\nRRULE:FREQ=DAILY;COUNT=6;BYHOUR=9,17;BYMINUTE=30"),
+    ("yearly-dst-start", "DTSTART;TZID=America/New_York:20240310T020000\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU;COUNT=4"),
+    ("daily-across-dst", "DTSTART;TZID=America/New_York:20241101T090000\nRRULE:FREQ=DAILY;COUNT=6"),
+    ("weekly-start-tuesday", "DTSTART:20240102T090000Z\nRRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=6"),
+    ("monthly-interval-monday", "DTSTART:20240101T090000Z\nRRULE:FREQ=MONTHLY;INTERVAL=2;BYDAY=1MO;COUNT=6"),
+    ("monthly-bysetpos-first-last", "DTSTART:20240101T090000Z\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1,-1;COUNT=10"),
+    ("yearly-bymonthday-30", "DTSTART:20240130T090000Z\nRRULE:FREQ=YEARLY;BYMONTH=1,3,5;BYMONTHDAY=30;COUNT=8"),
+    ("weekly-count-dst", "DTSTART;TZID=Europe/Berlin:20240324T090000\nRRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=6"),
+]
+
+payload = [{"id": cid, "ics": ics, "limit": 40} for cid, ics in CASES]
+
+out = sys.argv[1] if len(sys.argv) > 1 else "spike/data/rrule-cases.json"
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, indent=2)
+print(f"wrote {len(payload)} cases to {out}")
