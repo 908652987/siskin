@@ -53,6 +53,7 @@
 | 翻译 | 未开始 | |
 | 三端 UI | 未开始 | |
 | Windows / 移动端验证 | 未开始 | 本机无 Windows、无 .NET SDK |
+| 代码规范与风格固化 | 完成 | `AGENTS.md` + `docs/CONVENTIONS.md` + rustfmt/clippy/CI |
 
 ---
 
@@ -223,6 +224,15 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 
 ## 12. 提交与分支约定
 
-- 分支：`main`；提交信息用祈使句，说明“做了什么 + 为什么”。
+风格与规范已固化，不要各写一套：
+
+| 层 | 文件 | 作用 |
+|---|---|---|
+| 代理入口 | `AGENTS.md` | 每次会话自动加载：必读顺序、开发思路、目录边界、红线 |
+| 人读细则 | `docs/CONVENTIONS.md` | 命名、错误处理、异步、数据层、测试、依赖政策、反例 |
+| 工具强制 | `rustfmt.toml`、`[workspace.lints]`、`.editorconfig` | 格式与 lint 基线 |
+| CI | `.github/workflows/ci.yml` | fmt 检查 + clippy `-D warnings` + 全量测试 |
+
+- 分支：`main`；提交信息用英文祈使句，说明“做了什么 + 为什么”。
 - 生成物不入库：`target/`、`spike/data/`、`spike/ffi-probe/gen*`、`*.db*`、spike 编译出的可执行文件。
-- 提交前跑：`cargo fmt --all && cargo test --workspace`。
+- 提交前跑：`cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`。

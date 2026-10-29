@@ -10,3 +10,6 @@ mail-proto = { path = "../mail-proto" }
 mail-store = { path = "../mail-store" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

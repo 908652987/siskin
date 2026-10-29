@@ -262,64 +262,54 @@ impl Store {
     }
 
     fn load_mailbox(conn: &Connection, id: i64) -> Result<Option<Mailbox>> {
-        let raw: Option<(
-            i64,
-            i64,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-        )> = conn
+        struct Row {
+            id: i64,
+            account_id: i64,
+            remote_name: String,
+            role: Option<String>,
+            uidvalidity: Option<i64>,
+            uidnext: Option<i64>,
+            highest_modseq: Option<i64>,
+            last_sync_at: Option<i64>,
+            last_flag_sync_at: Option<i64>,
+            last_reconcile_at: Option<i64>,
+        }
+
+        let raw: Option<Row> = conn
             .query_row(
                 "SELECT id, account_id, remote_name, role, uidvalidity, uidnext,
                         highest_modseq, last_sync_at, last_flag_sync_at, last_reconcile_at
                  FROM mailboxes WHERE id = ?1",
                 [id],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
+                    Ok(Row {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        remote_name: row.get(2)?,
+                        role: row.get(3)?,
+                        uidvalidity: row.get(4)?,
+                        uidnext: row.get(5)?,
+                        highest_modseq: row.get(6)?,
+                        last_sync_at: row.get(7)?,
+                        last_flag_sync_at: row.get(8)?,
+                        last_reconcile_at: row.get(9)?,
+                    })
                 },
             )
             .optional()?;
-        Ok(raw.map(
-            |(
-                id,
-                account_id,
-                remote_name,
-                role,
-                uidvalidity,
-                uidnext,
-                highest_modseq,
-                last_sync_at,
-                last_flag_sync_at,
-                last_reconcile_at,
-            )| Mailbox {
-                id,
-                account_id,
-                remote_name,
-                role,
-                uidvalidity,
-                uidnext,
-                highest_modseq,
-                last_sync_at,
-                last_flag_sync_at,
-                last_reconcile_at,
-            },
-        ))
+
+        Ok(raw.map(|row| Mailbox {
+            id: row.id,
+            account_id: row.account_id,
+            remote_name: row.remote_name,
+            role: row.role,
+            uidvalidity: row.uidvalidity,
+            uidnext: row.uidnext,
+            highest_modseq: row.highest_modseq,
+            last_sync_at: row.last_sync_at,
+            last_flag_sync_at: row.last_flag_sync_at,
+            last_reconcile_at: row.last_reconcile_at,
+        }))
     }
 
     pub fn mailbox_by_name(&self, account_id: i64, name: &str) -> Result<Option<Mailbox>> {
