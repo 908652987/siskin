@@ -1,0 +1,3 @@
+# Windows checkouts default to core.autocrlf=true; pin LF so formatting
+# gates and diffs stay identical on every platform.
+* text=auto eol=lf
