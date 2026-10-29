@@ -151,6 +151,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
 ## 12. 提交
 
+- **不自动提交**：只有大功能完成且用户明确同意后才 commit / push；小改动与文档修订随下一次获准提交一起进入。
 - 一个提交一个目的；格式化、重命名与功能改动分开。
 - 信息格式：
 

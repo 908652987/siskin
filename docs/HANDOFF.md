@@ -235,6 +235,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 | 工具强制 | `rustfmt.toml`、`[workspace.lints]`、`.editorconfig` | 格式与 lint 基线 |
 | CI | `.github/workflows/ci.yml` | fmt 检查 + clippy `-D warnings` + 全量测试 |
 
+- **协作节奏（2026-10-29 用户新增）**：未获确认不开始实现、不改代码；不自动 commit/push；只有大功能完成且用户明确同意才提交。
 - 分支：`main`；提交信息用英文祈使句，说明“做了什么 + 为什么”。
 - 生成物不入库：`target/`、`spike/data/`、`spike/ffi-probe/gen*`、`*.db*`、spike 编译出的可执行文件。
 - 提交前跑：`cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`。
