@@ -230,8 +230,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 | 层 | 文件 | 作用 |
 |---|---|---|
 | 代理入口 | `AGENTS.md` | 每次会话自动加载：必读顺序、开发思路、目录边界、红线 |
-| 子任务入口（流程） | `SUBTASK-BRIEF.md` | 必读顺序、验证命令、交付格式、任务模板；由 `.omp/config.yml` 自动加载 |
-| 子代理硬规则（策略） | `.omp/RULES.md` | 9 条不变量；sticky，子代理必收；与 `AGENTS.md` 是子集关系，改动需同步 |
+| 子代理执行规则 | `.omp/RULES.md` | 8 条策略 + 3 条执行要求；sticky，子代理必收；与 `AGENTS.md` 是子集关系，改动需同步 |
 | 人读细则 | `docs/CONVENTIONS.md` | 命名、错误处理、异步、数据层、测试、依赖政策、反例 |
 | 工具强制 | `rustfmt.toml`、`[workspace.lints]`、`.editorconfig` | 格式与 lint 基线 |
 | CI | `.github/workflows/ci.yml` | fmt 检查 + clippy `-D warnings` + 全量测试 |
@@ -239,7 +238,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 - 分支：`main`；提交信息用英文祈使句，说明“做了什么 + 为什么”。
 - 生成物不入库：`target/`、`spike/data/`、`spike/ffi-probe/gen*`、`*.db*`、spike 编译出的可执行文件。
 - 提交前跑：`cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`。
-- 分工原则：`AGENTS.md` 全量规范，`.omp/RULES.md` 只放策略（9 条），`SUBTASK-BRIEF.md` 只放流程，`docs/CONVENTIONS.md` 放细则。**硬约束只在 RULES 与 AGENTS 中各出现一次，BRIEF 不重复**。
-- OMP 的 task 子代理**不会**收到 `AGENTS.md`（按文件名过滤），但会收到 `.omp/RULES.md` 与 `contextFiles.extra` 中的 `SUBTASK-BRIEF.md`。改动 RULES 时必须同步 AGENTS。
-- 已验证（2026-10-29，OMP 18.13.2，新会话 + 实际子代理）：子代理的 `<repo-rules>` 只包含 `SUBTASK-BRIEF.md`；`RULES.md` 以 sticky 规则形式出现在 `<generic-rules>`；`AGENTS.md` 确实未传给子代理。
-- 用 Codex / Claude Code 等其他工具时仍以根目录 `AGENTS.md` 为准；`SUBTASK-BRIEF.md` 作为人工/代理入口保留。
+- 分工原则：`AGENTS.md` 全量规范（主会话与其他工具），`.omp/RULES.md` 是子代理可见的执行子集（策略 + 执行要求），`docs/CONVENTIONS.md` 是细则与任务派发模板。**硬约束只在 RULES 与 AGENTS 中各出现一次**。
+- OMP 的 task 子代理**不会**收到 `AGENTS.md`（按文件名过滤），只会收到 `.omp/RULES.md`。改动 RULES 时必须同步 AGENTS。
+- 已验证（2026-10-29，OMP 18.13.2，新会话 + 实际子代理）：子代理收到 `RULES.md` 内容（sticky），未收到 `AGENTS.md`。
+- 不设 `contextFiles.extra`：执行者需要的流程已并入 `RULES.md`，避免两份文件内容漂移。

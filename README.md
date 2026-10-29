@@ -56,8 +56,7 @@ cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com
 - `docs/SPIKE-REPORT.md` — 五项验证的实测数据与结论
 - `docs/IMPLEMENTATION.md` — 第一段实现说明、运行方式、已知缺口
 - `docs/HANDOFF.md` — **从这里继续任务**：进度、环境、下一步、待决问题
-- `docs/CONVENTIONS.md` — 代码风格、错误处理、测试、依赖政策（`AGENTS.md` 是代理入口）
-- `SUBTASK-BRIEF.md` — 子任务入口（OMP 自动加载，见 `.omp/config.yml`）：必读、硬约束、交付格式、任务模板
+- `docs/CONVENTIONS.md` — 代码风格、错误处理、测试、依赖政策、任务派发模板（`AGENTS.md` 是代理入口）
 
 ## 测试
 

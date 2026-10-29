@@ -178,3 +178,34 @@ through SecretStore and refreshed on 401.
 | 在库 crate 引入 `anyhow` | 定义本 crate 错误类型 |
 | 注释写“increment i by 1” | 写清业务原因 |
 | 为省事新增一个小依赖 | 先确认标准库/现有依赖不可行 |
+
+---
+
+## 14. 任务派发模板（父代理使用）
+
+派发子任务时使用，执行者不需要看到模板本身（它只影响父代理怎么写任务）。
+
+```markdown
+# Target
+文件/模块：
+非目标：
+
+# Context
+必读：AGENTS.md、docs/CONVENTIONS.md、docs/HANDOFF.md 相关段落
+当前行为：
+期望行为：
+
+# Change
+1. …
+2. …
+
+# Constraints
+- 不改动：…
+- 边界：…
+- 依赖：不新增 / 允许新增（需说明理由）
+
+# Acceptance
+- 可观察结果：…
+- 必须跑的命令：cargo fmt / clippy / test（以及 Dovecot 冒烟，若涉及协议）
+- 不得出现：新增 warning、未使用代码、TODO 占位
+```

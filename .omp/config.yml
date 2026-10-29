@@ -1,8 +1,0 @@
-# OMP 项目配置。
-#
-# AGENTS.md 不会传给 task 子代理（OMP 按文件名过滤），因此把子任务入口
-# SUBTASK-BRIEF.md 作为额外上下文文件加载：主会话与子代理都会收到它。
-# 硬约束走 .omp/RULES.md（sticky，子代理也会收到）。
-contextFiles:
-  extra:
-    - SUBTASK-BRIEF.md
