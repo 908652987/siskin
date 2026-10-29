@@ -1350,6 +1350,8 @@ dependencies = [
 name = "mail-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "chrono",
  "mail-crypto",
  "mail-proto",
  "mail-store",
@@ -1359,6 +1361,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1380,6 +1383,7 @@ name = "mail-proto"
 version = "0.1.0"
 dependencies = [
  "async-imap",
+ "base64",
  "chrono",
  "futures",
  "rustls",
@@ -1410,7 +1414,10 @@ dependencies = [
  "chrono",
  "mail-proto",
  "mail-store",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 
@@ -2807,6 +2814,18 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "uuid"
+version = "1.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+dependencies = [
+ "getrandom 0.4.3",
+ "js-sys",
+ "serde_core",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"

@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；**图形界面、日历、Hub 服务端、OAuth2 尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；**图形界面、日历、Hub 服务端尚未开始**。
 
 ---
 
@@ -21,7 +21,7 @@
 | D3 | 客户端与 Hub 协议 | JMAP 子集（RFC 8620/8621） | 不自创协议 |
 | D4 | 部署形态 | 桌面可单机直连；手机与跨设备走自建 Hub | 手机端只做薄客户端 |
 | D5 | 存储 | SQLite + FTS5；目标加密 SQLCipher | SQLCipher 已接入，密钥由钥匙串主密钥 HKDF 派生 |
-| D6 | 邮件接入 | IMAP/SMTP，不接 Gmail API / Graph | 规避 restricted scope 与 CASA 年审 |
+| D6 | 邮件接入 | IMAP/POP3 接收 + SMTP 发送，不接 Gmail API / Graph；Outlook 不做（仅 OAuth2），Gmail 走应用专用密码 | 规避 restricted scope 与 CASA 年审；OAuth2 需自建 Entra 应用身份，测试账号无租户无法验收 |
 | D7 | 日历 | 系统桥（EventKit / CalendarContract）+ 直连 CalDAV/Google/Graph | 微软无 CalDAV |
 | D8 | 许可 | AGPL-3.0 | 与 GPL-3 代码可组合 |
 | D9 | 组件策略 | 优先平台官方与成熟库，只有同步状态机与 HTML 净化自研 | |
@@ -45,7 +45,12 @@
 | 增量同步引擎 | 完成 | `mail-sync`，3 个单测 + Dovecot 实跑 |
 | 常驻 IDLE 与重连退避 | 完成 | `mail-core::watch`，实跑验证 |
 | 开发 CLI | 完成 | `mail-cli` |
-| OAuth2 / XOAUTH2 | **未开始** | Outlook 当前无法登录 |
+| IMAP/POP3/SMTP + STARTTLS | 完成 | 三类协议对 88 服务器 143/110/587 实机升级到 AUTH；密码/STLS/STARTTLS 路径 |
+| POP3 接收同步 | 完成（mock） | `mail-proto::pop3` + `mail-sync::pop3`；UIDL 去重、轮询、单 INBOX；真实账户未验证 |
+| SMTP 发信 | 完成（协议层） | `mail-proto::smtp` + `core.send`；纯文本、base64 正文；真实投递未验证 |
+| 提供商预设 | 完成 | `gmail/qq/88/custom`；QQ/88/Gmail 主机与端口已用登录尝试验证 |
+| Outlook / Hotmail | **不做（范围决策）** | 微软已禁用密码登录，仅 OAuth2；测试账号无 Entra 租户无法取得应用身份 |
+| Gmail（应用专用密码） | 待真实验证 | 密码路径已就绪；需 Gmail 开启 IMAP + 2FA 应用专用密码 |
 | 正文与附件拉取、HTML 渲染 | 未开始 | 仅存头部 |
 | 多邮箱遍历 | 部分 | 协议层可列邮箱，门面只同步 INBOX |
 | Hub / JMAP | 未开始 | |
@@ -67,15 +72,20 @@ crates/
                            迁移、账户/邮箱/消息/位置/变更日志、
                            apply_fetch（事务）、search_messages（FTS/LIKE 双路）
   mail-store/tests/        9 个存储测试（含错密钥、明文库、落盘无明文）
-  mail-proto/src/lib.rs    Stream（TLS/明文）、ImapSession、CapabilitySet、
+  mail-proto/src/lib.rs    Stream（TLS/明文/STARTTLS）、ImapSession、CapabilitySet、
                            Tier(A/B/C)、fetch_range/fetch_flags/CHANGEDSINCE、
                            list_uids、append、add_flag、move_message、idle_wait
+  mail-proto/src/pop3.rs   POP3：LIST/UIDL/TOP、STLS、USER/PASS
+  mail-proto/src/smtp.rs   SMTP：EHLO、STARTTLS、AUTH PLAIN/LOGIN、DATA
   mail-sync/src/lib.rs     sync_mailbox：UIDVALIDITY 重建、全量/增量、
                            删除检测、合并去重；3 个单测
+  mail-sync/src/pop3.rs    POP3 镜像：UIDL 去重、头部解析、轮询、删除跟随服务器
   mail-core/src/lib.rs     Core：主密钥（钥匙串）→ HKDF → 库密钥、
-                           add_account（密码入钥匙串）、sync、watch（IDLE + 指数退避重连）
-  mail-cli/src/main.rs     add-account / accounts / sync / watch / list / stats /
-                           export-key / import-key
+                           add_account（密码入钥匙串）、协议分派、sync、watch、
+                           check、send（SMTP + Sent 归档）
+  mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
+  mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch /
+                           list / stats / export-key / import-key
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -100,7 +110,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 16 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 36 个测试全过
 ~/.cargo/bin/cargo build --release
 
 # 2) 起测试服务器
@@ -108,10 +118,12 @@ docker start mail-spike-dovecot               # 若容器不在：见 README 快
 
 # 3) 冒烟
 cargo run --release -p mail-cli -- --db /tmp/smoke.db add-account \
-  --email vmail@example.com --host 127.0.0.1 --port 31143 --tls false \
+  --email vmail@example.com --host 127.0.0.1 --port 31143 \
+  --security plaintext --insecure-plaintext true \
   --username vmail --password testpass
 cargo run --release -p mail-cli -- --db /tmp/smoke.db sync --email vmail@example.com
 cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@example.com
+cargo run --release -p mail-cli -- --db /tmp/smoke.db check --email vmail@example.com
 
 # 4) 主密钥备份 / 恢复（输出即密钥本身：存进密码管理器，勿贴日志或提交）
 cargo run --release -p mail-cli -- --db /tmp/smoke.db export-key
@@ -138,7 +150,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | 钥匙串 | `keyring` crate 必须启用特性 `apple-native / windows-native / sync-secret-service / crypto-rust`，否则写入静默失效、读取为空（已踩过） |
 | SQLCipher | `rusqlite` 特性 `bundled-sqlcipher-vendored-openssl`；首次构建会编译 vendored OpenSSL（本机约 20 s），不依赖系统 openssl |
 | 数据库密钥 | 钥匙串条目 `mail-client-dev / master-key`（`secret_key` 用于账户密码，两者不同）；库密钥由主密钥 HKDF-SHA256(info=`eyrie/sqlite/v1`) 派生 |
-| 网络 | 到 `imap.gmail.com:993` 的 TLS 被中断，Gmail 未实测；其余源码镜像可达 |
+| 网络 | 2026-10-29 实测 `imap.gmail.com:993` 直连可用（TLS 1.3 握手成功），尚未用账户登录验证；其余源码镜像可达 |
 
 ---
 
@@ -156,6 +168,9 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | UIDVALIDITY 重建 | 全量 10,000 封 / 2.8 s（debug） |
 | macOS 10 万行列表 | RSS 97 MB，滚动单步 p95 0.74 ms |
 | UniFFI 单页 50 行调用 | 73.5 µs |
+| STARTTLS（88：IMAP 143 / POP3 110 / SMTP 587） | 三类协议均升级成功并进入 AUTH；错误口令被拒 |
+| POP3 同步（mock） | 2 封入库；UIDL 消失后 removed=1 |
+| SMTP（mock） | AUTH PLAIN、MAIL/RCPT/DATA、点填充校验通过 |
 | 邮件 HTML 净化 | 9 组攻击样本 0 失败；净化后外部请求 0 |
 | RRULE | 22 例 21 通过，失败项为夏令时空洞时间，需归一化 |
 
@@ -165,25 +180,26 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 
 ## 8. 已知缺口（按优先级）
 
-1. **无 OAuth2**。Outlook 已禁密码登录（`LOGINDISABLED`，仅 `AUTH=XOAUTH2`），当前连接失败。需 XOAUTH2 + PKCE + 刷新令牌。**验收**：Outlook 账户可登录同步，令牌过期自动刷新，密码不落库。
+1. **不支持 Outlook/Hotmail**。2026-10-29 范围决策：微软已禁用密码登录，仅 OAuth2，且测试账号无 Entra 租户；Gmail 走应用专用密码（见 §10）。**验收**：不适用（范围外）。
 2. **只同步 INBOX**。**验收**：列出邮箱并按 SPECIAL-USE 映射 Sent/Drafts/Trash/Junk，全部可同步。
 3. **只存头部**。**验收**：打开邮件时按 BODYSTRUCTURE 拉取正文并缓存，二次打开离线命中；附件按需下载。
 4. **变更日志线性增长**。全量同步每封写一条。**验收**：10 万封场景下日志有界（快照 + 增量），状态可由快照重建。
-5. **B/C 档未实跑**。**验收**：Outlook（B 档）与 iCloud（C 档）账户实际同步；iCloud 移动邮件走 COPY+删除。
+5. **B/C 档未实跑**。**验收**：iCloud（C 档）账户实际同步，移动邮件走 COPY+删除；B 档需一台不广告 CONDSTORE 的服务器。
 6. **重连未做故障注入**。**验收**：同步中重启服务器，`watch` 按退避恢复且不产生重复行。
 7. **中文 1–2 字搜索走 LIKE 扫描**。10 万封内可接受。**验收**：10 万封下 2 字查询 P95 < 150 ms。
 8. **Windows/移动端零验证**。**验收**：WinUI 3 调 Rust（uniffi-bindgen-cs），空闲内存 ≤ 160 MB。
-9. **主密钥无轮换与自动备份**。已提供 `export-key`/`import-key` 做人工备份（可存 Bitwarden 等），但主密钥仍只有钥匙串一份，丢失且无备份即数据不可恢复；库密钥无法在线轮换。**验收**：轮换后旧库可迁移；备份丢失时给出明确提示。
+9. **POP3 语义受限**。无文件夹、无标志位、无 IDLE；本地删除仅影响本地，服务器删除通过 UIDL 列表消失检测；UIDL 以 63 位哈希映射为数字 uid。**验收**：真实 POP3 账户同步与删除行为符合预期。
+10. **发信能力窄**。仅纯文本 UTF-8；无附件、HTML、草稿；Sent 归档仅在 IMAP 账户尝试。**验收**：真实账户收到邮件，Sent 归档或明确报错。
+11. **明文端口需显式开关**。`--security plaintext` 或 `--smtp-security plaintext` 必须同时给 `--insecure-plaintext true`；QQ 的 143/110 不提供 STARTTLS。
+12. **主密钥无轮换与自动备份**。已提供 `export-key`/`import-key` 做人工备份（可存 Bitwarden 等），但主密钥仍只有钥匙串一份，丢失且无备份即数据不可恢复；库密钥无法在线轮换。**验收**：轮换后旧库可迁移；备份丢失时给出明确提示。
 
 ---
 
 ## 9. 下一步路线（按顺序，独立可交付）
 
-### 第 2 段：安全与认证（SQLCipher 已完成，剩认证）
+### 第 2 段：安全与认证（完成）
 
-1. **OAuth2 + XOAUTH2**
-   - 改动：`mail-crypto` 存 refresh token；`mail-proto` 支持 `AUTHENTICATE XOAUTH2`；新增授权流程（回环重定向 + PKCE），CLI 先提供 `--oauth2` 手动授权。
-   - 验收：§8-1。
+- SQLCipher 加密库完成；OAuth2 按范围决策不做（见 §3 与 §8-1）。
 
 ### 第 3 段：内容能力
 
@@ -212,8 +228,9 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 
 | 项 | 用途 | 影响 |
 |---|---|---|
-| 一个 Gmail 测试账户（应用专用密码） | 验证 Gmail 能力与 Gmail 标签映射 | 未知则 Gmail 路径只能靠推断 |
-| 一个 Outlook / M365 测试账户（或 OAuth 客户端） | B 档与 XOAUTH2 验证 | 阻塞 §8-1、§8-5 |
+| 一个 Gmail 测试账户（应用专用密码，需开启 2FA 与 IMAP） | Gmail 能力与标签映射验证 | 未提供则 Gmail 路径未实测 |
+| 一个 QQ 或 88 测试账户（授权码/专用密码） | 真实预设同步 + POP3/IMAP/SMTP 验收 | 未提供则真实收发未实测 |
+| 一个 iCloud 账户（应用专用密码） | C 档与 COPY+删除路径实测 | 阻塞 §8-5 的 C 档验证 |
 | 一台 Windows 11 机器 + .NET SDK | WinUI 3 + UniFFI 内存验证 | 阻塞 Windows UI 段 |
 | APNs / FCM 凭据 | 手机推送 | 阻塞移动端 |
 | 是否先做 Hub 还是先做桌面 UI | 排序 | 影响第 4–6 段顺序 |
@@ -232,6 +249,11 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 - `import-key` 必须先验证再落库：库存在且导入密钥打不开它时直接失败，不覆盖钥匙串；只有 `--force true` 才替换已有的不同密钥。
 - FTS5 `contentless_delete=1` 必须同时写 `content=''`，否则建表失败。
 - trigram 分词器不支持 <3 字符查询，中文需 LIKE 回退。
+- Gmail 应用专用密码要求账户开启两步验证；Gmail 的 IMAP 还需在设置中显式启用，未启用时认证会失败但密码本身有效。
+- QQ 的 143/110 可连但不广告 STARTTLS（STLS），走这两个端口等于明文传授权码；默认应使用 993/995。
+- 88（Coremail）不广告 IDLE/CONDSTORE，档位为 C（轮询）；`imap/pop/smtp` 主机按域名区分（88.com / 111.com / email.cn）。
+- POP3 无 UIDL 持久化列：UIDL 经 SHA-256 截断为 63 位数字 uid；容器内冲突概率可忽略，但不要把它当协议 UID 展示。
+- SMTP 发送后 IMAP 追加 Sent 失败不回滚投递，只返回 `save_error`；POP3 账户没有 Sent 归档。
 - iCloud 无 IDLE/CONDSTORE/MOVE；每次全量 UID 扫描代价高（10 万封时不可接受），必须保留“数量变化/超时”门槛。
 - `UIDVALIDITY` 变化必须整箱重建，不能复用 UID。
 - 草稿与已发送的去重尚未实现，接入发送功能时先解决。

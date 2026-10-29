@@ -33,7 +33,7 @@
 | D3 | 客户端与 Hub 之间用 JMAP 子集（RFC 8620/8621） | 增量同步、状态字符串、SSE 推送已有标准语义，不自创协议 | JSON 体积略大，需要实现子集 |
 | D4 | 桌面支持"本地直连"与"连 Hub"两种模式，共用同一核心 | 隐私与多端一致各取所需；手机端只做薄客户端 | 核心需抽象 provider |
 | D5 | 存储统一 SQLite + FTS5（SQLCipher 加密） | 单文件、事务、全文检索、可跨平台打包 | 并发写需串行化 |
-| D6 | 邮件统一走 IMAP/SMTP，不接 Gmail API / Graph | 规避 restricted scope 与 CASA 年审 | 失去部分 Gmail 专有能力 |
+| D6 | 邮件统一走 IMAP/POP3 + SMTP，不接 Gmail API / Graph | 规避 restricted scope 与 CASA 年审 | 失去部分 Gmail 专有能力 |
 | D7 | 日历走 CalDAV / Google Calendar API / Microsoft Graph | 微软不提供 CalDAV，必须 Graph | 三套日历适配器 |
 | D8 | AGPL-3.0 | 自托管产品防闭源白嫖；与 GPL-3 代码可组合 | 商业客户敏感 |
 
@@ -98,7 +98,7 @@ flowchart TB
 ├── Cargo.toml                  # workspace
 ├── crates/
 │   ├── mail-core/              # 门面：组装各模块，暴露用例
-│   ├── mail-proto/             # 协议适配器（imap/smtp/caldav/graph/google）
+│   ├── mail-proto/             # 协议适配器（imap/pop3/smtp/caldav/graph/google）
 │   ├── mail-parse/             # MIME、iCalendar、HTML 净化、线程化
 │   ├── mail-store/             # schema、迁移、查询、变更日志
 │   ├── mail-sync/              # 同步状态机、调度、重试

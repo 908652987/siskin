@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
-use mail_core::{AccountSpec, Core};
+use mail_core::{presets, AccountSpec, Core, ReceiveProtocol, SecurityMode, SmtpSettings};
 use mail_crypto::KeyringStore;
 use mail_store::Store;
 
@@ -26,6 +26,8 @@ fn parse() -> Result<Args, String> {
     while let Some(arg) = it.next() {
         if arg == "--db" {
             db = PathBuf::from(it.next().ok_or("--db needs a value")?);
+        } else if arg == "--password-stdin" {
+            flags.insert("password-stdin".to_string(), "true".to_string());
         } else if let Some(name) = arg.strip_prefix("--") {
             let value = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
             flags.insert(name.to_string(), value);
@@ -38,7 +40,7 @@ fn parse() -> Result<Args, String> {
     Ok(Args {
         db,
         command: command.ok_or(
-            "missing command: add-account | accounts | sync | watch | list | stats | export-key | import-key",
+            "missing command: add-account | check | send | accounts | sync | watch | list | stats | export-key | import-key",
         )?,
         flags,
     })
@@ -51,11 +53,139 @@ fn required(flags: &HashMap<String, String>, name: &str) -> Result<String, Strin
         .ok_or_else(|| format!("missing --{name}"))
 }
 
+/// Reads the account password from stdin with `--password-stdin`, so it never
+/// reaches shell history or the process argument list.
+fn password_from(flags: &HashMap<String, String>) -> Result<String, String> {
+    if flag_bool(flags, "password-stdin", false) {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("reading password from stdin: {e}"))?;
+        let password = input.trim_end_matches(['\r', '\n']).to_string();
+        if password.is_empty() {
+            return Err("stdin carried an empty password".to_string());
+        }
+        return Ok(password);
+    }
+    required(flags, "password")
+}
+
 fn flag_bool(flags: &HashMap<String, String>, name: &str, default: bool) -> bool {
     flags
         .get(name)
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
         .unwrap_or(default)
+}
+
+fn protocol_from(flags: &HashMap<String, String>) -> Result<ReceiveProtocol, String> {
+    match flags
+        .get("protocol")
+        .map(String::as_str)
+        .unwrap_or("imap")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "imap" => Ok(ReceiveProtocol::Imap),
+        "pop3" => Ok(ReceiveProtocol::Pop3),
+        other => Err(format!("bad --protocol {other}; expected imap or pop3")),
+    }
+}
+
+fn security_from(flags: &HashMap<String, String>, name: &str) -> Result<SecurityMode, String> {
+    if let Some(value) = flags.get(name) {
+        return match value.to_ascii_lowercase().as_str() {
+            "tls" => Ok(SecurityMode::Tls),
+            "starttls" => Ok(SecurityMode::StartTls),
+            "plaintext" => Ok(SecurityMode::Plaintext),
+            other => Err(format!(
+                "bad --{name} {other}; expected tls, starttls or plaintext"
+            )),
+        };
+    }
+    if name == "security" && flags.get("tls").map(|v| v == "false").unwrap_or(false) {
+        return Ok(SecurityMode::Plaintext);
+    }
+    Ok(SecurityMode::Tls)
+}
+
+fn account_spec(flags: &HashMap<String, String>) -> Result<AccountSpec, String> {
+    let email = required(flags, "email")?;
+    let provider = flags
+        .get("provider")
+        .cloned()
+        .unwrap_or_else(|| "custom".to_string())
+        .to_ascii_lowercase();
+    let protocol = protocol_from(flags)?;
+    let security = security_from(flags, "security")?;
+
+    let preset = if provider == "custom" {
+        None
+    } else {
+        Some(presets::hosts(&provider, &email).map_err(|e| e.to_string())?)
+    };
+
+    let host = match flags.get("host") {
+        Some(host) => host.clone(),
+        None => preset
+            .as_ref()
+            .map(|preset| match protocol {
+                ReceiveProtocol::Imap => preset.imap.clone(),
+                ReceiveProtocol::Pop3 => preset.pop3.clone(),
+            })
+            .ok_or_else(|| "missing --host".to_string())?,
+    };
+    let port = match flags.get("port") {
+        Some(port) => port.parse().map_err(|_| "bad --port".to_string())?,
+        None => presets::default_port(protocol, security),
+    };
+
+    let smtp_host = flags
+        .get("smtp-host")
+        .cloned()
+        .or_else(|| preset.as_ref().map(|preset| preset.smtp.clone()));
+    let smtp = match smtp_host {
+        Some(host) => {
+            let smtp_security = security_from(flags, "smtp-security")?;
+            let port = match flags.get("smtp-port") {
+                Some(port) => port.parse().map_err(|_| "bad --smtp-port".to_string())?,
+                None => presets::default_smtp_port(smtp_security),
+            };
+            Some(SmtpSettings {
+                host,
+                port,
+                security: Some(smtp_security),
+                username: flags.get("smtp-username").cloned(),
+            })
+        }
+        None => None,
+    };
+
+    if !flag_bool(flags, "insecure-plaintext", false)
+        && (security == SecurityMode::Plaintext
+            || smtp
+                .as_ref()
+                .map(|smtp| smtp.security() == SecurityMode::Plaintext)
+                .unwrap_or(false))
+    {
+        return Err(
+            "plaintext transport requires --insecure-plaintext true; use tls or starttls"
+                .to_string(),
+        );
+    }
+
+    Ok(AccountSpec {
+        email: email.clone(),
+        display_name: flags.get("name").cloned(),
+        provider,
+        host,
+        port,
+        username: flags.get("username").cloned().unwrap_or(email),
+        password: password_from(flags)?,
+        protocol,
+        security,
+        smtp,
+        sent_mailbox: flags.get("sent-mailbox").cloned(),
+    })
 }
 
 #[tokio::main]
@@ -119,23 +249,50 @@ async fn run() -> Result<(), String> {
 
     match args.command.as_str() {
         "add-account" => {
-            let spec = AccountSpec {
-                email: required(&args.flags, "email")?,
-                display_name: args.flags.get("name").cloned(),
-                host: required(&args.flags, "host")?,
-                port: required(&args.flags, "port")?
-                    .parse()
-                    .map_err(|_| "bad --port")?,
-                tls: flag_bool(&args.flags, "tls", true),
-                username: args
-                    .flags
-                    .get("username")
-                    .cloned()
-                    .unwrap_or_else(|| args.flags.get("email").cloned().unwrap_or_default()),
-                password: required(&args.flags, "password")?,
-            };
+            let spec = account_spec(&args.flags)?;
             let id = core.add_account(&spec).map_err(|e| e.to_string())?;
-            println!("account id={id} email={} stored in keychain", spec.email);
+            println!(
+                "account id={id} email={} provider={} protocol={:?} security={:?}",
+                spec.email, spec.provider, spec.protocol, spec.security
+            );
+        }
+        "check" => {
+            let email = required(&args.flags, "email")?;
+            core.check(&email).await.map_err(|e| e.to_string())?;
+            println!("login ok: {email}");
+        }
+        "send" => {
+            let email = required(&args.flags, "email")?;
+            let to: Vec<String> = required(&args.flags, "to")?
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+            if to.is_empty() {
+                return Err("--to needs at least one address".to_string());
+            }
+            let subject = args.flags.get("subject").cloned().unwrap_or_default();
+            let body = match args.flags.get("body") {
+                Some(body) => body.clone(),
+                None => match args.flags.get("body-file") {
+                    Some(path) => {
+                        std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?
+                    }
+                    None => return Err("missing --body or --body-file".to_string()),
+                },
+            };
+            let outcome = core
+                .send(&email, &to, &subject, &body)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("sent to {} recipient(s)", outcome.recipients);
+            if let Some(mailbox) = outcome.saved_to {
+                println!("saved to {mailbox}");
+            }
+            if let Some(err) = outcome.save_error {
+                eprintln!("warning: sent but not saved to Sent: {err}");
+            }
         }
         "accounts" => {
             let store: Arc<Store> = core.store();

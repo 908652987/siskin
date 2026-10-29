@@ -1,4 +1,4 @@
-//! IMAP transport: TLS, capability detection, tiered sync primitives.
+//! Mail protocol clients: IMAP transport, POP3 receive and SMTP submission.
 
 use std::collections::HashSet;
 use std::io;
@@ -15,9 +15,23 @@ use futures::TryStreamExt;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+
+pub mod pop3;
+pub mod smtp;
+
+/// Transport security for protocol connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Security {
+    /// Implicit TLS from the first byte (993, 995, 465).
+    Tls,
+    /// Plaintext connection that is upgraded before credentials are sent.
+    StartTls,
+    /// No transport encryption; only for explicit local/testing use.
+    Plaintext,
+}
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -72,7 +86,7 @@ impl CapabilitySet {
 pub struct ImapConfig {
     pub host: String,
     pub port: u16,
-    pub tls: bool,
+    pub security: Security,
     pub username: String,
     pub password: String,
 }
@@ -157,6 +171,33 @@ impl AsyncWrite for Stream {
     }
 }
 
+impl Stream {
+    /// Returns the raw socket when no TLS has been applied yet, for STARTTLS.
+    pub(crate) fn into_plain_tcp(self) -> Option<TcpStream> {
+        match self {
+            Stream::Plain(tcp) => Some(tcp),
+            Stream::Tls(_) => None,
+        }
+    }
+}
+
+/// Wraps a TCP stream in TLS with the bundled webpki roots.
+pub(crate) async fn tls_wrap(host: &str, tcp: TcpStream) -> Result<Stream> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(tls));
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|e| ProtoError::Tls(e.to_string()))?;
+    let secure = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| ProtoError::Tls(e.to_string()))?;
+    Ok(Stream::Tls(Box::new(secure)))
+}
+
 pub struct ImapSession {
     inner: Option<Session<Stream>>,
     capabilities: CapabilitySet,
@@ -167,30 +208,44 @@ impl ImapSession {
         let tcp = TcpStream::connect((config.host.as_str(), config.port)).await?;
         tcp.set_nodelay(true).ok();
 
-        let stream = if config.tls {
-            let mut roots = RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let tls = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            let connector = TlsConnector::from(Arc::new(tls));
-            let server_name = ServerName::try_from(config.host.clone())
-                .map_err(|e| ProtoError::Tls(e.to_string()))?;
-            let secure = connector
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| ProtoError::Tls(e.to_string()))?;
-            Stream::Tls(Box::new(secure))
-        } else {
-            Stream::Plain(tcp)
+        let mut client = match config.security {
+            Security::Tls => async_imap::Client::new(tls_wrap(&config.host, tcp).await?),
+            Security::StartTls | Security::Plaintext => async_imap::Client::new(Stream::Plain(tcp)),
         };
 
-        let client = async_imap::Client::new(stream);
+        // Client::new leaves the greeting unread; consume it before any command.
+        let greeting = client.read_response().await.map_err(ProtoError::Io)?;
+        let Some(greeting) = greeting else {
+            return Err(ProtoError::Unexpected(
+                "server closed the connection before the greeting".into(),
+            ));
+        };
+        if let async_imap::imap_proto::Response::Done { status, .. } = greeting.parsed() {
+            if *status != async_imap::imap_proto::Status::Ok {
+                return Err(ProtoError::Unexpected(format!(
+                    "server rejected the connection: {status:?}"
+                )));
+            }
+        }
+
+        if config.security == Security::StartTls {
+            client
+                .run_command_and_check_ok("STARTTLS", None)
+                .await
+                .map_err(ProtoError::Imap)?;
+            let plain = client.into_inner();
+            let tcp = plain.into_plain_tcp().ok_or_else(|| {
+                ProtoError::Unexpected("STARTTLS requested on an already encrypted stream".into())
+            })?;
+            client = async_imap::Client::new(tls_wrap(&config.host, tcp).await?);
+        }
+
         let mut session = client
             .login(&config.username, &config.password)
             .await
             .map_err(|(err, _client)| ProtoError::Imap(err))?;
 
+        // Re-check capabilities after STARTTLS; the server may advertise more.
         let raw = session.capabilities().await?;
         let capabilities = CapabilitySet {
             idle: has(&raw, "IDLE"),
@@ -336,6 +391,28 @@ impl ImapSession {
             session.logout().await.ok();
         }
     }
+}
+
+/// Reads one CRLF-terminated control line, rejecting oversized or unterminated input.
+pub(crate) async fn read_line(io: &mut BufReader<Stream>) -> Result<String> {
+    let mut line = String::new();
+    let read = io.read_line(&mut line).await?;
+    if read == 0 {
+        return Err(ProtoError::Unexpected("connection closed".into()));
+    }
+    if line.len() > 1024 * 1024 {
+        return Err(ProtoError::Unexpected("protocol line too long".into()));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Writes one CRLF-terminated line and flushes it.
+pub(crate) async fn write_line(io: &mut BufReader<Stream>, line: &str) -> Result<()> {
+    let stream = io.get_mut();
+    stream.write_all(line.as_bytes()).await?;
+    stream.write_all(b"\r\n").await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 fn has(caps: &async_imap::types::Capabilities, name: &str) -> bool {

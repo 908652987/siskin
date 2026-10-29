@@ -9,6 +9,9 @@ use mail_proto::{FetchedMessage, ImapSession, Tier};
 use mail_store::{NewMessage, Store, SyncState};
 use thiserror::Error;
 
+mod pop3;
+pub use pop3::{pop3_uid, Pop3SyncEngine};
+
 /// How long tier B/C servers may go before flags are re-read in full.
 const FLAG_RESYNC_SECONDS: i64 = 15 * 60;
 
