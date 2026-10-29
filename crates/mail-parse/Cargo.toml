@@ -1,0 +1,15 @@
+[package]
+name = "mail-parse"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ammonia = { workspace = true }
+base64 = { workspace = true }
+encoding_rs = { workspace = true }
+quoted_printable = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

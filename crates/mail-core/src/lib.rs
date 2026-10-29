@@ -11,8 +11,11 @@ use mail_crypto::{CryptoError, MasterKey, SecretStore};
 use mail_proto::pop3::{Pop3Config, Pop3Session};
 use mail_proto::smtp::{SmtpConfig, SmtpSession};
 use mail_proto::{IdleEvent, ImapConfig, ImapSession, ProtoError, Security};
-use mail_store::{Account, DbKey, Store, StoreError};
-use mail_sync::{Pop3SyncEngine, SyncEngine, SyncError, SyncOutcome};
+use mail_store::{
+    Account, AttachmentMetaInput, BodyPartInput, BodyState, DbKey, MessageBody, MessageContext,
+    PartMetaInput, Store, StoreError,
+};
+use mail_sync::{pop3_uid, Pop3SyncEngine, SyncEngine, SyncError, SyncOutcome};
 use uuid::Uuid;
 
 pub mod presets;
@@ -39,6 +42,12 @@ pub enum CoreError {
     KeyConflict,
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("message not found: {0}")]
+    MessageNotFound(i64),
+    #[error("the server no longer lists message uid {0}")]
+    MessageGone(i64),
+    #[error("message {message_id} has no attachment part {part}")]
+    AttachmentNotFound { message_id: i64, part: String },
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;
@@ -132,6 +141,27 @@ pub struct AccountSpec {
     pub security: SecurityMode,
     pub smtp: Option<SmtpSettings>,
     pub sent_mailbox: Option<String>,
+}
+
+/// One attachment as reported by the cached layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentInfo {
+    pub part: String,
+    pub filename: Option<String>,
+    pub content_type: String,
+    pub size: i64,
+    pub downloaded: bool,
+}
+
+/// Cached content of one message. `text` always exists for messages that have
+/// a body: HTML-only mail is rendered to text, so lists and search have text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageContent {
+    pub message_id: i64,
+    pub body_state: BodyState,
+    pub text: Option<String>,
+    pub html: Option<String>,
+    pub attachments: Vec<AttachmentInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +387,310 @@ impl Core {
         }
     }
 
+    // ---- message content ---------------------------------------------------
+
+    /// Loads a message's body, fetching it from the server on first use.
+    ///
+    /// A second call for the same message is served entirely from the local
+    /// cache; attachments are fetched separately by [`Core::fetch_attachment`].
+    pub async fn fetch_body(&self, email: &str, message_id: i64) -> Result<MessageContent> {
+        let account = self.account(email)?;
+        let context = self
+            .store
+            .message_context(message_id)?
+            .ok_or(CoreError::MessageNotFound(message_id))?;
+
+        if let Some(content) = self.cached_content(message_id)? {
+            return Ok(content);
+        }
+
+        let settings = settings_of(&account)?;
+        match settings.protocol {
+            ReceiveProtocol::Imap => {
+                let mut session = self.connect_imap(&account).await?;
+                let outcome = self
+                    .fetch_imap_content(&mut session, message_id, &context)
+                    .await;
+                session.logout().await;
+                outcome?;
+            }
+            ReceiveProtocol::Pop3 => {
+                let mut session = self.connect_pop3(&account).await?;
+                let outcome = self
+                    .store_pop3_content(&mut session, message_id, &context)
+                    .await;
+                session.quit().await;
+                outcome?;
+            }
+        }
+
+        self.cached_content(message_id)?
+            .ok_or(CoreError::MessageNotFound(message_id))
+    }
+
+    /// Downloads one attachment on demand. POP3 cannot fetch a single part, so
+    /// that path re-reads the whole message and caches it.
+    pub async fn fetch_attachment(
+        &self,
+        email: &str,
+        message_id: i64,
+        part: &str,
+    ) -> Result<Vec<u8>> {
+        if let Some(data) = self.store.attachment_data(message_id, part)? {
+            return Ok(data);
+        }
+        let account = self.account(email)?;
+        let context = self
+            .store
+            .message_context(message_id)?
+            .ok_or(CoreError::MessageNotFound(message_id))?;
+        let meta = self
+            .store
+            .attachment_meta(message_id, part)?
+            .ok_or_else(|| CoreError::AttachmentNotFound {
+                message_id,
+                part: part.to_string(),
+            })?;
+
+        let settings = settings_of(&account)?;
+        let data = match settings.protocol {
+            ReceiveProtocol::Imap => {
+                let mut session = self.connect_imap(&account).await?;
+                let outcome = self
+                    .fetch_imap_attachment(&mut session, &context, part, meta.encoding.as_deref())
+                    .await;
+                session.logout().await;
+                outcome?
+            }
+            ReceiveProtocol::Pop3 => {
+                let mut session = self.connect_pop3(&account).await?;
+                let outcome = self
+                    .store_pop3_content(&mut session, message_id, &context)
+                    .await;
+                session.quit().await;
+                outcome?;
+                self.store
+                    .attachment_data(message_id, part)?
+                    .ok_or_else(|| CoreError::AttachmentNotFound {
+                        message_id,
+                        part: part.to_string(),
+                    })?
+            }
+        };
+
+        self.store.store_attachment(
+            context.account_id,
+            message_id,
+            part,
+            &meta.content_type,
+            meta.filename.as_deref(),
+            &data,
+        )?;
+        Ok(data)
+    }
+
+    /// Cached content, but only once every body alternative is present.
+    fn cached_content(&self, message_id: i64) -> Result<Option<MessageContent>> {
+        let Some(body) = self.store.message_body(message_id)? else {
+            return Ok(None);
+        };
+        if body.state == BodyState::Headers {
+            return Ok(None);
+        }
+        if body.parts.iter().any(|part| !part.cached) {
+            return Ok(None);
+        }
+        Ok(Some(content_of(message_id, body)))
+    }
+
+    async fn fetch_imap_content(
+        &self,
+        session: &mut ImapSession,
+        message_id: i64,
+        context: &MessageContext,
+    ) -> Result<()> {
+        session.select(&context.mailbox_name).await?;
+        let uid = uid_of(context.uid)?;
+        let layout = session.fetch_body_layout(uid).await?;
+
+        let names: Vec<Option<String>> = layout
+            .parts
+            .iter()
+            .map(|part| part.filename.as_deref().map(clean_attachment_name))
+            .collect();
+        let mut part_meta = Vec::new();
+        let mut attachment_meta = Vec::new();
+        for (part, name) in layout.parts.iter().zip(&names) {
+            if part.is_body_text() {
+                part_meta.push(PartMetaInput {
+                    part: &part.part,
+                    content_type: &part.content_type,
+                    charset: part.charset.as_deref(),
+                    is_html: part.content_type == "text/html",
+                    size: i64::from(part.size),
+                });
+            } else {
+                attachment_meta.push(AttachmentMetaInput {
+                    part: &part.part,
+                    filename: name.as_deref(),
+                    content_type: &part.content_type,
+                    encoding: Some(part.encoding.as_str()),
+                    size: i64::from(part.size),
+                });
+            }
+        }
+        self.store.record_body_structure(
+            context.account_id,
+            message_id,
+            &part_meta,
+            &attachment_meta,
+        )?;
+
+        let mut decoded: Vec<DecodedPart> = Vec::new();
+        for part in &layout.parts {
+            if !part.is_body_text() {
+                continue;
+            }
+            let raw = session.fetch_part(uid, &part.part).await?;
+            let bytes = mail_parse::decode_transfer(&part.encoding, &raw);
+            let text = mail_parse::decode_text(&bytes, part.charset.as_deref());
+            let is_html = part.content_type == "text/html";
+            let stored = if is_html {
+                mail_parse::sanitize_html(&text)
+            } else {
+                text
+            };
+            decoded.push(DecodedPart {
+                part: part.part.clone(),
+                content_type: part.content_type.clone(),
+                is_html,
+                data: stored,
+            });
+        }
+        self.store_decoded_parts(context.account_id, message_id, &decoded)?;
+        Ok(())
+    }
+
+    async fn fetch_imap_attachment(
+        &self,
+        session: &mut ImapSession,
+        context: &MessageContext,
+        part: &str,
+        encoding: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        session.select(&context.mailbox_name).await?;
+        let uid = uid_of(context.uid)?;
+        let raw = session.fetch_part(uid, part).await?;
+        Ok(mail_parse::decode_transfer(encoding.unwrap_or(""), &raw))
+    }
+
+    /// POP3 has no sections: read the whole message, parse MIME locally, and
+    /// cache bodies plus attachments in one pass.
+    async fn store_pop3_content(
+        &self,
+        session: &mut Pop3Session,
+        message_id: i64,
+        context: &MessageContext,
+    ) -> Result<()> {
+        let listed = session.list().await?;
+        let number = listed
+            .iter()
+            .find(|item| pop3_uid(&item.uid) == context.uid)
+            .map(|item| item.number)
+            .ok_or(CoreError::MessageGone(context.uid))?;
+        let raw = session.retrieve(number).await?;
+        let parsed = mail_parse::parse_message(&raw);
+
+        // POP3 has no IMAP section ids; synthetic ones keep the cache keyed
+        // without pretending they are fetchable.
+        let mut part_meta = Vec::new();
+        let mut decoded = Vec::new();
+        if let Some(text) = parsed.text.as_ref() {
+            part_meta.push(PartMetaInput {
+                part: TEXT_PART,
+                content_type: "text/plain",
+                charset: Some("utf-8"),
+                is_html: false,
+                size: text.len() as i64,
+            });
+            decoded.push(DecodedPart {
+                part: TEXT_PART.to_string(),
+                content_type: "text/plain".to_string(),
+                is_html: false,
+                data: text.clone(),
+            });
+        }
+        if let Some(html) = parsed.html.as_ref() {
+            part_meta.push(PartMetaInput {
+                part: HTML_PART,
+                content_type: "text/html",
+                charset: Some("utf-8"),
+                is_html: true,
+                size: html.len() as i64,
+            });
+            decoded.push(DecodedPart {
+                part: HTML_PART.to_string(),
+                content_type: "text/html".to_string(),
+                is_html: true,
+                data: html.clone(),
+            });
+        }
+        let attachment_meta: Vec<AttachmentMetaInput<'_>> = parsed
+            .attachments
+            .iter()
+            .map(|attachment| AttachmentMetaInput {
+                part: &attachment.part,
+                filename: attachment.filename.as_deref(),
+                content_type: &attachment.content_type,
+                // parse_message already decodes transfer encodings.
+                encoding: None,
+                size: attachment.bytes.len() as i64,
+            })
+            .collect();
+        self.store.record_body_structure(
+            context.account_id,
+            message_id,
+            &part_meta,
+            &attachment_meta,
+        )?;
+        self.store_decoded_parts(context.account_id, message_id, &decoded)?;
+        for attachment in &parsed.attachments {
+            self.store.store_attachment(
+                context.account_id,
+                message_id,
+                &attachment.part,
+                &attachment.content_type,
+                attachment.filename.as_deref(),
+                &attachment.bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn store_decoded_parts(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        parts: &[DecodedPart],
+    ) -> Result<()> {
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let inputs: Vec<BodyPartInput<'_>> = parts
+            .iter()
+            .map(|part| BodyPartInput {
+                part: &part.part,
+                content_type: &part.content_type,
+                charset: Some("utf-8"),
+                is_html: part.is_html,
+                data: part.data.as_bytes(),
+            })
+            .collect();
+        self.store
+            .store_body_parts(account_id, message_id, &inputs)?;
+        Ok(())
+    }
+
     pub async fn connect_imap(&self, account: &Account) -> Result<ImapSession> {
         let settings = settings_of(account)?;
         let security = settings.security();
@@ -493,6 +827,60 @@ fn secret_key(email: &str) -> String {
 
 fn settings_of(account: &Account) -> Result<ServerSettings> {
     serde_json::from_value(account.settings.clone()).map_err(|e| CoreError::Settings(e.to_string()))
+}
+
+/// Synthetic part ids for POP3, where there are no IMAP sections.
+const TEXT_PART: &str = "text";
+const HTML_PART: &str = "html";
+
+struct DecodedPart {
+    part: String,
+    content_type: String,
+    is_html: bool,
+    data: String,
+}
+
+fn content_of(message_id: i64, body: MessageBody) -> MessageContent {
+    let text = body
+        .text
+        .or_else(|| body.html.as_deref().map(mail_parse::html_to_text));
+    MessageContent {
+        message_id,
+        body_state: body.state,
+        text,
+        html: body.html,
+        attachments: body
+            .attachments
+            .into_iter()
+            .map(|attachment| AttachmentInfo {
+                part: attachment.part,
+                filename: attachment.filename,
+                content_type: attachment.content_type,
+                size: attachment.size,
+                downloaded: attachment.downloaded,
+            })
+            .collect(),
+    }
+}
+
+fn uid_of(uid: i64) -> Result<u32> {
+    u32::try_from(uid)
+        .map_err(|_| CoreError::Settings(format!("uid {uid} is outside the IMAP range")))
+}
+
+/// Reduces a server-supplied attachment name to a safe basename.
+fn clean_attachment_name(raw: &str) -> String {
+    let decoded = mail_parse::decode_encoded_words(raw);
+    let base = decoded.rsplit(['/', '\\']).next().unwrap_or(&decoded);
+    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else if trimmed.chars().count() > 255 {
+        trimmed.chars().take(255).collect()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Builds a minimal RFC 5322 message. The body is base64 so any UTF-8 content

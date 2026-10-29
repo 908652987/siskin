@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -31,7 +32,7 @@ pub enum StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -110,6 +111,115 @@ pub struct ChangeRecord {
     pub entity_id: String,
     pub op: String,
     pub at: i64,
+}
+
+/// How much of a message's content is cached locally.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyState {
+    /// Only headers were synced; the server layout is unknown.
+    #[default]
+    Headers,
+    /// Layout or some parts are cached, but bodies or attachments are missing.
+    Partial,
+    /// Every body part and attachment is available offline.
+    Full,
+}
+
+impl BodyState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BodyState::Headers => "headers",
+            BodyState::Partial => "partial",
+            BodyState::Full => "full",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "full" => BodyState::Full,
+            "partial" => BodyState::Partial,
+            _ => BodyState::Headers,
+        }
+    }
+}
+
+/// One cached body alternative, as reported by BODYSTRUCTURE.
+#[derive(Debug, Clone)]
+pub struct StoredPart {
+    pub part: String,
+    pub content_type: String,
+    pub charset: Option<String>,
+    pub is_html: bool,
+    pub cached: bool,
+}
+
+/// Attachment metadata; `downloaded` is false until its blob is stored.
+#[derive(Debug, Clone)]
+pub struct StoredAttachment {
+    pub part: String,
+    pub filename: Option<String>,
+    pub content_type: String,
+    pub size: i64,
+    pub downloaded: bool,
+}
+
+/// Download information for one attachment.
+#[derive(Debug, Clone)]
+pub struct AttachmentMeta {
+    pub filename: Option<String>,
+    pub content_type: String,
+    pub encoding: Option<String>,
+    pub size: i64,
+}
+
+/// Everything cached for one message body. Text is decoded UTF-8; HTML is
+/// already sanitised.
+#[derive(Debug, Clone, Default)]
+pub struct MessageBody {
+    pub state: BodyState,
+    pub text: Option<String>,
+    pub html: Option<String>,
+    pub parts: Vec<StoredPart>,
+    pub attachments: Vec<StoredAttachment>,
+}
+
+/// Enough routing information to fetch a message's content from its server.
+#[derive(Debug, Clone)]
+pub struct MessageContext {
+    pub account_id: i64,
+    pub mailbox_id: i64,
+    pub mailbox_name: String,
+    pub uid: i64,
+    pub state: BodyState,
+}
+
+/// Body alternative to cache; `data` is the decoded UTF-8 payload.
+pub struct BodyPartInput<'a> {
+    pub part: &'a str,
+    pub content_type: &'a str,
+    pub charset: Option<&'a str>,
+    pub is_html: bool,
+    pub data: &'a [u8],
+}
+
+/// Layout entry recorded before any body bytes exist.
+pub struct PartMetaInput<'a> {
+    pub part: &'a str,
+    pub content_type: &'a str,
+    pub charset: Option<&'a str>,
+    pub is_html: bool,
+    pub size: i64,
+}
+
+/// Attachment entry recorded before its bytes are downloaded.
+pub struct AttachmentMetaInput<'a> {
+    pub part: &'a str,
+    pub filename: Option<&'a str>,
+    pub content_type: &'a str,
+    /// Transfer encoding (`base64`, `quoted-printable`, ...) for decoding.
+    pub encoding: Option<&'a str>,
+    pub size: i64,
 }
 
 /// 32-byte key for the encrypted database. SQLCipher derives its own page and
@@ -410,6 +520,38 @@ impl Store {
             "DELETE FROM message_locations WHERE mailbox_id = ?1",
             [mailbox_id],
         )?;
+        // Messages left without any location are dropped below; release the
+        // blobs they referenced first so the cache does not leak.
+        {
+            let mut stmt = tx.prepare(
+                "SELECT blob_hash, COUNT(*) FROM (
+                     SELECT blob_hash FROM message_parts
+                      WHERE message_id IN (
+                          SELECT id FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)
+                      ) AND blob_hash IS NOT NULL
+                     UNION ALL
+                     SELECT blob_hash FROM attachments
+                      WHERE message_id IN (
+                          SELECT id FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)
+                      ) AND blob_hash IS NOT NULL
+                 ) GROUP BY blob_hash",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let orphans: Vec<(Vec<u8>, i64)> = rows.collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            for (hash, count) in orphans {
+                tx.execute(
+                    "UPDATE blobs SET refcount = refcount - ?2 WHERE hash = ?1",
+                    params![hash, count],
+                )?;
+                tx.execute(
+                    "DELETE FROM blobs WHERE hash = ?1 AND refcount <= 0",
+                    [hash],
+                )?;
+            }
+        }
         tx.execute(
             "DELETE FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)",
             [],
@@ -552,6 +694,337 @@ impl Store {
             [account_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// Routing data needed to fetch one message's content from its server.
+    pub fn message_context(&self, message_id: i64) -> Result<Option<MessageContext>> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.query_row(
+            "SELECT m.account_id, l.mailbox_id, b.remote_name, l.uid, m.body_state
+             FROM messages m
+             JOIN message_locations l ON l.message_id = m.id
+             JOIN mailboxes b ON b.id = l.mailbox_id
+             WHERE m.id = ?1
+             ORDER BY l.mailbox_id LIMIT 1",
+            [message_id],
+            |row| {
+                Ok(MessageContext {
+                    account_id: row.get(0)?,
+                    mailbox_id: row.get(1)?,
+                    mailbox_name: row.get(2)?,
+                    uid: row.get(3)?,
+                    state: BodyState::parse(&row.get::<_, String>(4)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Records what a server says a message contains, without fetching bytes.
+    /// Parts missing from the new layout are dropped and their blobs released.
+    pub fn record_body_structure(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        parts: &[PartMetaInput<'_>],
+        attachments: &[AttachmentMetaInput<'_>],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+
+        let kept_parts: std::collections::HashSet<&str> =
+            parts.iter().map(|part| part.part).collect();
+        let kept_attachments: std::collections::HashSet<&str> = attachments
+            .iter()
+            .map(|attachment| attachment.part)
+            .collect();
+
+        prune_rows(&tx, "message_parts", message_id, &kept_parts)?;
+        prune_rows(&tx, "attachments", message_id, &kept_attachments)?;
+
+        for part in parts {
+            tx.execute(
+                "INSERT INTO message_parts (message_id, part, content_type, charset, is_html)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(message_id, part) DO UPDATE SET
+                     content_type = excluded.content_type,
+                     charset = COALESCE(excluded.charset, message_parts.charset),
+                     is_html = excluded.is_html",
+                params![
+                    message_id,
+                    part.part,
+                    part.content_type,
+                    part.charset,
+                    i64::from(part.is_html)
+                ],
+            )?;
+        }
+        for attachment in attachments {
+            tx.execute(
+                "INSERT INTO attachments (message_id, part, filename, content_type, encoding, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(message_id, part) DO UPDATE SET
+                     filename = COALESCE(excluded.filename, attachments.filename),
+                     content_type = excluded.content_type,
+                     encoding = COALESCE(excluded.encoding, attachments.encoding),
+                     size = excluded.size",
+                params![
+                    message_id,
+                    attachment.part,
+                    attachment.filename,
+                    attachment.content_type,
+                    attachment.encoding,
+                    attachment.size
+                ],
+            )?;
+        }
+
+        refresh_body_state(&tx, message_id)?;
+        record_change(
+            &tx,
+            account_id,
+            "message",
+            &message_id.to_string(),
+            "updated",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Caches decoded body alternatives. Re-storing identical bytes keeps the
+    /// existing blob so refcounts do not grow.
+    pub fn store_body_parts(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        parts: &[BodyPartInput<'_>],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        for part in parts {
+            let hash = hash_bytes(part.data);
+            let existing: Option<Option<Vec<u8>>> = tx
+                .query_row(
+                    "SELECT blob_hash FROM message_parts WHERE message_id = ?1 AND part = ?2",
+                    params![message_id, part.part],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let already_stored = existing.as_ref().and_then(|hash| hash.as_ref()) == Some(&hash);
+            if !already_stored {
+                store_blob(&tx, &hash, part.data)?;
+            }
+            tx.execute(
+                "INSERT INTO message_parts (message_id, part, content_type, charset, is_html, blob_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(message_id, part) DO UPDATE SET
+                     content_type = excluded.content_type,
+                     charset = COALESCE(excluded.charset, message_parts.charset),
+                     is_html = excluded.is_html,
+                     blob_hash = excluded.blob_hash",
+                params![
+                    message_id,
+                    part.part,
+                    part.content_type,
+                    part.charset,
+                    i64::from(part.is_html),
+                    hash
+                ],
+            )?;
+            if !already_stored {
+                if let Some(Some(old)) = existing {
+                    release_blob(&tx, &old)?;
+                }
+            }
+        }
+        refresh_body_state(&tx, message_id)?;
+        record_change(
+            &tx,
+            account_id,
+            "message",
+            &message_id.to_string(),
+            "updated",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Caches one attachment's bytes, replacing any previously stored copy.
+    pub fn store_attachment(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        part: &str,
+        content_type: &str,
+        filename: Option<&str>,
+        data: &[u8],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let hash = hash_bytes(data);
+        let existing: Option<Option<Vec<u8>>> = tx
+            .query_row(
+                "SELECT blob_hash FROM attachments WHERE message_id = ?1 AND part = ?2",
+                params![message_id, part],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let already_stored = existing.as_ref().and_then(|hash| hash.as_ref()) == Some(&hash);
+        if !already_stored {
+            store_blob(&tx, &hash, data)?;
+        }
+        tx.execute(
+            "INSERT INTO attachments (message_id, part, filename, content_type, size, blob_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(message_id, part) DO UPDATE SET
+                 filename = COALESCE(excluded.filename, attachments.filename),
+                 content_type = excluded.content_type,
+                 size = excluded.size,
+                 blob_hash = excluded.blob_hash",
+            params![
+                message_id,
+                part,
+                filename,
+                content_type,
+                data.len() as i64,
+                hash
+            ],
+        )?;
+        if !already_stored {
+            if let Some(Some(old)) = existing {
+                release_blob(&tx, &old)?;
+            }
+        }
+        refresh_body_state(&tx, message_id)?;
+        record_change(
+            &tx,
+            account_id,
+            "message",
+            &message_id.to_string(),
+            "updated",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Cached content of one message; `None` when the message is unknown.
+    pub fn message_body(&self, message_id: i64) -> Result<Option<MessageBody>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let state: Option<String> = conn
+            .query_row(
+                "SELECT body_state FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+
+        let mut body = MessageBody {
+            state: BodyState::parse(&state),
+            ..Default::default()
+        };
+        {
+            let mut stmt = conn.prepare(
+                "SELECT p.part, p.content_type, p.charset, p.is_html, b.data
+                 FROM message_parts p
+                 LEFT JOIN blobs b ON b.hash = p.blob_hash
+                 WHERE p.message_id = ?1
+                 ORDER BY p.part",
+            )?;
+            let rows = stmt.query_map([message_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (part, content_type, charset, is_html, data) = row?;
+                if let Some(bytes) = data.as_deref() {
+                    let text = String::from_utf8_lossy(bytes).to_string();
+                    if is_html {
+                        body.html.get_or_insert(text);
+                    } else {
+                        body.text.get_or_insert(text);
+                    }
+                }
+                body.parts.push(StoredPart {
+                    part,
+                    content_type,
+                    charset,
+                    is_html,
+                    cached: data.is_some(),
+                });
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT part, filename, content_type, size, blob_hash IS NOT NULL
+                 FROM attachments WHERE message_id = ?1 ORDER BY part",
+            )?;
+            let rows = stmt.query_map([message_id], |row| {
+                Ok(StoredAttachment {
+                    part: row.get(0)?,
+                    filename: row.get(1)?,
+                    content_type: row.get(2)?,
+                    size: row.get(3)?,
+                    downloaded: row.get::<_, i64>(4)? != 0,
+                })
+            })?;
+            for row in rows {
+                body.attachments.push(row?);
+            }
+        }
+        Ok(Some(body))
+    }
+
+    /// Cached bytes of one attachment, if it was downloaded already.
+    pub fn attachment_data(&self, message_id: i64, part: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT b.data FROM attachments a
+                 JOIN blobs b ON b.hash = a.blob_hash
+                 WHERE a.message_id = ?1 AND a.part = ?2",
+                params![message_id, part],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Metadata needed to download and decode one attachment.
+    pub fn attachment_meta(&self, message_id: i64, part: &str) -> Result<Option<AttachmentMeta>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT filename, content_type, encoding, size FROM attachments
+                 WHERE message_id = ?1 AND part = ?2",
+                params![message_id, part],
+                |row| {
+                    Ok(AttachmentMeta {
+                        filename: row.get(0)?,
+                        content_type: row.get(1)?,
+                        encoding: row.get(2)?,
+                        size: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Total bytes held by cached bodies and attachments.
+    pub fn blob_bytes(&self) -> Result<i64> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(
+            conn.query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+                row.get(0)
+            })?,
+        )
     }
 
     pub fn local_uids(&self, mailbox_id: i64) -> Result<std::collections::HashSet<i64>> {
@@ -726,6 +1199,101 @@ fn index_message(tx: &Transaction<'_>, id: i64, msg: &NewMessage) -> Result<()> 
     Ok(())
 }
 
+/// Content hash used as the blob key; content addressing gives dedupe for free.
+fn hash_bytes(data: &[u8]) -> Vec<u8> {
+    Sha256::digest(data).to_vec()
+}
+
+/// Inserts a blob or bumps its refcount when the same bytes already exist.
+fn store_blob(tx: &Transaction<'_>, hash: &[u8], data: &[u8]) -> Result<()> {
+    tx.execute(
+        "INSERT INTO blobs (hash, size, encoding, refcount, data)
+         VALUES (?1, ?2, 'identity', 1, ?3)
+         ON CONFLICT(hash) DO UPDATE SET refcount = blobs.refcount + 1",
+        params![hash, data.len() as i64, data],
+    )?;
+    Ok(())
+}
+
+/// Drops one reference and deletes the blob once nothing points at it.
+fn release_blob(tx: &Transaction<'_>, hash: &[u8]) -> Result<()> {
+    tx.execute(
+        "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
+        [hash],
+    )?;
+    tx.execute(
+        "DELETE FROM blobs WHERE hash = ?1 AND refcount <= 0",
+        [hash],
+    )?;
+    Ok(())
+}
+
+/// Removes layout rows that the server no longer reports, releasing blobs.
+fn prune_rows(
+    tx: &Transaction<'_>,
+    table: &'static str,
+    message_id: i64,
+    kept: &std::collections::HashSet<&str>,
+) -> Result<()> {
+    let (select, delete) = match table {
+        "message_parts" => (
+            "SELECT part, blob_hash FROM message_parts WHERE message_id = ?1",
+            "DELETE FROM message_parts WHERE message_id = ?1 AND part = ?2",
+        ),
+        "attachments" => (
+            "SELECT part, blob_hash FROM attachments WHERE message_id = ?1",
+            "DELETE FROM attachments WHERE message_id = ?1 AND part = ?2",
+        ),
+        other => {
+            return Err(StoreError::Sqlite(rusqlite::Error::InvalidParameterName(
+                other.to_string(),
+            )))
+        }
+    };
+    let stale: Vec<(String, Option<Vec<u8>>)> = {
+        let mut stmt = tx.prepare(select)?;
+        let rows = stmt.query_map([message_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (part, hash) in stale {
+        if kept.contains(part.as_str()) {
+            continue;
+        }
+        tx.execute(delete, params![message_id, part])?;
+        if let Some(hash) = hash {
+            release_blob(tx, &hash)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recomputes `messages.body_state` and `has_attach` from the cache tables.
+fn refresh_body_state(tx: &Transaction<'_>, message_id: i64) -> Result<()> {
+    let counts =
+        |sql: &str| -> Result<i64> { Ok(tx.query_row(sql, [message_id], |row| row.get(0))?) };
+    let body_total = counts("SELECT COUNT(*) FROM message_parts WHERE message_id = ?1")?;
+    let body_missing =
+        counts("SELECT COUNT(*) FROM message_parts WHERE message_id = ?1 AND blob_hash IS NULL")?;
+    let attachment_total = counts("SELECT COUNT(*) FROM attachments WHERE message_id = ?1")?;
+    let attachment_missing =
+        counts("SELECT COUNT(*) FROM attachments WHERE message_id = ?1 AND blob_hash IS NULL")?;
+
+    let state = if body_total == 0 && attachment_total == 0 {
+        BodyState::Headers
+    } else if body_missing == 0 && attachment_missing == 0 {
+        BodyState::Full
+    } else {
+        BodyState::Partial
+    };
+    tx.execute(
+        "UPDATE messages SET body_state = ?2, has_attach = ?3 WHERE id = ?1",
+        params![message_id, state.as_str(), i64::from(attachment_total > 0)],
+    )?;
+    Ok(())
+}
+
 fn record_change(
     tx: &Transaction<'_>,
     account_id: i64,
@@ -807,6 +1375,38 @@ CREATE TABLE IF NOT EXISTS changes (
   at           INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS changes_account_seq ON changes (account_id, seq);
+
+-- Content-addressed bodies and attachments; refcount keeps one copy per hash.
+CREATE TABLE IF NOT EXISTS blobs (
+  hash     BLOB PRIMARY KEY,
+  size     INTEGER NOT NULL,
+  encoding TEXT NOT NULL DEFAULT 'identity',
+  refcount INTEGER NOT NULL DEFAULT 1,
+  data     BLOB NOT NULL
+);
+
+-- Cached body alternatives of one message (already decoded and sanitised).
+CREATE TABLE IF NOT EXISTS message_parts (
+  message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  part         TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  charset      TEXT,
+  is_html      INTEGER NOT NULL DEFAULT 0,
+  blob_hash    BLOB,
+  PRIMARY KEY (message_id, part)
+);
+
+-- Attachment metadata; blob_hash stays NULL until the bytes are downloaded.
+CREATE TABLE IF NOT EXISTS attachments (
+  message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  part         TEXT NOT NULL,
+  filename     TEXT,
+  content_type TEXT NOT NULL,
+  encoding     TEXT,
+  size         INTEGER NOT NULL DEFAULT 0,
+  blob_hash    BLOB,
+  PRIMARY KEY (message_id, part)
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   subject, from_text, to_text, snippet,

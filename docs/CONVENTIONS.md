@@ -138,7 +138,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 4. 体积与编译时间：核心 crate 避免引入大型传递依赖（例如不要为一个小功能引入 `tokio-full`）。
 5. 记录：在提交信息里写明“为什么需要它”。
 
-当前核心依赖：`tokio`、`async-imap`、`rustls`/`tokio-rustls`、`rusqlite`（SQLCipher）、`serde`、`thiserror`、`keyring`、`chacha20poly1305`、`hkdf`/`sha2`。
+当前核心依赖：`tokio`、`async-imap`、`rustls`/`tokio-rustls`、`rusqlite`（SQLCipher）、`serde`、`thiserror`、`keyring`、`chacha20poly1305`、`hkdf`/`sha2`、`ammonia`（HTML 净化）、`encoding_rs`（字符集）、`quoted_printable`（正文解码）。
 
 ---
 

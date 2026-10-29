@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_imap::imap_proto::types::Address;
+use async_imap::imap_proto::types::{
+    Address, BodyContentCommon, BodyContentSinglePart, BodyStructure, ContentEncoding,
+    MessageSection, SectionPath,
+};
 use async_imap::types::{Capability, Flag, Name};
 use async_imap::Session;
 use chrono::{DateTime, FixedOffset};
@@ -116,6 +119,44 @@ pub struct FetchedMessage {
     pub to: Vec<String>,
     pub message_id: Option<String>,
     pub sent_at: Option<i64>,
+}
+
+/// One leaf of a message's BODYSTRUCTURE, as needed to fetch and label bodies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyPartMeta {
+    /// IMAP section path: `""` for a single-part message, `1`, `2.1`, ...
+    pub part: String,
+    /// Lowercase `type/subtype`.
+    pub content_type: String,
+    pub charset: Option<String>,
+    /// Transfer encoding: `base64`, `quoted-printable`, `7bit`, ...
+    pub encoding: String,
+    pub size: u32,
+    pub filename: Option<String>,
+    /// Lowercase disposition type (`inline`, `attachment`), if any.
+    pub disposition: Option<String>,
+    pub content_id: Option<String>,
+}
+
+impl BodyPartMeta {
+    /// Whether this leaf is a body alternative rather than an attachment.
+    pub fn is_body_text(&self) -> bool {
+        self.disposition.as_deref() != Some("attachment")
+            && self.filename.is_none()
+            && (self.content_type == "text/plain" || self.content_type == "text/html")
+    }
+}
+
+/// Flattened BODYSTRUCTURE: only leaves, in fetch order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyLayout {
+    pub parts: Vec<BodyPartMeta>,
+}
+
+impl BodyLayout {
+    pub fn has_attachments(&self) -> bool {
+        self.parts.iter().any(|part| !part.is_body_text())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +372,56 @@ impl ImapSession {
         Ok(set.into_iter().collect())
     }
 
+    /// Reads the BODYSTRUCTURE of one message without touching its bodies.
+    pub async fn fetch_body_layout(&mut self, uid: u32) -> Result<BodyLayout> {
+        let mut stream = self
+            .session()
+            .uid_fetch(uid.to_string(), "(UID BODYSTRUCTURE)")
+            .await?;
+        let mut layout = None;
+        while let Some(item) = stream.try_next().await? {
+            if let Some(structure) = item.bodystructure() {
+                layout = Some(flatten_structure(structure));
+            }
+        }
+        drop(stream);
+        layout.ok_or_else(|| {
+            ProtoError::Unexpected(format!("server returned no BODYSTRUCTURE for uid {uid}"))
+        })
+    }
+
+    /// Fetches one body section with `BODY.PEEK`, so it never sets `\Seen`.
+    ///
+    /// Bytes are returned exactly as stored by the server, still transfer
+    /// encoded; decoding is the caller's job.
+    pub async fn fetch_part(&mut self, uid: u32, part: &str) -> Result<Vec<u8>> {
+        let section = if part.is_empty() {
+            "TEXT".to_string()
+        } else {
+            part.to_string()
+        };
+        let path = section_path(part);
+        let mut stream = self
+            .session()
+            .uid_fetch(uid.to_string(), format!("(UID BODY.PEEK[{section}])"))
+            .await?;
+        let mut out = Vec::new();
+        let mut matched = false;
+        while let Some(item) = stream.try_next().await? {
+            if let Some(bytes) = item.section(&path) {
+                matched = true;
+                out.extend_from_slice(bytes);
+            }
+        }
+        drop(stream);
+        if !matched {
+            return Err(ProtoError::Unexpected(format!(
+                "server returned no section {section:?} for uid {uid}"
+            )));
+        }
+        Ok(out)
+    }
+
     pub async fn append(&mut self, mailbox: &str, flags: Option<&str>, body: &[u8]) -> Result<()> {
         self.session().append(mailbox, flags, None, body).await?;
         Ok(())
@@ -508,5 +599,243 @@ fn format_address(addr: &Address<'_>) -> String {
     {
         Some(name) if !name.is_empty() => format!("{name} <{email}>"),
         _ => email,
+    }
+}
+
+/// Flattens a BODYSTRUCTURE into fetchable leaves with IMAP section paths.
+fn flatten_structure(root: &BodyStructure<'_>) -> BodyLayout {
+    let mut parts = Vec::new();
+    match root {
+        BodyStructure::Multipart { bodies, .. } => {
+            for (index, child) in bodies.iter().enumerate() {
+                flatten_part(child, &(index + 1).to_string(), &mut parts);
+            }
+        }
+        leaf => flatten_part(leaf, "", &mut parts),
+    }
+    BodyLayout { parts }
+}
+
+fn flatten_part(node: &BodyStructure<'_>, part: &str, out: &mut Vec<BodyPartMeta>) {
+    match node {
+        // Nested multiparts add their own level: `1` -> `1.1`, `1.2`.
+        BodyStructure::Multipart { bodies, .. } => {
+            for (index, child) in bodies.iter().enumerate() {
+                flatten_part(child, &format!("{part}.{}", index + 1), out);
+            }
+        }
+        BodyStructure::Text { common, other, .. }
+        | BodyStructure::Basic { common, other, .. }
+        | BodyStructure::Message { common, other, .. } => out.push(part_meta(common, other, part)),
+    }
+}
+
+fn part_meta(
+    common: &BodyContentCommon<'_>,
+    single: &BodyContentSinglePart<'_>,
+    part: &str,
+) -> BodyPartMeta {
+    let content_type = format!(
+        "{}/{}",
+        common.ty.ty.to_ascii_lowercase(),
+        common.ty.subtype.to_ascii_lowercase()
+    );
+    let params = common.ty.params.as_deref().unwrap_or_default();
+    let filename = common
+        .disposition
+        .as_ref()
+        .and_then(|disposition| disposition.params.as_deref())
+        .and_then(|params| param(params, "filename"))
+        .or_else(|| param(params, "name"));
+    BodyPartMeta {
+        part: part.to_string(),
+        content_type,
+        charset: param(params, "charset"),
+        encoding: encoding_name(&single.transfer_encoding),
+        size: single.octets,
+        filename,
+        disposition: common
+            .disposition
+            .as_ref()
+            .map(|disposition| disposition.ty.to_ascii_lowercase()),
+        content_id: single
+            .id
+            .as_ref()
+            .map(|id| id.trim_matches(['<', '>']).to_string()),
+    }
+}
+
+fn param(
+    params: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
+    key: &str,
+) -> Option<String> {
+    params
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.to_string())
+}
+
+fn encoding_name(encoding: &ContentEncoding<'_>) -> String {
+    match encoding {
+        ContentEncoding::SevenBit => "7bit".to_string(),
+        ContentEncoding::EightBit => "8bit".to_string(),
+        ContentEncoding::Binary => "binary".to_string(),
+        ContentEncoding::Base64 => "base64".to_string(),
+        ContentEncoding::QuotedPrintable => "quoted-printable".to_string(),
+        ContentEncoding::Other(value) => value.to_ascii_lowercase(),
+    }
+}
+
+/// Maps a part path to the section the server echoes back in FETCH.
+fn section_path(part: &str) -> SectionPath {
+    if part.is_empty() {
+        return SectionPath::Full(MessageSection::Text);
+    }
+    let numbers: Vec<u32> = part
+        .split('.')
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    SectionPath::Part(numbers, None)
+}
+
+#[cfg(test)]
+mod body_structure_tests {
+    use super::*;
+    use async_imap::imap_proto::types::{BodyExtension, ContentDisposition, ContentType};
+    use std::borrow::Cow;
+
+    fn common(
+        ty: &'static str,
+        subtype: &'static str,
+        params: &[(&'static str, &'static str)],
+        disposition: Option<(&'static str, &'static str, &'static str)>,
+    ) -> BodyContentCommon<'static> {
+        let params = if params.is_empty() {
+            None
+        } else {
+            Some(
+                params
+                    .iter()
+                    .map(|(k, v)| (Cow::Borrowed(*k), Cow::Borrowed(*v)))
+                    .collect(),
+            )
+        };
+        BodyContentCommon {
+            ty: ContentType {
+                ty: Cow::Borrowed(ty),
+                subtype: Cow::Borrowed(subtype),
+                params,
+            },
+            disposition: disposition.map(|(dtype, key, value)| ContentDisposition {
+                ty: Cow::Borrowed(dtype),
+                params: Some(vec![(Cow::Borrowed(key), Cow::Borrowed(value))]),
+            }),
+            language: None,
+            location: None,
+        }
+    }
+
+    fn single(encoding: ContentEncoding<'static>) -> BodyContentSinglePart<'static> {
+        BodyContentSinglePart {
+            id: None,
+            md5: None,
+            description: None,
+            transfer_encoding: encoding,
+            octets: 42,
+        }
+    }
+
+    fn text(common: BodyContentCommon<'static>) -> BodyStructure<'static> {
+        BodyStructure::Text {
+            common,
+            other: single(ContentEncoding::QuotedPrintable),
+            lines: 1,
+            extension: None::<BodyExtension<'static>>,
+        }
+    }
+
+    fn attachment(name: &'static str) -> BodyStructure<'static> {
+        BodyStructure::Basic {
+            common: common(
+                "application",
+                "pdf",
+                &[("name", name)],
+                Some(("attachment", "filename", name)),
+            ),
+            other: single(ContentEncoding::Base64),
+            extension: None::<BodyExtension<'static>>,
+        }
+    }
+
+    fn multipart(children: Vec<BodyStructure<'static>>) -> BodyStructure<'static> {
+        BodyStructure::Multipart {
+            common: common("multipart", "mixed", &[], None),
+            bodies: children,
+            extension: None::<BodyExtension<'static>>,
+        }
+    }
+
+    #[test]
+    fn single_part_message_uses_the_text_section() {
+        let layout = flatten_structure(&text(common(
+            "text",
+            "plain",
+            &[("charset", "utf-8")],
+            None,
+        )));
+        assert_eq!(layout.parts.len(), 1);
+        assert_eq!(layout.parts[0].part, "");
+        assert_eq!(layout.parts[0].content_type, "text/plain");
+        assert_eq!(layout.parts[0].charset.as_deref(), Some("utf-8"));
+        assert_eq!(layout.parts[0].encoding, "quoted-printable");
+        assert!(!layout.has_attachments());
+    }
+
+    #[test]
+    fn alternative_parts_are_numbered_in_order() {
+        let layout = flatten_structure(&BodyStructure::Multipart {
+            common: common("multipart", "alternative", &[], None),
+            bodies: vec![
+                text(common("text", "plain", &[], None)),
+                text(common("text", "html", &[], None)),
+            ],
+            extension: None::<BodyExtension<'static>>,
+        });
+        let parts: Vec<&str> = layout.parts.iter().map(|p| p.part.as_str()).collect();
+        assert_eq!(parts, vec!["1", "2"]);
+        assert_eq!(layout.parts[0].content_type, "text/plain");
+        assert_eq!(layout.parts[1].content_type, "text/html");
+        assert!(!layout.has_attachments());
+    }
+
+    #[test]
+    fn nested_multipart_numbers_parts_by_path() {
+        let layout = flatten_structure(&multipart(vec![
+            text(common("text", "plain", &[], None)),
+            BodyStructure::Multipart {
+                common: common("multipart", "alternative", &[], None),
+                bodies: vec![
+                    text(common("text", "html", &[], None)),
+                    attachment("report.pdf"),
+                ],
+                extension: None::<BodyExtension<'static>>,
+            },
+        ]));
+        let parts: Vec<&str> = layout.parts.iter().map(|p| p.part.as_str()).collect();
+        assert_eq!(parts, vec!["1", "2.1", "2.2"]);
+        assert_eq!(layout.parts[2].filename.as_deref(), Some("report.pdf"));
+        assert_eq!(layout.parts[2].disposition.as_deref(), Some("attachment"));
+        assert_eq!(layout.parts[2].encoding, "base64");
+        assert!(
+            !layout.parts[2].is_body_text(),
+            "attachments are not bodies"
+        );
+        assert!(layout.has_attachments());
+    }
+
+    #[test]
+    fn section_paths_match_imap_sections() {
+        assert_eq!(section_path(""), SectionPath::Full(MessageSection::Text));
+        assert_eq!(section_path("2.1"), SectionPath::Part(vec![2, 1], None));
     }
 }

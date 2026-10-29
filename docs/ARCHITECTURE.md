@@ -142,7 +142,7 @@ mail-hub → mail-api, mail-core
 ```sql
 -- 账户：凭据不落库，只存钥匙串引用
 CREATE TABLE accounts (
-  id            TEXT PRIMARY KEY,
+  id            INTEGER PRIMARY KEY,
   provider      TEXT NOT NULL,          -- imap | gmail | graph
   email         TEXT NOT NULL,
   display_name  TEXT,
@@ -153,8 +153,8 @@ CREATE TABLE accounts (
 
 -- 邮箱/文件夹
 CREATE TABLE mailboxes (
-  id             TEXT PRIMARY KEY,
-  account_id     TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id             INTEGER PRIMARY KEY,
+  account_id     INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   remote_name    TEXT NOT NULL,
   role           TEXT,                  -- inbox|sent|drafts|trash|archive|spam
   uidvalidity    INTEGER,
@@ -166,8 +166,8 @@ CREATE TABLE mailboxes (
 
 -- 邮件主体（一封邮件一行，与所在文件夹解耦）
 CREATE TABLE messages (
-  id            TEXT PRIMARY KEY,
-  account_id    TEXT NOT NULL,
+  id            INTEGER PRIMARY KEY,
+  account_id    INTEGER NOT NULL,
   message_id    TEXT,                   -- RFC 5322 Message-ID
   thread_id     TEXT,
   subject       TEXT,
@@ -183,25 +183,49 @@ CREATE TABLE messages (
 
 -- 邮件在文件夹中的位置（Gmail 标签 = 多行）
 CREATE TABLE message_locations (
-  message_id  TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-  mailbox_id  TEXT NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+  message_id  INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  mailbox_id  INTEGER NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
   uid         INTEGER NOT NULL,
   flags       TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (message_id, mailbox_id)
 );
 
--- 内容寻址的正文与附件
+-- 内容寻址的正文与附件；同一份字节只存一行，引用计数归零才回收
 CREATE TABLE blobs (
   hash        BLOB PRIMARY KEY,         -- sha256
   size        INTEGER NOT NULL,
-  encoding    TEXT NOT NULL,            -- zstd|identity
-  refcount    INTEGER NOT NULL DEFAULT 1
+  encoding    TEXT NOT NULL,            -- zstd|identity（当前实现只写 identity）
+  refcount    INTEGER NOT NULL DEFAULT 1,
+  data        BLOB NOT NULL
+);
+
+-- 正文部件：已按传输编码解码为 UTF-8，HTML 已净化后才入库
+CREATE TABLE message_parts (
+  message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  part         TEXT NOT NULL,           -- IMAP section 路径；POP3 用 text/html 两个固定键
+  content_type TEXT NOT NULL,
+  charset      TEXT,
+  is_html      INTEGER NOT NULL DEFAULT 0,
+  blob_hash    BLOB,
+  PRIMARY KEY (message_id, part)
+);
+
+-- 附件元数据；blob_hash 为空表示尚未按需下载
+CREATE TABLE attachments (
+  message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  part         TEXT NOT NULL,
+  filename     TEXT,
+  content_type TEXT NOT NULL,
+  encoding     TEXT,                    -- base64|quoted-printable|...，下载时用于解码
+  size         INTEGER NOT NULL DEFAULT 0,
+  blob_hash    BLOB,
+  PRIMARY KEY (message_id, part)
 );
 
 -- 变更日志：客户端增量同步的唯一来源
 CREATE TABLE changes (
   seq         INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_id  TEXT NOT NULL,
+  account_id  INTEGER NOT NULL,
   entity_type TEXT NOT NULL,            -- message|mailbox|calendar|event|settings
   entity_id   TEXT NOT NULL,
   op          TEXT NOT NULL,            -- created|updated|destroyed
@@ -367,7 +391,7 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 | 本地库 | SQLCipher（`bundled-sqlcipher-vendored-openssl`）；主密钥存钥匙串，库密钥由它经 HKDF-SHA256 派生；FTS 索引随库加密；明文旧库拒绝打开；主密钥可导出/导入做人工恢复 |
 | 邮件 HTML | 核心侧 `ammonia` 白名单净化；图片默认全阻断，仅放行 `cid:` 与光栅 data URI（含相对路径与 `srcset`）；UI 侧禁用 JS 的沙箱 WebView；CSP `default-src 'none'` |
 | 远程内容 | 默认阻断；放行时经 Hub 代理，剥离 Referer 与追踪参数 |
-| 附件 | 隔离目录、按需下载、可执行类型拦截、不做自动打开 |
+| 附件 | 字节存加密库的 `blobs`（内容寻址，按需下载）；导出/打开时落到隔离目录，可执行类型拦截，不做自动打开 |
 | 日志 | 不记录正文、地址、令牌；只记录 id 前缀与错误码 |
 | 更新 | 平台签名 + 制品哈希校验 |
 | Hub 暴露面 | 仅 HTTPS、限流、登录失败锁定、设备吊销列表、审计日志 |

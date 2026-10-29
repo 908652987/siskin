@@ -48,6 +48,9 @@ async fn pop3_lists_messages_and_reads_headers() {
                     "+OK\r\nSubject: one\r\nFrom: a@example.com\r\nMessage-ID: <one@example.com>\r\nDate: Tue, 01 Oct 2024 10:00:00 +0800\r\n\r\n.\r\n".to_string()
                 }
                 "TOP 2 0" => "+OK\r\nSubject: two\r\n\r\n.\r\n".to_string(),
+                "RETR 2" => {
+                    "+OK\r\nSubject: two\r\n\r\nline one\r\n..dotted\r\n.\r\n".to_string()
+                }
                 "QUIT" => "+OK bye\r\n".to_string(),
                 other => format!("-ERR unknown {other}\r\n"),
             };
@@ -76,6 +79,11 @@ async fn pop3_lists_messages_and_reads_headers() {
     assert_eq!(messages[0].size, 120);
     let headers = session.headers(1).await.expect("headers");
     assert!(headers.contains("Subject: one"));
+    let raw = session.retrieve(2).await.expect("retr");
+    assert_eq!(
+        String::from_utf8(raw).expect("utf8"),
+        "Subject: two\r\n\r\nline one\r\n.dotted\r\n"
+    );
     session.quit().await;
 
     let seen = mock.handle.await.expect("mock");

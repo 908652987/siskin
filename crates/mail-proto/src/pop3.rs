@@ -133,6 +133,27 @@ impl Pop3Session {
         let _ = self.command("QUIT").await;
     }
 
+    /// Retrieves the whole message. POP3 has no partial fetch, so bodies and
+    /// attachments arrive together and the caller parses them out.
+    ///
+    /// Lines are rejoined with CRLF and dot-stuffed lines are unstuffed, so the
+    /// result is semantically identical but not byte-identical to the original.
+    pub async fn retrieve(&mut self, number: u32) -> Result<Vec<u8>> {
+        let reply = self.command(&format!("RETR {number}")).await?;
+        if !reply.starts_with("+OK") {
+            return Err(ProtoError::Unexpected(format!(
+                "POP3 RETR {number} was refused"
+            )));
+        }
+        let lines = self.multiline().await?;
+        let mut out = Vec::with_capacity(lines.iter().map(|line| line.len() + 2).sum());
+        for line in lines {
+            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        Ok(out)
+    }
+
     async fn list_sizes(&mut self) -> Result<Vec<(u32, u64)>> {
         let reply = self.command("LIST").await?;
         if !reply.starts_with("+OK") {
@@ -188,7 +209,11 @@ impl Pop3Session {
             if line == "." {
                 break;
             }
-            lines.push(line.strip_prefix("..").unwrap_or(&line).to_string());
+            // Dot-stuffing prepends one dot, so remove exactly one.
+            match line.strip_prefix('.') {
+                Some(rest) => lines.push(rest.to_string()),
+                None => lines.push(line),
+            }
         }
         Ok(lines)
     }

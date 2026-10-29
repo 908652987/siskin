@@ -40,7 +40,7 @@ fn parse() -> Result<Args, String> {
     Ok(Args {
         db,
         command: command.ok_or(
-            "missing command: add-account | check | send | accounts | sync | watch | list | stats | export-key | import-key",
+            "missing command: add-account | check | send | accounts | sync | watch | list | body | attachment | stats | export-key | import-key",
         )?,
         flags,
     })
@@ -68,6 +68,13 @@ fn password_from(flags: &HashMap<String, String>) -> Result<String, String> {
         return Ok(password);
     }
     required(flags, "password")
+}
+
+/// Message ids are local row ids, not IMAP UIDs.
+fn message_id_from(flags: &HashMap<String, String>) -> Result<i64, String> {
+    required(flags, "id")?
+        .parse()
+        .map_err(|_| "bad --id; expected a numeric local message id from `list`".to_string())
 }
 
 fn flag_bool(flags: &HashMap<String, String>, name: &str, default: bool) -> bool {
@@ -373,7 +380,8 @@ async fn run() -> Result<(), String> {
                     })
                     .unwrap_or_else(|| "-".to_string());
                 println!(
-                    "{when}  uid={:<6} [{}]  {} — {}",
+                    "{when}  id={:<6} uid={:<6} [{}]  {} — {}",
+                    msg.id,
                     msg.uid,
                     if msg.flags.iter().any(|f| f == "\\Seen") {
                         " "
@@ -383,6 +391,61 @@ async fn run() -> Result<(), String> {
                     msg.from.first().cloned().unwrap_or_default(),
                     msg.subject.unwrap_or_default()
                 );
+            }
+        }
+        "body" => {
+            let email = required(&args.flags, "email")?;
+            let id = message_id_from(&args.flags)?;
+            let content = core
+                .fetch_body(&email, id)
+                .await
+                .map_err(|e| e.to_string())?;
+            eprintln!(
+                "state={} text_bytes={} html_bytes={} attachments={}",
+                content.body_state.as_str(),
+                content.text.as_ref().map(String::len).unwrap_or(0),
+                content.html.as_ref().map(String::len).unwrap_or(0),
+                content.attachments.len()
+            );
+            for attachment in &content.attachments {
+                eprintln!(
+                    "attachment part={} type={} size={} downloaded={} name={}",
+                    attachment.part,
+                    attachment.content_type,
+                    attachment.size,
+                    attachment.downloaded,
+                    attachment.filename.as_deref().unwrap_or("-")
+                );
+            }
+            let body = if flag_bool(&args.flags, "html", false) {
+                content.html.clone()
+            } else {
+                content.text.clone()
+            };
+            match body {
+                Some(body) => println!("{body}"),
+                None => return Err("message has no body part of the requested kind".to_string()),
+            }
+        }
+        "attachment" => {
+            let email = required(&args.flags, "email")?;
+            let id = message_id_from(&args.flags)?;
+            let part = required(&args.flags, "part")?;
+            let data = core
+                .fetch_attachment(&email, id, &part)
+                .await
+                .map_err(|e| e.to_string())?;
+            match args.flags.get("out") {
+                Some(path) => {
+                    std::fs::write(path, &data).map_err(|e| format!("writing {path}: {e}"))?;
+                    println!("wrote {} bytes to {path}", data.len());
+                }
+                None => {
+                    use std::io::Write as _;
+                    std::io::stdout()
+                        .write_all(&data)
+                        .map_err(|e| format!("writing attachment to stdout: {e}"))?;
+                }
             }
         }
         "stats" => {
@@ -398,9 +461,10 @@ async fn run() -> Result<(), String> {
             let seq = store
                 .latest_change_seq(account.id)
                 .map_err(|e| e.to_string())?;
+            let blob_bytes = store.blob_bytes().map_err(|e| e.to_string())?;
             println!(
-                "account={} messages={} change_seq={}",
-                account.email, count, seq
+                "account={} messages={} change_seq={} blob_bytes={}",
+                account.email, count, seq, blob_bytes
             );
         }
         other => return Err(format!("unknown command: {other}")),

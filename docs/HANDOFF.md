@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；**图形界面、日历、Hub 服务端尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；**图形界面、日历、Hub 服务端尚未开始**。
 
 ---
 
@@ -51,7 +51,8 @@
 | 提供商预设 | 完成 | `gmail/qq/88/custom`；QQ/88/Gmail 主机与端口已用登录尝试验证 |
 | Outlook / Hotmail | **不做（范围决策）** | 微软已禁用密码登录，仅 OAuth2；测试账号无 Entra 租户无法取得应用身份 |
 | Gmail（应用专用密码） | 待真实验证 | 密码路径已就绪；需 Gmail 开启 IMAP + 2FA 应用专用密码 |
-| 正文与附件拉取、HTML 渲染 | 未开始 | 仅存头部 |
+| 正文与附件拉取 | 完成 | `mail-proto` BODYSTRUCTURE + `BODY.PEEK`；`mail-parse` 解码与净化；Dovecot 实跑，二次打开离线 39 ms |
+| HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
 | 多邮箱遍历 | 部分 | 协议层可列邮箱，门面只同步 INBOX |
 | Hub / JMAP | 未开始 | |
 | 日历 | 未开始 | |
@@ -70,22 +71,28 @@ crates/
                            MasterKey（HKDF 发送子密钥）、seal/open（XChaCha20-Poly1305 + AAD）
   mail-store/src/lib.rs    SQLCipher 打开（PRAGMA key + 错密钥/明文库拒绝）、schema、
                            迁移、账户/邮箱/消息/位置/变更日志、
-                           apply_fetch（事务）、search_messages（FTS/LIKE 双路）
-  mail-store/tests/        9 个存储测试（含错密钥、明文库、落盘无明文）
+                           apply_fetch（事务）、search_messages（FTS/LIKE 双路）、
+                           blobs（内容寻址 + 引用计数）、message_parts/attachments、
+                           record_body_structure/store_body_parts/store_attachment
+  mail-store/tests/        14 个存储测试（含错密钥、明文库、落盘无明文、blob 回收）
   mail-proto/src/lib.rs    Stream（TLS/明文/STARTTLS）、ImapSession、CapabilitySet、
                            Tier(A/B/C)、fetch_range/fetch_flags/CHANGEDSINCE、
-                           list_uids、append、add_flag、move_message、idle_wait
-  mail-proto/src/pop3.rs   POP3：LIST/UIDL/TOP、STLS、USER/PASS
+                           list_uids、fetch_body_layout（BODYSTRUCTURE 扁平化）、
+                           fetch_part（BODY.PEEK）、append、add_flag、move_message、idle_wait
+  mail-parse/src/lib.rs    MIME 解码（base64/QP/charset/RFC 2047）、ammonia 净化、
+                           HTML→纯文本、整封解析（POP3）
+  mail-proto/src/pop3.rs   POP3：LIST/UIDL/TOP/RETR、STLS、USER/PASS
   mail-proto/src/smtp.rs   SMTP：EHLO、STARTTLS、AUTH PLAIN/LOGIN、DATA
   mail-sync/src/lib.rs     sync_mailbox：UIDVALIDITY 重建、全量/增量、
                            删除检测、合并去重；3 个单测
   mail-sync/src/pop3.rs    POP3 镜像：UIDL 去重、头部解析、轮询、删除跟随服务器
   mail-core/src/lib.rs     Core：主密钥（钥匙串）→ HKDF → 库密钥、
                            add_account（密码入钥匙串）、协议分派、sync、watch、
-                           check、send（SMTP + Sent 归档）
+                           check、send（SMTP + Sent 归档）、
+                           fetch_body（缓存优先）、fetch_attachment（按需）
   mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
   mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch /
-                           list / stats / export-key / import-key
+                           list / body / attachment / stats / export-key / import-key
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -110,7 +117,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 36 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 66 个测试全过
 ~/.cargo/bin/cargo build --release
 
 # 2) 起测试服务器
@@ -124,6 +131,12 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db add-account \
 cargo run --release -p mail-cli -- --db /tmp/smoke.db sync --email vmail@example.com
 cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@example.com
 cargo run --release -p mail-cli -- --db /tmp/smoke.db check --email vmail@example.com
+
+# 3.1) 正文与附件：id 取自 list 的 id= 列，附件 part 取自 body 的 stderr 输出
+cargo run --release -p mail-cli -- --db /tmp/smoke.db list --email vmail@example.com --limit 5
+cargo run --release -p mail-cli -- --db /tmp/smoke.db body --email vmail@example.com --id 42
+cargo run --release -p mail-cli -- --db /tmp/smoke.db attachment --email vmail@example.com \
+  --id 42 --part 2 --out /tmp/attachment.bin
 
 # 4) 主密钥备份 / 恢复（输出即密钥本身：存进密码管理器，勿贴日志或提交）
 cargo run --release -p mail-cli -- --db /tmp/smoke.db export-key
@@ -171,7 +184,11 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | STARTTLS（88：IMAP 143 / POP3 110 / SMTP 587） | 三类协议均升级成功并进入 AUTH；错误口令被拒 |
 | POP3 同步（mock） | 2 封入库；UIDL 消失后 removed=1 |
 | SMTP（mock） | AUTH PLAIN、MAIL/RCPT/DATA、点填充校验通过 |
-| 邮件 HTML 净化 | 9 组攻击样本 0 失败；净化后外部请求 0 |
+| 邮件 HTML 净化 | 9 组攻击样本 0 失败；净化后外部请求 0；已并入 `mail-parse` 单测 |
+| 正文首次拉取（multipart/alternative + 附件） | `state=partial`；附件下载后 `state=full` |
+| 正文二次打开（Dovecot 已停） | 39 ms 进程整体，纯本地命中 |
+| 单部件消息（`BODY.PEEK[TEXT]`） | 正常 |
+| 重同步后正文缓存 | 保留，`body_state` 不回退 |
 | RRULE | 22 例 21 通过，失败项为夏令时空洞时间，需归一化 |
 
 完整方法与命令见 `docs/SPIKE-REPORT.md`。
@@ -182,7 +199,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 
 1. **不支持 Outlook/Hotmail**。2026-10-29 范围决策：微软已禁用密码登录，仅 OAuth2，且测试账号无 Entra 租户；Gmail 走应用专用密码（见 §10）。**验收**：不适用（范围外）。
 2. **只同步 INBOX**。**验收**：列出邮箱并按 SPECIAL-USE 映射 Sent/Drafts/Trash/Junk，全部可同步。
-3. **只存头部**。**验收**：打开邮件时按 BODYSTRUCTURE 拉取正文并缓存，二次打开离线命中；附件按需下载。
+3. **正文未进 FTS**。正文已按需拉取与解码，但全文索引仍只覆盖主题/地址/摘要。**验收**：正文入 `body_text` 索引后重建迁移，10 万封下中文查询仍满足 §8-7 的时延。
 4. **变更日志线性增长**。全量同步每封写一条。**验收**：10 万封场景下日志有界（快照 + 增量），状态可由快照重建。
 5. **B/C 档未实跑**。**验收**：iCloud（C 档）账户实际同步，移动邮件走 COPY+删除；B 档需一台不广告 CONDSTORE 的服务器。
 6. **重连未做故障注入**。**验收**：同步中重启服务器，`watch` 按退避恢复且不产生重复行。
@@ -201,9 +218,9 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 
 - SQLCipher 加密库完成；OAuth2 按范围决策不做（见 §3 与 §8-1）。
 
-### 第 3 段：内容能力
+### 第 3 段：内容能力（正文已完成）
 
-2. 正文与附件按需拉取；接入 `spike/html-probe` 的净化规则。
+2. ~~正文与附件按需拉取；接入 `spike/html-probe` 的净化规则。~~（完成）
 3. 多邮箱遍历与角色映射。
 4. 变更日志压缩与快照。
 
@@ -257,6 +274,13 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 - iCloud 无 IDLE/CONDSTORE/MOVE；每次全量 UID 扫描代价高（10 万封时不可接受），必须保留“数量变化/超时”门槛。
 - `UIDVALIDITY` 变化必须整箱重建，不能复用 UID。
 - 草稿与已发送的去重尚未实现，接入发送功能时先解决。
+- `BODY.PEEK` 与 `BODY` 的差别是是否置 `\Seen`：取正文一律用 `PEEK`，否则打开邮件等于标记已读。
+- IMAP 分段号只对 multipart 有意义：单部件消息取 `BODY[TEXT]`，不要拼 `[1]`；`fetch_part` 用空 part 表示这一分支。
+- POP3 的 `multiline` 曾把 `..dotted` 裁成 `dotted`（多删一个点），已修正为只去掉一个前导点；任何按行剥点的代码都要先过 `RETR` 单测。
+- blob 引用计数只在“新引用”时 +1：重复存同一份正文必须命中同一 hash 并跳过计数，否则 `reset_mailbox` 后残留。
+- POP3 的正文部件键是 `text`/`html`，不是 IMAP section；不要把它当 UID 或 section 复用。
+- 附件先落 `attachments` 元数据（含传输编码）、下载后回填 `blob_hash`；漏存 encoding 会导致 base64 附件写盘为编码串。
+- 净化用 ammonia 的 `attribute_filter`，不要回到 regex 后处理：`url(...)`、`javascript:`、远程 `src` 都要按属性过滤，正则易被引号与实体绕过。
 - Mailspring-Sync 为 GPL-3，可与 AGPL 组合，但不要无意引入其他不兼容许可。
 
 ---
