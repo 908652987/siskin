@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mail_crypto::{CryptoError, SecretStore};
+use mail_crypto::{CryptoError, MasterKey, SecretStore};
 use mail_proto::{IdleEvent, ImapConfig, ImapSession, ProtoError};
-use mail_store::{Account, Store, StoreError};
+use mail_store::{Account, DbKey, Store, StoreError};
 use mail_sync::{SyncEngine, SyncError, SyncOutcome};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -27,11 +27,18 @@ pub enum CoreError {
     MissingSecret(String),
     #[error("invalid account settings: {0}")]
     Settings(String),
+    #[error("a different master key is already stored; pass --force to replace it")]
+    KeyConflict,
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;
+
+/// Keychain entry for the master key, created on first open.
+const MASTER_KEY_REF: &str = "master-key";
+/// HKDF info string; changing it makes existing databases unreadable.
+const DB_KEY_INFO: &[u8] = b"eyrie/sqlite/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
@@ -59,15 +66,17 @@ pub struct Core {
 
 impl Core {
     pub fn open(path: impl AsRef<Path>, secrets: Arc<dyn SecretStore>) -> Result<Self> {
+        let store = Store::open(path, &db_key(secrets.as_ref())?)?;
         Ok(Self {
-            store: Arc::new(Store::open(path)?),
+            store: Arc::new(store),
             secrets,
         })
     }
 
     pub fn open_in_memory(secrets: Arc<dyn SecretStore>) -> Result<Self> {
+        let store = Store::open_in_memory(&db_key(secrets.as_ref())?)?;
         Ok(Self {
-            store: Arc::new(Store::open_in_memory()?),
+            store: Arc::new(store),
             secrets,
         })
     }
@@ -217,4 +226,174 @@ impl Core {
 
 fn secret_key(email: &str) -> String {
     format!("account:{email}:password")
+}
+
+/// Master key lives in the keychain; the database key is derived from it, so
+/// the same bytes never encrypt both database pages and sealed blobs.
+fn db_key(secrets: &dyn SecretStore) -> Result<DbKey> {
+    let master = MasterKey::load_or_create(secrets, MASTER_KEY_REF)?;
+    db_key_from(&master)
+}
+
+fn db_key_from(master: &MasterKey) -> Result<DbKey> {
+    let derived = master.derive(DB_KEY_INFO)?;
+    Ok(DbKey::from_bytes(&derived[..])?)
+}
+
+/// Base64 form of the stored master key, for manual backup. Fails when no key
+/// has been created yet (the first [`Core::open`] creates one).
+pub fn export_master_key(secrets: &dyn SecretStore) -> Result<String> {
+    let stored = secrets
+        .get(MASTER_KEY_REF)?
+        .ok_or_else(|| CoreError::MissingSecret(MASTER_KEY_REF.to_string()))?;
+    Ok(MasterKey::from_slice(&stored)?.encode().to_string())
+}
+
+/// Replaces the stored master key with `encoded`. When `database` exists and
+/// already holds data, the imported key must open it, otherwise nothing is
+/// written. A different existing key is replaced only with `force`.
+///
+/// Returns whether the keychain was updated.
+pub fn import_master_key(
+    secrets: &dyn SecretStore,
+    encoded: &str,
+    database: Option<&Path>,
+    force: bool,
+) -> Result<bool> {
+    let master = MasterKey::decode(encoded)?;
+    let key = db_key_from(&master)?;
+    if let Some(path) = database {
+        if path.exists() {
+            Store::open(path, &key)?;
+        }
+    }
+
+    if let Some(existing) = secrets.get(MASTER_KEY_REF)? {
+        if existing == master.as_bytes() {
+            return Ok(false);
+        }
+        if !force {
+            return Err(CoreError::KeyConflict);
+        }
+    }
+    secrets.set(MASTER_KEY_REF, master.as_bytes())?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mail_crypto::MemoryStore;
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "siskin-core-{name}-{}-{nanos}.db",
+            std::process::id()
+        ))
+    }
+
+    fn remove_db_files(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut target = path.as_os_str().to_owned();
+            target.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(target));
+        }
+    }
+
+    fn store_with_account(path: &Path, master: &MasterKey) {
+        let store = Store::open(path, &db_key_from(master).unwrap()).unwrap();
+        let account = store
+            .create_account(
+                "imap",
+                "test@example.com",
+                None,
+                "account:test",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        store
+            .ensure_mailbox(account, "INBOX", Some("inbox"))
+            .unwrap();
+    }
+
+    #[test]
+    fn export_requires_an_existing_key() {
+        let secrets = MemoryStore::new();
+        assert!(matches!(
+            export_master_key(&secrets),
+            Err(CoreError::MissingSecret(_))
+        ));
+    }
+
+    #[test]
+    fn exported_key_survives_reimport() {
+        let source = MemoryStore::new();
+        let master = MasterKey::generate();
+        source.set(MASTER_KEY_REF, master.as_bytes()).unwrap();
+        let encoded = export_master_key(&source).unwrap();
+
+        let target = MemoryStore::new();
+        assert!(import_master_key(&target, &encoded, None, false).unwrap());
+        assert_eq!(export_master_key(&target).unwrap(), encoded);
+        assert!(
+            !import_master_key(&target, &encoded, None, false).unwrap(),
+            "re-importing the same key must not rewrite the keychain"
+        );
+    }
+
+    #[test]
+    fn a_different_key_needs_force() {
+        let secrets = MemoryStore::new();
+        let first = MasterKey::generate();
+        secrets.set(MASTER_KEY_REF, first.as_bytes()).unwrap();
+        let other = MasterKey::generate().encode().to_string();
+
+        assert!(matches!(
+            import_master_key(&secrets, &other, None, false),
+            Err(CoreError::KeyConflict)
+        ));
+        assert_eq!(
+            export_master_key(&secrets).unwrap(),
+            first.encode().to_string()
+        );
+
+        assert!(import_master_key(&secrets, &other, None, true).unwrap());
+        assert_eq!(export_master_key(&secrets).unwrap(), other);
+    }
+
+    #[test]
+    fn import_is_refused_when_the_key_cannot_open_the_database() {
+        let path = temp_db_path("import-wrong");
+        store_with_account(&path, &MasterKey::generate());
+
+        let secrets = MemoryStore::new();
+        let stranger = MasterKey::generate().encode().to_string();
+        assert!(matches!(
+            import_master_key(&secrets, &stranger, Some(&path), false),
+            Err(CoreError::Store(StoreError::WrongKey))
+        ));
+        assert!(
+            secrets.get(MASTER_KEY_REF).unwrap().is_none(),
+            "a rejected import must not write the keychain"
+        );
+        remove_db_files(&path);
+    }
+
+    #[test]
+    fn import_verifies_against_the_database_and_then_opens_it() {
+        let path = temp_db_path("import-ok");
+        let master = MasterKey::generate();
+        store_with_account(&path, &master);
+
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+        assert!(import_master_key(secrets.as_ref(), &master.encode(), Some(&path), false).unwrap());
+
+        let core = Core::open(&path, Arc::clone(&secrets)).unwrap();
+        assert_eq!(core.store().list_accounts().unwrap().len(), 1);
+        remove_db_files(&path);
+    }
 }

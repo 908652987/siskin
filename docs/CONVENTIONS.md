@@ -92,6 +92,8 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 - 外键开启（`PRAGMA foreign_keys=ON`），级联删除按账户 → 邮箱 → 位置。
 - 查询必须显式列名，禁止 `SELECT *`。
 - FTS5 使用 `tokenize='trigram'`，因此 <3 字符查询走 LIKE 回退；新增搜索入口必须保留该回退。
+- 数据库密钥只能由主密钥派生（HKDF），不得把主密钥直接当库密钥，也不得把密钥写进日志、错误信息或数据库。
+- 打开库的顺序固定：`PRAGMA key` → 读 `sqlite_master` 验证密钥 → 再设 WAL/外键/迁移；错密钥与明文旧库都必须显式报错，不能静默重建。
 
 ---
 
@@ -112,6 +114,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 - 邮件 HTML 统一走净化策略：默认阻断全部外部资源，仅放行 `cid:` 与光栅 data URI；UI 侧禁用 JS。
 - 打开外部链接前必须展示真实目标；IDN 同形字告警由 UI 层统一实现。
 - 新增加密相关代码必须带 AAD，禁止裸加密。
+- 主密钥导出仅供用户人工备份：不得自动上传、不得写入日志或提交；导入前必须先用目标库验证，验证失败不得覆盖钥匙串已有密钥。
 
 ---
 
@@ -135,7 +138,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 4. 体积与编译时间：核心 crate 避免引入大型传递依赖（例如不要为一个小功能引入 `tokio-full`）。
 5. 记录：在提交信息里写明“为什么需要它”。
 
-当前核心依赖：`tokio`、`async-imap`、`rustls`/`tokio-rustls`、`rusqlite`、`serde`、`thiserror`、`keyring`、`chacha20poly1305`。
+当前核心依赖：`tokio`、`async-imap`、`rustls`/`tokio-rustls`、`rusqlite`（SQLCipher）、`serde`、`thiserror`、`keyring`、`chacha20poly1305`、`hkdf`/`sha2`。
 
 ---
 

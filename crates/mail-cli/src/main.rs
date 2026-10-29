@@ -37,7 +37,9 @@ fn parse() -> Result<Args, String> {
     }
     Ok(Args {
         db,
-        command: command.ok_or("missing command: add-account | accounts | sync | list | stats")?,
+        command: command.ok_or(
+            "missing command: add-account | accounts | sync | watch | list | stats | export-key | import-key",
+        )?,
         flags,
     })
 }
@@ -78,6 +80,41 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), String> {
     let args = parse()?;
     let secrets = Arc::new(KeyringStore::new(SECRET_SERVICE));
+
+    // Key commands must run before the core opens (and possibly creates) a key.
+    match args.command.as_str() {
+        "export-key" => {
+            let encoded =
+                mail_core::export_master_key(secrets.as_ref()).map_err(|e| e.to_string())?;
+            eprintln!(
+                "this line is your database master key: store it in your password manager, never in shell history or logs"
+            );
+            println!("{encoded}");
+            return Ok(());
+        }
+        "import-key" => {
+            let encoded = match args.flags.get("value") {
+                Some(value) => value.clone(),
+                None => std::io::read_to_string(std::io::stdin())
+                    .map_err(|e| format!("reading key from stdin: {e}"))?,
+            };
+            let force = flag_bool(&args.flags, "force", false);
+            let updated =
+                mail_core::import_master_key(secrets.as_ref(), &encoded, Some(&args.db), force)
+                    .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                if updated {
+                    "master key imported"
+                } else {
+                    "master key already matches, nothing changed"
+                }
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let core = Core::open(&args.db, secrets.clone()).map_err(|e| e.to_string())?;
 
     match args.command.as_str() {

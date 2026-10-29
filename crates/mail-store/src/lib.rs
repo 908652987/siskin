@@ -1,6 +1,7 @@
 //! Local store: accounts, mailboxes, messages, change log, full-text index.
 
-use std::path::Path;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::Utc;
@@ -12,8 +13,16 @@ use thiserror::Error;
 pub enum StoreError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("database key must be 32 bytes")]
+    InvalidKey,
+    #[error("database key does not match this file")]
+    WrongKey,
+    #[error("refusing to open unencrypted database: {0}")]
+    PlaintextDatabase(PathBuf),
     #[error("account not found: {0}")]
     AccountNotFound(String),
     #[error("mailbox not found: {0}")]
@@ -103,20 +112,65 @@ pub struct ChangeRecord {
     pub at: i64,
 }
 
+/// 32-byte key for the encrypted database. SQLCipher derives its own page and
+/// HMAC keys from it, so no second KDF runs here.
+pub struct DbKey(zeroize::Zeroizing<[u8; 32]>);
+
+impl DbKey {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 32 {
+            return Err(StoreError::InvalidKey);
+        }
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(bytes);
+        Ok(Self(zeroize::Zeroizing::new(buf)))
+    }
+
+    /// SQLCipher raw-key syntax; the key never passes through a derived
+    /// passphrase, so the database is only openable with these exact bytes.
+    fn raw_key(&self) -> zeroize::Zeroizing<String> {
+        use std::fmt::Write as _;
+        let mut out = zeroize::Zeroizing::new(String::with_capacity(68));
+        out.push_str("x'");
+        for byte in self.0.iter() {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out.push('\'');
+        out
+    }
+}
+
+const PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
 
 impl Store {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::init(Connection::open(path)?)
+    pub fn open(path: impl AsRef<Path>, key: &DbKey) -> Result<Self> {
+        let path = path.as_ref();
+        reject_plaintext(path)?;
+        Self::init(Connection::open(path)?, key)
     }
 
-    pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+    pub fn open_in_memory(key: &DbKey) -> Result<Self> {
+        Self::init(Connection::open_in_memory()?, key)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, key: &DbKey) -> Result<Self> {
+        let key_pragma = key.raw_key();
+        conn.execute_batch(&format!("PRAGMA key = \"{}\";", key_pragma.as_str()))?;
+        // Reading the schema forces SQLCipher to decrypt page 1, so a wrong key
+        // fails here instead of on the first real query.
+        match conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())) {
+            Ok(()) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::NotADatabase =>
+            {
+                return Err(StoreError::WrongKey);
+            }
+            Err(err) => return Err(err.into()),
+        }
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -557,6 +611,25 @@ impl Store {
                 |row| row.get(0),
             )
             .unwrap_or(0))
+    }
+}
+
+/// Refuses to open a legacy plaintext SQLite file: SQLCipher reports such a
+/// file as "not a database", which reads like a wrong key, so detect it first.
+fn reject_plaintext(path: &Path) -> Result<()> {
+    let mut header = [0u8; 16];
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    match file.read_exact(&mut header) {
+        Ok(()) if header == *PLAINTEXT_HEADER => {
+            Err(StoreError::PlaintextDatabase(path.to_path_buf()))
+        }
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 

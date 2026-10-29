@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms）；**图形界面、日历、Hub 服务端、OAuth2、数据库加密尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；**图形界面、日历、Hub 服务端、OAuth2 尚未开始**。
 
 ---
 
@@ -20,7 +20,7 @@
 | D2 | 界面 | 全原生：SwiftUI（macOS/iOS）、WinUI 3（Windows）、Compose（Android） | 用户明确选择低内存优先，接受三套 UI |
 | D3 | 客户端与 Hub 协议 | JMAP 子集（RFC 8620/8621） | 不自创协议 |
 | D4 | 部署形态 | 桌面可单机直连；手机与跨设备走自建 Hub | 手机端只做薄客户端 |
-| D5 | 存储 | SQLite + FTS5；目标加密 SQLCipher | SQLCipher 尚未接入 |
+| D5 | 存储 | SQLite + FTS5；目标加密 SQLCipher | SQLCipher 已接入，密钥由钥匙串主密钥 HKDF 派生 |
 | D6 | 邮件接入 | IMAP/SMTP，不接 Gmail API / Graph | 规避 restricted scope 与 CASA 年审 |
 | D7 | 日历 | 系统桥（EventKit / CalendarContract）+ 直连 CalDAV/Google/Graph | 微软无 CalDAV |
 | D8 | 许可 | AGPL-3.0 | 与 GPL-3 代码可组合 |
@@ -39,12 +39,12 @@
 | 技术选型与架构 | 完成 | `docs/ARCHITECTURE.md` |
 | 五项开工前验证 | 完成 | `docs/SPIKE-REPORT.md` |
 | 凭据保险箱（系统钥匙串） | 完成 | `mail-crypto`，macOS Keychain 实跑 |
-| SQLite 存储 + 变更日志 + FTS5 | 完成 | `mail-store`，6 个单测 |
+| SQLite 存储 + 变更日志 + FTS5 | 完成 | `mail-store`，9 个单测 |
+| 数据库加密（SQLCipher） | 完成 | `mail-store` + `mail-core`；无密钥/错密钥打不开，10,003 封 612 ms；主密钥可 `export-key`/`import-key` 人工备份与恢复 |
 | IMAP 连接与三档能力 | 完成 | `mail-proto`，Dovecot/Outlook/iCloud/Fastmail/Yahoo 能力探测 |
 | 增量同步引擎 | 完成 | `mail-sync`，3 个单测 + Dovecot 实跑 |
 | 常驻 IDLE 与重连退避 | 完成 | `mail-core::watch`，实跑验证 |
 | 开发 CLI | 完成 | `mail-cli` |
-| 数据库加密（SQLCipher） | **未开始** | 见 §8 第 1 项 |
 | OAuth2 / XOAUTH2 | **未开始** | Outlook 当前无法登录 |
 | 正文与附件拉取、HTML 渲染 | 未开始 | 仅存头部 |
 | 多邮箱遍历 | 部分 | 协议层可列邮箱，门面只同步 INBOX |
@@ -62,18 +62,20 @@
 ```
 crates/
   mail-crypto/src/lib.rs   SecretStore trait、KeyringStore、MemoryStore、
-                           MasterKey、seal/open（XChaCha20-Poly1305 + AAD）
-  mail-store/src/lib.rs    schema、迁移、账户/邮箱/消息/位置/变更日志、
+                           MasterKey（HKDF 发送子密钥）、seal/open（XChaCha20-Poly1305 + AAD）
+  mail-store/src/lib.rs    SQLCipher 打开（PRAGMA key + 错密钥/明文库拒绝）、schema、
+                           迁移、账户/邮箱/消息/位置/变更日志、
                            apply_fetch（事务）、search_messages（FTS/LIKE 双路）
-  mail-store/tests/        6 个存储测试
+  mail-store/tests/        9 个存储测试（含错密钥、明文库、落盘无明文）
   mail-proto/src/lib.rs    Stream（TLS/明文）、ImapSession、CapabilitySet、
                            Tier(A/B/C)、fetch_range/fetch_flags/CHANGEDSINCE、
                            list_uids、append、add_flag、move_message、idle_wait
   mail-sync/src/lib.rs     sync_mailbox：UIDVALIDITY 重建、全量/增量、
                            删除检测、合并去重；3 个单测
-  mail-core/src/lib.rs     Core：add_account（密码入钥匙串）、sync、
-                           watch（IDLE + 指数退避重连）
-  mail-cli/src/main.rs     add-account / accounts / sync / watch / list / stats
+  mail-core/src/lib.rs     Core：主密钥（钥匙串）→ HKDF → 库密钥、
+                           add_account（密码入钥匙串）、sync、watch（IDLE + 指数退避重连）
+  mail-cli/src/main.rs     add-account / accounts / sync / watch / list / stats /
+                           export-key / import-key
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -98,7 +100,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 12 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 16 个测试全过
 ~/.cargo/bin/cargo build --release
 
 # 2) 起测试服务器
@@ -111,7 +113,12 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db add-account \
 cargo run --release -p mail-cli -- --db /tmp/smoke.db sync --email vmail@example.com
 cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@example.com
 
-# 4) 选下一项：见 §9
+# 4) 主密钥备份 / 恢复（输出即密钥本身：存进密码管理器，勿贴日志或提交）
+cargo run --release -p mail-cli -- --db /tmp/smoke.db export-key
+cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base64>'
+# 换机器时先 import-key 再打开库；库已存在则密钥必须能打开它，否则拒绝写入
+
+# 5) 选下一项：见 §9
 ```
 
 ---
@@ -129,6 +136,8 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 | Docker | 29.1.3；镜像 `mail-spike-dovecot`（Debian + Dovecot 2.3.19.1，apt 走 USTC 镜像） |
 | 测试数据 | `spike/data/Maildir` 10,000 封合成邮件（gitignored，可重新生成） |
 | 钥匙串 | `keyring` crate 必须启用特性 `apple-native / windows-native / sync-secret-service / crypto-rust`，否则写入静默失效、读取为空（已踩过） |
+| SQLCipher | `rusqlite` 特性 `bundled-sqlcipher-vendored-openssl`；首次构建会编译 vendored OpenSSL（本机约 20 s），不依赖系统 openssl |
+| 数据库密钥 | 钥匙串条目 `mail-client-dev / master-key`（`secret_key` 用于账户密码，两者不同）；库密钥由主密钥 HKDF-SHA256(info=`eyrie/sqlite/v1`) 派生 |
 | 网络 | 到 `imap.gmail.com:993` 的 TLS 被中断，Gmail 未实测；其余源码镜像可达 |
 
 ---
@@ -138,6 +147,9 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 | 场景 | 结果 |
 |---|---|
 | 首次全量同步 10,002 封（release） | 1,005 ms，数据库 5.1 MB |
+| 加密库全量同步 10,003 封（release，SQLCipher） | 612 ms，数据库 5.7 MB |
+| 加密库空闲增量 | 1 ms（同步阶段） |
+| 无密钥打开加密库 | `sqlite3` 报 `file is not a database`（错误码 26）；`strings` 搜不到主题 |
 | 空闲增量 | 5 ms |
 | IDLE 新邮件 → 落库 | 43 ms |
 | 外部删除检测 | 69 ms（门槛化后；此前 3.4 s） |
@@ -153,49 +165,46 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 
 ## 8. 已知缺口（按优先级）
 
-1. **数据库明文**。凭据在钥匙串，但邮件元数据/正文未加密。切 `rusqlite` 的 `bundled-sqlcipher`，密钥存钥匙串。**验收**：`sqlite3 mail.db` 无密钥打不开；`strings mail.db` 搜不到主题。
-2. **无 OAuth2**。Outlook 已禁密码登录（`LOGINDISABLED`，仅 `AUTH=XOAUTH2`），当前连接失败。需 XOAUTH2 + PKCE + 刷新令牌。**验收**：Outlook 账户可登录同步，令牌过期自动刷新，密码不落库。
-3. **只同步 INBOX**。**验收**：列出邮箱并按 SPECIAL-USE 映射 Sent/Drafts/Trash/Junk，全部可同步。
-4. **只存头部**。**验收**：打开邮件时按 BODYSTRUCTURE 拉取正文并缓存，二次打开离线命中；附件按需下载。
-5. **变更日志线性增长**。全量同步每封写一条。**验收**：10 万封场景下日志有界（快照 + 增量），状态可由快照重建。
-6. **B/C 档未实跑**。**验收**：Outlook（B 档）与 iCloud（C 档）账户实际同步；iCloud 移动邮件走 COPY+删除。
-7. **重连未做故障注入**。**验收**：同步中重启服务器，`watch` 按退避恢复且不产生重复行。
-8. **中文 1–2 字搜索走 LIKE 扫描**。10 万封内可接受。**验收**：10 万封下 2 字查询 P95 < 150 ms。
-9. **Windows/移动端零验证**。**验收**：WinUI 3 调 Rust（uniffi-bindgen-cs），空闲内存 ≤ 160 MB。
+1. **无 OAuth2**。Outlook 已禁密码登录（`LOGINDISABLED`，仅 `AUTH=XOAUTH2`），当前连接失败。需 XOAUTH2 + PKCE + 刷新令牌。**验收**：Outlook 账户可登录同步，令牌过期自动刷新，密码不落库。
+2. **只同步 INBOX**。**验收**：列出邮箱并按 SPECIAL-USE 映射 Sent/Drafts/Trash/Junk，全部可同步。
+3. **只存头部**。**验收**：打开邮件时按 BODYSTRUCTURE 拉取正文并缓存，二次打开离线命中；附件按需下载。
+4. **变更日志线性增长**。全量同步每封写一条。**验收**：10 万封场景下日志有界（快照 + 增量），状态可由快照重建。
+5. **B/C 档未实跑**。**验收**：Outlook（B 档）与 iCloud（C 档）账户实际同步；iCloud 移动邮件走 COPY+删除。
+6. **重连未做故障注入**。**验收**：同步中重启服务器，`watch` 按退避恢复且不产生重复行。
+7. **中文 1–2 字搜索走 LIKE 扫描**。10 万封内可接受。**验收**：10 万封下 2 字查询 P95 < 150 ms。
+8. **Windows/移动端零验证**。**验收**：WinUI 3 调 Rust（uniffi-bindgen-cs），空闲内存 ≤ 160 MB。
+9. **主密钥无轮换与自动备份**。已提供 `export-key`/`import-key` 做人工备份（可存 Bitwarden 等），但主密钥仍只有钥匙串一份，丢失且无备份即数据不可恢复；库密钥无法在线轮换。**验收**：轮换后旧库可迁移；备份丢失时给出明确提示。
 
 ---
 
 ## 9. 下一步路线（按顺序，独立可交付）
 
-### 第 2 段：安全与认证
+### 第 2 段：安全与认证（SQLCipher 已完成，剩认证）
 
-1. **SQLCipher**
-   - 改动：`mail-store` 启用 `bundled-sqlcipher-vendored-openssl`，`Store::open` 接收密钥；`mail-core` 从钥匙串取主密钥派生库密钥。
-   - 验收：§8-1。
-2. **OAuth2 + XOAUTH2**
+1. **OAuth2 + XOAUTH2**
    - 改动：`mail-crypto` 存 refresh token；`mail-proto` 支持 `AUTHENTICATE XOAUTH2`；新增授权流程（回环重定向 + PKCE），CLI 先提供 `--oauth2` 手动授权。
-   - 验收：§8-2。
+   - 验收：§8-1。
 
 ### 第 3 段：内容能力
 
-3. 正文与附件按需拉取；接入 `spike/html-probe` 的净化规则。
-4. 多邮箱遍历与角色映射。
-5. 变更日志压缩与快照。
+2. 正文与附件按需拉取；接入 `spike/html-probe` 的净化规则。
+3. 多邮箱遍历与角色映射。
+4. 变更日志压缩与快照。
 
 ### 第 4 段：服务端与移动
 
-6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。
-7. iOS/Android 薄客户端。
+5. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。
+6. iOS/Android 薄客户端。
 
 ### 第 5 段：日历与翻译
 
-8. EventKit / CalendarContract 桥 + CalDAV/Google/Graph；邀请函。
-9. 翻译管线（本地/自托管/云）。
+7. EventKit / CalendarContract 桥 + CalDAV/Google/Graph；邀请函。
+8. 翻译管线（本地/自托管/云）。
 
 ### 第 6 段：桌面 UI
 
-10. macOS SwiftUI（列表/阅读/撰写/搜索）。
-11. Windows WinUI 3（复用 Rust 核心）。
+9. macOS SwiftUI（列表/阅读/撰写/搜索）。
+10. Windows WinUI 3（复用 Rust 核心）。
 
 ---
 
@@ -204,7 +213,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 | 项 | 用途 | 影响 |
 |---|---|---|
 | 一个 Gmail 测试账户（应用专用密码） | 验证 Gmail 能力与 Gmail 标签映射 | 未知则 Gmail 路径只能靠推断 |
-| 一个 Outlook / M365 测试账户（或 OAuth 客户端） | B 档与 XOAUTH2 验证 | 阻塞 §8-2、§8-6 |
+| 一个 Outlook / M365 测试账户（或 OAuth 客户端） | B 档与 XOAUTH2 验证 | 阻塞 §8-1、§8-5 |
 | 一台 Windows 11 机器 + .NET SDK | WinUI 3 + UniFFI 内存验证 | 阻塞 Windows UI 段 |
 | APNs / FCM 凭据 | 手机推送 | 阻塞移动端 |
 | 是否先做 Hub 还是先做桌面 UI | 排序 | 影响第 4–6 段顺序 |
@@ -214,6 +223,13 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@exampl
 ## 11. 风险与陷阱（已踩过，勿重犯）
 
 - `keyring` 缺平台特性会静默不存，必须检查实际钥匙串。
+- SQLCipher 原始密钥只能写成 `PRAGMA key = "x'<hex>'"`；`PRAGMA key = x'<hex>'`（裸 blob 字面量）是语法错误。
+- 主密钥条目名 `master-key` 与账户密码条目 `account:<email>:password` 不同；`MASTER_KEY_REF` 或 HKDF info（`eyrie/sqlite/v1`）一旦变更，既有库永久打不开。
+- 旧明文库必须显式拒绝：`StoreError::PlaintextDatabase`。迁移只能 `sqlcipher_export` 或重新同步，不能原地改。
+- 验收加密库不要用 `sqlite3 file '.tables'`（对非库文件可能退出 0 且无输出）；用 `sqlite3 file 'select count(*) from sqlite_master;'` 看错误码 26。
+- 重建 `mail-cli` 后首次访问钥匙串会弹出授权框（新二进制被 macOS 视为不同应用）；无 TTY 的自动化调用会一直挂起。冒烟脚本要先手动批准一次，或改用 `MemoryStore` 的单测路径。
+- `export-key` 的标准输出就是主密钥本身：只让用户复制进密码管理器，不要进 shell 历史、日志、提交或聊天记录；调试时比对 sha256 前缀。
+- `import-key` 必须先验证再落库：库存在且导入密钥打不开它时直接失败，不覆盖钥匙串；只有 `--force true` 才替换已有的不同密钥。
 - FTS5 `contentless_delete=1` 必须同时写 `content=''`，否则建表失败。
 - trigram 分词器不支持 <3 字符查询，中文需 LIKE 回退。
 - iCloud 无 IDLE/CONDSTORE/MOVE；每次全量 UID 扫描代价高（10 万封时不可接受），必须保留“数量变化/超时”门槛。

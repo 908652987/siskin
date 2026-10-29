@@ -1,7 +1,7 @@
-# 第一段实现说明（同步内核）
+# 实现说明（同步内核 + 加密库）
 
 日期：2026-10-29
-范围：工程骨架、本地存储、凭据保险箱、IMAP 同步内核（三档策略）、开发 CLI
+范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP 同步内核（三档策略）、开发 CLI
 状态：已实现并在 Dovecot 上实跑验证
 
 ---
@@ -10,12 +10,12 @@
 
 | crate | 职责 | 关键点 |
 |---|---|---|
-| `mail-crypto` | 凭据保险箱 + 信封加密 | 系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；XChaCha20-Poly1305 带 AAD；主密钥首次使用时生成并存入钥匙串 |
-| `mail-store` | SQLite 存储 | 账户、邮箱、消息、位置、变更日志、FTS5；WAL；schema 版本迁移；UIDVALIDITY 重建 |
+| `mail-crypto` | 凭据保险箱 + 信封加密 | 系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；XChaCha20-Poly1305 带 AAD；主密钥首次使用时生成并存入钥匙串，HKDF-SHA256 派生用途子密钥 |
+| `mail-store` | SQLite 存储（SQLCipher） | 账户、邮箱、消息、位置、变更日志、FTS5；WAL；schema 版本迁移；UIDVALIDITY 重建；打开时先验密钥，错密钥与明文旧库都显式报错 |
 | `mail-proto` | IMAP 传输 | 隐式 TLS、能力探测、三档判定、UID 范围抓取、CHANGEDSINCE、IDLE、MOVE / COPY+删除回退 |
 | `mail-sync` | 增量同步 | 首同步、UID 增量、标志位增量、删除检测、UIDVALIDITY 重建、合并去重 |
 | `mail-core` | 门面 | 账户添加（密码入钥匙串）、连接、单次同步、常驻 IDLE 循环与退避重连 |
-| `mail-cli` | 开发工具 | `add-account / accounts / sync / watch / list / stats` |
+| `mail-cli` | 开发工具 | `add-account / accounts / sync / watch / list / stats / export-key / import-key` |
 
 产品 UI、Hub、日历、翻译不在本段范围内。
 
@@ -56,12 +56,17 @@ flowchart TD
 | 场景 | 结果 |
 |---|---|
 | 首次全量同步（release） | 10,002 封 / **1,005 ms**，数据库 5.1 MB |
+| 加密库首次全量同步（release） | 10,003 封 / **612 ms**，数据库 5.7 MB |
+| 加密库空闲增量 | **1 ms**（同步阶段） |
+| 无密钥打开 | `sqlite3 … 'select count(*) from sqlite_master;'` → `file is not a database`（26）；`strings` 无主题命中 |
+| 错密钥打开 | `StoreError::WrongKey`（单测覆盖） |
+| 明文旧库打开 | `StoreError::PlaintextDatabase`（单测覆盖；CLI 实跑同结果） |
 | 空闲增量（release） | **5 ms**（进程整体 38 ms） |
 | 新邮件经 IDLE 到达并同步 | **43 ms**（含通知与写入） |
 | 标志位变更（CHANGEDSINCE） | applied=1，无重复插入 |
 | 外部删除一封 | removed=1，**69 ms** |
 | UIDVALIDITY 重建 | 清空后全量 10,000 封 / 2,794 ms（debug 构建） |
-| 单测 | 12 个（crypto 3、store 6、sync 3）全绿 |
+| 单测 | 16 个（crypto 4、store 9、sync 3）全绿 |
 
 首次同步后进程启动有一次钥匙串授权检查（新二进制），之后的同步都在 40 ms 内。
 
@@ -86,7 +91,17 @@ cargo run -p mail-cli -- --db /tmp/mail.db list --email vmail@example.com --limi
 # 4) 常驻监听（收到新邮件即增量同步）
 cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com
 
-# 5) 测试
+# 5) 验证加密：首次打开会自动在主密钥条目下生成密钥
+sqlite3 /tmp/mail.db 'select count(*) from sqlite_master;'   # 期望 file is not a database
+strings /tmp/mail.db | grep -c 'Subject'                     # 期望 0
+
+# 6) 主密钥备份 / 恢复（输出即密钥本身，存进密码管理器）
+cargo run -p mail-cli -- --db /tmp/mail.db export-key
+cargo run -p mail-cli -- --db /tmp/mail.db import-key --value '<base64>'          # 相同则不改动
+cargo run -p mail-cli -- --db /tmp/mail.db import-key --value '<base64>' --force true
+# import-key 会用 --db 指向的库验证密钥：打不开就失败，不覆盖钥匙串
+
+# 7) 测试
 cargo test --workspace
 ```
 
@@ -94,23 +109,23 @@ cargo test --workspace
 
 ## 5. 已知缺口（按优先级）
 
-1. **数据库未加密**。凭据已进钥匙串，但邮件元数据与正文仍是明文 SQLite。下一步切 `rusqlite` 的 `bundled-sqlcipher`，密钥同样存钥匙串。这是本段唯一的**安全缺口**。
-2. **只有 LOGIN 认证**。Outlook 已禁用密码登录（`LOGINDISABLED`，仅 `AUTH=XOAUTH2`），当前会连接失败。需要补 XOAUTH2 与 OAuth2 + PKCE 流程，以及 STARTTLS。
-3. **只同步 INBOX**。`mail-proto` 已能列出邮箱，门面尚未遍历；特殊文件夹角色映射已就绪。
-4. **只取头部**。正文、附件按需拉取尚未实现（`body_state` 字段已预留）。
-5. **B/C 档未实跑**。代码路径已实现，但没有 Outlook/iCloud 测试账户；能力矩阵来自未登录探测。
-6. **变更日志会持续增长**。全量同步会为每封邮件写一条变更记录，需要压缩/快照机制（Hub 上线前必须做）。
-7. **中文 1–2 字搜索走 LIKE 扫描**。10 万封以内可接受，更大规模需要专门的分词索引。
-8. **重连退避未做故障注入**。逻辑在 `Core::watch` 中，但未模拟断网/服务器重启。
+1. **只有 LOGIN 认证**。Outlook 已禁用密码登录（`LOGINDISABLED`，仅 `AUTH=XOAUTH2`），当前会连接失败。需要补 XOAUTH2 与 OAuth2 + PKCE 流程，以及 STARTTLS。
+2. **只同步 INBOX**。`mail-proto` 已能列出邮箱，门面尚未遍历；特殊文件夹角色映射已就绪。
+3. **只取头部**。正文、附件按需拉取尚未实现（`body_state` 字段已预留）。
+4. **B/C 档未实跑**。代码路径已实现，但没有 Outlook/iCloud 测试账户；能力矩阵来自未登录探测。
+5. **变更日志会持续增长**。全量同步会为每封邮件写一条变更记录，需要压缩/快照机制（Hub 上线前必须做）。
+6. **中文 1–2 字搜索走 LIKE 扫描**。10 万封以内可接受，更大规模需要专门的分词索引。
+7. **重连退避未做故障注入**。逻辑在 `Core::watch` 中，但未模拟断网/服务器重启。
+8. **主密钥无轮换与自动备份**。`export-key`/`import-key` 支持人工备份到密码管理器，但主密钥仍只有钥匙串一份，且库密钥不能在线轮换。
 
 ---
 
 ## 6. 下一段建议
 
-按依赖顺序：
+按依赖顺序（SQLCipher 已完成）：
 
-1. SQLCipher + 数据库密钥轮换（补齐安全基线）
-2. XOAUTH2 + OAuth2 PKCE（解锁 Gmail / Outlook）
-3. 正文与附件按需拉取 + HTML 净化接入（复用 spike 的净化器）
-4. 多邮箱遍历与特殊文件夹映射
-5. FTS 中文索引策略与变更日志压缩
+1. XOAUTH2 + OAuth2 PKCE（解锁 Gmail / Outlook）
+2. 正文与附件按需拉取 + HTML 净化接入（复用 spike 的净化器）
+3. 多邮箱遍历与特殊文件夹映射
+4. FTS 中文索引策略与变更日志压缩
+5. 主密钥导出/恢复与库密钥轮换

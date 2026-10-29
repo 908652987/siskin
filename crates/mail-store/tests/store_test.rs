@@ -1,4 +1,25 @@
-use mail_store::{NewMessage, Store, SyncState};
+use mail_store::{DbKey, NewMessage, Store, StoreError, SyncState};
+
+/// Deterministic test key; the real key is derived from the keychain master key.
+fn test_key() -> DbKey {
+    DbKey::from_bytes(&[7u8; 32]).unwrap()
+}
+
+fn temp_db_path(name: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("siskin-{name}-{}-{nanos}.db", std::process::id()))
+}
+
+fn remove_db_files(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut target = path.as_os_str().to_owned();
+        target.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(target));
+    }
+}
 
 fn msg(uid: i64, subject: &str) -> NewMessage {
     NewMessage {
@@ -15,7 +36,7 @@ fn msg(uid: i64, subject: &str) -> NewMessage {
 }
 
 fn setup() -> (Store, i64, i64) {
-    let store = Store::open_in_memory().unwrap();
+    let store = Store::open_in_memory(&test_key()).unwrap();
     let account = store
         .create_account(
             "imap",
@@ -170,4 +191,89 @@ fn search_handles_long_and_short_queries() {
         .search_messages(account_id, "missing", 10)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn a_different_key_cannot_open_the_database() {
+    let path = temp_db_path("wrong-key");
+    {
+        let store = Store::open(&path, &test_key()).unwrap();
+        let account = store
+            .create_account(
+                "imap",
+                "test@example.com",
+                None,
+                "account:test",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        store
+            .ensure_mailbox(account, "INBOX", Some("inbox"))
+            .unwrap();
+    }
+
+    let other = DbKey::from_bytes(&[9u8; 32]).unwrap();
+    match Store::open(&path, &other) {
+        Ok(_) => panic!("database opened with the wrong key"),
+        Err(StoreError::WrongKey) => {}
+        Err(err) => panic!("unexpected error: {err}"),
+    }
+    remove_db_files(&path);
+}
+
+#[test]
+fn a_plaintext_database_is_rejected() {
+    let path = temp_db_path("plaintext");
+    std::fs::write(&path, b"SQLite format 3\0plaintext payload").unwrap();
+
+    match Store::open(&path, &test_key()) {
+        Ok(_) => panic!("plaintext database was opened"),
+        Err(StoreError::PlaintextDatabase(reported)) => assert_eq!(reported, path),
+        Err(err) => panic!("unexpected error: {err}"),
+    }
+    remove_db_files(&path);
+}
+
+#[test]
+fn the_database_file_hides_message_text() {
+    let path = temp_db_path("at-rest");
+    {
+        let store = Store::open(&path, &test_key()).unwrap();
+        let account = store
+            .create_account(
+                "imap",
+                "test@example.com",
+                None,
+                "account:test",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        let mailbox = store
+            .ensure_mailbox(account, "INBOX", Some("inbox"))
+            .unwrap();
+        store
+            .apply_fetch(
+                account,
+                mailbox.id,
+                &[msg(1, "unmistakable-subject-marker")],
+                &[],
+            )
+            .unwrap();
+    }
+
+    let mut bytes = Vec::new();
+    for suffix in ["", "-wal"] {
+        let mut target = path.as_os_str().to_owned();
+        target.push(suffix);
+        if let Ok(mut content) = std::fs::read(std::path::PathBuf::from(target)) {
+            bytes.append(&mut content);
+        }
+    }
+    assert!(
+        !bytes
+            .windows(25)
+            .any(|window| window == b"unmistakable-subject-marker"),
+        "message subject found in plaintext on disk"
+    );
+    remove_db_files(&path);
 }

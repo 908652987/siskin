@@ -11,7 +11,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
 use rand::RngCore;
+use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -137,6 +139,16 @@ impl MasterKey {
         &*self.0
     }
 
+    /// Derives a purpose-bound subkey (HKDF-SHA256) so one master key can feed
+    /// several subsystems without key reuse. `info` separates the purposes.
+    pub fn derive(&self, info: &[u8]) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>> {
+        let hkdf = Hkdf::<Sha256>::new(None, self.as_bytes());
+        let mut out = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+        hkdf.expand(info, &mut *out)
+            .map_err(|_| CryptoError::InvalidKey)?;
+        Ok(out)
+    }
+
     /// Loads the key from the secret store, creating one on first use.
     pub fn load_or_create(store: &dyn SecretStore, key: &str) -> Result<Self> {
         if let Some(bytes) = store.get(key)? {
@@ -145,6 +157,20 @@ impl MasterKey {
         let master = Self::generate();
         store.set(key, master.as_bytes())?;
         Ok(master)
+    }
+
+    /// Base64 form for manual backup (password manager). The result is the key
+    /// itself: never log it, never send it anywhere except user-chosen storage.
+    pub fn encode(&self) -> Zeroizing<String> {
+        Zeroizing::new(B64.encode(self.as_bytes()))
+    }
+
+    /// Parses output of [`MasterKey::encode`], tolerating surrounding whitespace.
+    pub fn decode(encoded: &str) -> Result<Self> {
+        let bytes = B64
+            .decode(encoded.trim())
+            .map_err(|e| CryptoError::Encoding(e.to_string()))?;
+        Self::from_slice(&bytes)
     }
 }
 
@@ -208,6 +234,38 @@ mod tests {
         let first = MasterKey::load_or_create(&store, "master").unwrap();
         let second = MasterKey::load_or_create(&store, "master").unwrap();
         assert_eq!(first.as_bytes(), second.as_bytes());
+    }
+
+    #[test]
+    fn encoded_master_key_roundtrips_and_rejects_junk() {
+        let key = MasterKey::generate();
+        let encoded = key.encode();
+        assert_eq!(
+            MasterKey::decode(&format!("  {}\n", encoded.as_str()))
+                .unwrap()
+                .as_bytes(),
+            key.as_bytes()
+        );
+        assert!(matches!(
+            MasterKey::decode("not-base64!!"),
+            Err(CryptoError::Encoding(_))
+        ));
+        assert!(matches!(
+            MasterKey::decode(&B64.encode([0u8; 31])),
+            Err(CryptoError::InvalidKey)
+        ));
+    }
+
+    #[test]
+    fn derived_keys_are_separated_by_info() {
+        let key = MasterKey::generate();
+        let db = key.derive(b"eyrie/sqlite/v1").unwrap();
+        let again = key.derive(b"eyrie/sqlite/v1").unwrap();
+        let other = key.derive(b"eyrie/attachments/v1").unwrap();
+
+        assert_eq!(*db, *again);
+        assert_ne!(*db, *other);
+        assert_ne!(*db, *key.as_bytes());
     }
 
     #[test]

@@ -364,7 +364,7 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 | 认证 | OAuth2 + PKCE；SMTP/IMAP 用 SASL；Hub 设备令牌 32 字节随机，只存哈希 |
 | 凭据 | 系统钥匙串（Keychain / Credential Manager / Keystore）；内存 `zeroize` |
 | 服务端保险箱 | 每账户 DEK，KEK 来自 KMS/env；XChaCha20-Poly1305；轮换流程写入 runbook |
-| 本地库 | SQLCipher，密钥存钥匙串；FTS 索引随库加密 |
+| 本地库 | SQLCipher（`bundled-sqlcipher-vendored-openssl`）；主密钥存钥匙串，库密钥由它经 HKDF-SHA256 派生；FTS 索引随库加密；明文旧库拒绝打开；主密钥可导出/导入做人工恢复 |
 | 邮件 HTML | 核心侧 `ammonia` 白名单净化；图片默认全阻断，仅放行 `cid:` 与光栅 data URI（含相对路径与 `srcset`）；UI 侧禁用 JS 的沙箱 WebView；CSP `default-src 'none'` |
 | 远程内容 | 默认阻断；放行时经 Hub 代理，剥离 Referer 与追踪参数 |
 | 附件 | 隔离目录、按需下载、可执行类型拦截、不做自动打开 |
@@ -534,7 +534,7 @@ CI 门禁：`fmt`、`clippy -D warnings`、`test`、`deny`、`bench`、产物体
 | iCalendar | `icalendar` | 解析/生成 VEVENT |
 | 重复规则 | `rrule` | RFC 5545 |
 | 时间与时区 | `jiff` | 夏令时与 IANA 时区 |
-| 数据库 | `rusqlite`（bundled-sqlcipher） | 加密 + FTS5 |
+| 数据库 | `rusqlite`（bundled-sqlcipher-vendored-openssl） | 加密 + FTS5；库密钥由钥匙串主密钥 HKDF 派生 |
 | HTTP | `reqwest` + `rustls` | 统一 TLS 栈 |
 | OAuth2 | `oauth2` | PKCE |
 | 加密 | `chacha20poly1305`、`argon2`、`zeroize`、`keyring` | |
