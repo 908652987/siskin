@@ -1,6 +1,6 @@
 # 交接存档
 
-更新日期：2026-10-29
+更新日期：2026-10-30
 分支：`main`　许可：AGPL-3.0
 用途：任何人（或下一次会话）读完本文件即可继续开发，无需回溯聊天记录。
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；**图形界面、日历、Hub 服务端尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；**图形界面、日历、Hub 服务端尚未开始**。
 
 ---
 
@@ -52,8 +52,9 @@
 | Outlook / Hotmail | **不做（范围决策）** | 微软已禁用密码登录，仅 OAuth2；测试账号无 Entra 租户无法取得应用身份 |
 | Gmail（应用专用密码） | 待真实验证 | 密码路径已就绪；需 Gmail 开启 IMAP + 2FA 应用专用密码 |
 | 正文与附件拉取 | 完成 | `mail-proto` BODYSTRUCTURE + `BODY.PEEK`；`mail-parse` 解码与净化；Dovecot 实跑，二次打开离线 39 ms |
+| 多邮箱遍历与角色映射 | 完成 | `mail-sync::sync_account`；SPECIAL-USE 优先、名字/中文回退；修改版 UTF-7 名称；Dovecot 6 邮箱实跑 |
+| 本地回收站与保留期 | 完成 | `mail-store::missing_at`/`purge_trash`/`settings`；删除邮箱进回收站，默认 90 天，`sync` 自动清理；同名单重建保留旧数据 |
 | HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
-| 多邮箱遍历 | 部分 | 协议层可列邮箱，门面只同步 INBOX |
 | Hub / JMAP | 未开始 | |
 | 日历 | 未开始 | |
 | 翻译 | 未开始 | |
@@ -70,29 +71,38 @@ crates/
   mail-crypto/src/lib.rs   SecretStore trait、KeyringStore、MemoryStore、
                            MasterKey（HKDF 发送子密钥）、seal/open（XChaCha20-Poly1305 + AAD）
   mail-store/src/lib.rs    SQLCipher 打开（PRAGMA key + 错密钥/明文库拒绝）、schema、
-                           迁移、账户/邮箱/消息/位置/变更日志、
+                           迁移、账户/邮箱/消息/位置/变更日志、settings、
                            apply_fetch（事务）、search_messages（FTS/LIKE 双路）、
+                           list/search/count 的多邮箱去重与回收站过滤、
+                           missing_at / mark_missing_mailboxes / retire_mailbox、
+                           list_trash / purge_trash（回收站保留期）、
                            blobs（内容寻址 + 引用计数）、message_parts/attachments、
                            record_body_structure/store_body_parts/store_attachment
-  mail-store/tests/        14 个存储测试（含错密钥、明文库、落盘无明文、blob 回收）
+  mail-store/tests/        21 个存储测试（含错密钥、明文库、落盘无明文、blob 回收、
+                           回收站与保留期）
   mail-proto/src/lib.rs    Stream（TLS/明文/STARTTLS）、ImapSession、CapabilitySet、
                            Tier(A/B/C)、fetch_range/fetch_flags/CHANGEDSINCE、
                            list_uids、fetch_body_layout（BODYSTRUCTURE 扁平化）、
-                           fetch_part（BODY.PEEK）、append、add_flag、move_message、idle_wait
+                           fetch_part（BODY.PEEK）、append、add_flag、move_message、idle_wait、
+                           list_mailboxes + SPECIAL-USE、修改版 UTF-7 名称
+  mail-proto/src/utf7.rs   RFC 3501 修改版 UTF-7 编解码
   mail-parse/src/lib.rs    MIME 解码（base64/QP/charset/RFC 2047）、ammonia 净化、
                            HTML→纯文本、整封解析（POP3）
   mail-proto/src/pop3.rs   POP3：LIST/UIDL/TOP/RETR、STLS、USER/PASS
   mail-proto/src/smtp.rs   SMTP：EHLO、STARTTLS、AUTH PLAIN/LOGIN、DATA
   mail-sync/src/lib.rs     sync_mailbox：UIDVALIDITY 重建、全量/增量、
-                           删除检测、合并去重；3 个单测
+                           删除检测、合并去重；sync_account：全邮箱遍历、
+                           \Noselect/\All/\Flagged 过滤、角色映射、消失邮箱转回收站
   mail-sync/src/pop3.rs    POP3 镜像：UIDL 去重、头部解析、轮询、删除跟随服务器
   mail-core/src/lib.rs     Core：主密钥（钥匙串）→ HKDF → 库密钥、
-                           add_account（密码入钥匙串）、协议分派、sync、watch、
-                           check、send（SMTP + Sent 归档）、
-                           fetch_body（缓存优先）、fetch_attachment（按需）
+                           add_account（密码入钥匙串）、协议分派、sync/sync_account、
+                           watch、check、send（SMTP + Sent 归档）、
+                           fetch_body（缓存优先）、fetch_attachment（按需）、
+                           purge_expired_trash / trash_retention_days
   mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
-  mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch /
-                           list / body / attachment / stats / export-key / import-key
+  mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch / mailboxes /
+                           list / trash / trash-purge / body / attachment / stats /
+                           retention / set-retention / export-key / import-key
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -117,7 +127,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 66 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 79 个测试全过
 ~/.cargo/bin/cargo build --release
 
 # 2) 起测试服务器
@@ -128,11 +138,20 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db add-account \
   --email vmail@example.com --host 127.0.0.1 --port 31143 \
   --security plaintext --insecure-plaintext true \
   --username vmail --password testpass
-cargo run --release -p mail-cli -- --db /tmp/smoke.db sync --email vmail@example.com
+cargo run --release -p mail-cli -- --db /tmp/smoke.db sync --email vmail@example.com   # 全部可选邮箱
+cargo run --release -p mail-cli -- --db /tmp/smoke.db mailboxes --email vmail@example.com
 cargo run --release -p mail-cli -- --db /tmp/smoke.db stats --email vmail@example.com
 cargo run --release -p mail-cli -- --db /tmp/smoke.db check --email vmail@example.com
 
-# 3.1) 正文与附件：id 取自 list 的 id= 列，附件 part 取自 body 的 stderr 输出
+# 3.1) 回收站：服务器删掉的邮箱进回收站，默认保留 90 天
+docker exec mail-spike-dovecot doveadm mailbox create -u vmail 项目
+docker exec mail-spike-dovecot doveadm mailbox delete -u vmail 项目   # 下次 sync 后变 missing
+cargo run --release -p mail-cli -- --db /tmp/smoke.db trash --email vmail@example.com
+cargo run --release -p mail-cli -- --db /tmp/smoke.db retention
+cargo run --release -p mail-cli -- --db /tmp/smoke.db set-retention --days 30
+cargo run --release -p mail-cli -- --db /tmp/smoke.db trash-purge
+
+# 3.2) 正文与附件：id 取自 list 的 id= 列，附件 part 取自 body 的 stderr 输出
 cargo run --release -p mail-cli -- --db /tmp/smoke.db list --email vmail@example.com --limit 5
 cargo run --release -p mail-cli -- --db /tmp/smoke.db body --email vmail@example.com --id 42
 cargo run --release -p mail-cli -- --db /tmp/smoke.db attachment --email vmail@example.com \
@@ -189,6 +208,11 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | 正文二次打开（Dovecot 已停） | 39 ms 进程整体，纯本地命中 |
 | 单部件消息（`BODY.PEEK[TEXT]`） | 正常 |
 | 重同步后正文缓存 | 保留，`body_state` 不回退 |
+| 全账户同步（debug，Dovecot 6 邮箱） | INBOX 10,005 封 1,143 ms；Sent/项目 各 1 封 ≤14 ms；`\Sent`/`\Drafts`/`\Trash`/`\Junk` 角色正确 |
+| 修改版 UTF-7 邮箱名 | LIST 的 `&mHl27g-` 解码为 `项目`；SELECT 重新编码成功 |
+| 服务器删掉邮箱 | `sync` 后该行 `state=missing`，消息只在 `trash` 出现，`list` 排除 |
+| 同名单重建 | 旧行改名 `项目 (local trash 2)` 保留消息；新 `项目` 全量同步，回收站不丢 |
+| 回收站保留期 | 默认 90 天；`set-retention --days 30` 回读 30；未到期 `trash-purge` 返回 0 |
 | RRULE | 22 例 21 通过，失败项为夏令时空洞时间，需归一化 |
 
 完整方法与命令见 `docs/SPIKE-REPORT.md`。
@@ -198,7 +222,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 ## 8. 已知缺口（按优先级）
 
 1. **不支持 Outlook/Hotmail**。2026-10-29 范围决策：微软已禁用密码登录，仅 OAuth2，且测试账号无 Entra 租户；Gmail 走应用专用密码（见 §10）。**验收**：不适用（范围外）。
-2. **只同步 INBOX**。**验收**：列出邮箱并按 SPECIAL-USE 映射 Sent/Drafts/Trash/Junk，全部可同步。
+2. **常驻监听只覆盖单个邮箱**。批量 `sync` 已遍历全部可选邮箱，`watch` 仍只对一个邮箱 IDLE。**验收**：每个可选邮箱都进入实时同步（多会话或轮询调度），或在 UI 上明确标注仅 INBOX 实时。
 3. **正文未进 FTS**。正文已按需拉取与解码，但全文索引仍只覆盖主题/地址/摘要。**验收**：正文入 `body_text` 索引后重建迁移，10 万封下中文查询仍满足 §8-7 的时延。
 4. **变更日志线性增长**。全量同步每封写一条。**验收**：10 万封场景下日志有界（快照 + 增量），状态可由快照重建。
 5. **B/C 档未实跑**。**验收**：iCloud（C 档）账户实际同步，移动邮件走 COPY+删除；B 档需一台不广告 CONDSTORE 的服务器。
@@ -209,6 +233,8 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 10. **发信能力窄**。仅纯文本 UTF-8；无附件、HTML、草稿；Sent 归档仅在 IMAP 账户尝试。**验收**：真实账户收到邮件，Sent 归档或明确报错。
 11. **明文端口需显式开关**。`--security plaintext` 或 `--smtp-security plaintext` 必须同时给 `--insecure-plaintext true`；QQ 的 143/110 不提供 STARTTLS。
 12. **主密钥无轮换与自动备份**。已提供 `export-key`/`import-key` 做人工备份（可存 Bitwarden 等），但主密钥仍只有钥匙串一份，丢失且无备份即数据不可恢复；库密钥无法在线轮换。**验收**：轮换后旧库可迁移；备份丢失时给出明确提示。
+13. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应先进入服务器 Trash 并同步到本地 Trash）；回收站不提供手工恢复。**验收**：UI 可按邮箱/时间浏览回收站；恢复操作有明确语义。
+14. **多邮箱列表已去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选、跨邮箱计数需要新的查询接口。**验收**：列表可按邮箱过滤且不重复，计数与筛选一致。
 
 ---
 
@@ -221,7 +247,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 ### 第 3 段：内容能力（正文已完成）
 
 2. ~~正文与附件按需拉取；接入 `spike/html-probe` 的净化规则。~~（完成）
-3. 多邮箱遍历与角色映射。
+3. ~~多邮箱遍历与角色映射。~~（完成；含修改版 UTF-7 与本地回收站）
 4. 变更日志压缩与快照。
 
 ### 第 4 段：服务端与移动
@@ -282,6 +308,13 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 - 附件先落 `attachments` 元数据（含传输编码）、下载后回填 `blob_hash`；漏存 encoding 会导致 base64 附件写盘为编码串。
 - 净化用 ammonia 的 `attribute_filter`，不要回到 regex 后处理：`url(...)`、`javascript:`、远程 `src` 都要按属性过滤，正则易被引号与实体绕过。
 - Mailspring-Sync 为 GPL-3，可与 AGPL 组合，但不要无意引入其他不兼容许可。
+- IMAP 邮箱名线上是修改版 UTF-7：`LIST` 返回 `&mHl27g-`、`SELECT` 要用同一编码；对外 API 统一 UTF-8（`mail-proto::utf7`），不要在两处各写一套编解码。
+- `\All`/`\Flagged` 是虚拟邮箱：Gmail 的 All Mail 会聚合其他邮箱，同步它会让每封邮件多一份位置；`\Noselect` 只是层级占位，SELECT 会失败。
+- `mark_missing_mailboxes` 必须把 INBOX 当永远存在：LIST 响应异常缺失时不能把主邮箱打进回收站。
+- 同名单重建（新 UIDVALIDITY）先 `retire_mailbox` 再 `ensure_mailbox`，否则 `reset_mailbox` 会立即清掉回收站里的旧消息。
+- 多邮箱下同 Message-ID 只有一条 `messages` 行、多条 `message_locations`；列表/搜索/计数必须取一个代表位置（`missing_at IS NULL` 的最小 `mailbox_id`），否则 INBOX 与 Archive 重复。
+- 回收站清理顺序：先释放 blob 引用、再删 FTS 行、最后删消息；漏删 FTS 会留下无法 join 的孤儿行。
+- `settings` 表是全局配置（不是 account.settings）；保留期键 `trash_retention_days`，默认 90，范围 1–3650。
 
 ---
 

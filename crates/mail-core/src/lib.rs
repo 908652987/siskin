@@ -13,9 +13,10 @@ use mail_proto::smtp::{SmtpConfig, SmtpSession};
 use mail_proto::{IdleEvent, ImapConfig, ImapSession, ProtoError, Security};
 use mail_store::{
     Account, AttachmentMetaInput, BodyPartInput, BodyState, DbKey, MessageBody, MessageContext,
-    PartMetaInput, Store, StoreError,
+    PartMetaInput, PurgeStats, Store, StoreError,
 };
-use mail_sync::{pop3_uid, Pop3SyncEngine, SyncEngine, SyncError, SyncOutcome};
+use mail_sync::{pop3_uid, Pop3SyncEngine, SyncEngine, SyncError};
+pub use mail_sync::{AccountSyncReport, SyncOutcome};
 use uuid::Uuid;
 
 pub mod presets;
@@ -229,6 +230,7 @@ impl Core {
     pub async fn sync(&self, email: &str, mailbox: &str) -> Result<Vec<SyncOutcome>> {
         let account = self.account(email)?;
         let settings = settings_of(&account)?;
+        self.purge_expired_trash()?;
         match settings.protocol {
             ReceiveProtocol::Imap => {
                 let mut session = self.connect_imap(&account).await?;
@@ -247,6 +249,57 @@ impl Core {
                 Ok(vec![outcome])
             }
         }
+    }
+
+    /// Syncs every selectable mailbox of an IMAP account and moves mailboxes
+    /// that disappeared on the server into the local trash. POP3 stays a
+    /// single INBOX mirror. Expired trash is purged first.
+    pub async fn sync_account(&self, email: &str) -> Result<AccountSyncReport> {
+        let account = self.account(email)?;
+        let settings = settings_of(&account)?;
+        self.purge_expired_trash()?;
+        match settings.protocol {
+            ReceiveProtocol::Imap => {
+                let mut session = self.connect_imap(&account).await?;
+                let engine = SyncEngine::new(Arc::clone(&self.store));
+                let report = engine.sync_account(account.id, &mut session).await?;
+                session.logout().await;
+                Ok(report)
+            }
+            ReceiveProtocol::Pop3 => {
+                let mut session = self.connect_pop3(&account).await?;
+                let engine = Pop3SyncEngine::new(Arc::clone(&self.store));
+                let outcome = engine.sync(account.id, &mut session).await?;
+                session.quit().await;
+                Ok(AccountSyncReport {
+                    outcomes: vec![outcome],
+                    failures: Vec::new(),
+                })
+            }
+        }
+    }
+
+    /// Deletes trash older than the configured retention (three months by
+    /// default). Runs automatically at the start of every sync.
+    pub fn purge_expired_trash(&self) -> Result<PurgeStats> {
+        let days = self.store.trash_retention_days()?;
+        let stats = self.store.purge_trash(days, Utc::now().timestamp())?;
+        if stats.mailboxes > 0 || stats.messages > 0 {
+            tracing::info!(
+                mailboxes = stats.mailboxes,
+                messages = stats.messages,
+                "purged expired trash"
+            );
+        }
+        Ok(stats)
+    }
+
+    pub fn trash_retention_days(&self) -> Result<u32> {
+        Ok(self.store.trash_retention_days()?)
+    }
+
+    pub fn set_trash_retention_days(&self, days: u32) -> Result<()> {
+        Ok(self.store.set_trash_retention_days(days)?)
     }
 
     /// Keeps a mailbox in sync: IMAP uses IDLE and reconnect/backoff, POP3 polls.

@@ -6,9 +6,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
-use mail_core::{presets, AccountSpec, Core, ReceiveProtocol, SecurityMode, SmtpSettings};
+use mail_core::{
+    presets, AccountSpec, Core, ReceiveProtocol, SecurityMode, SmtpSettings, SyncOutcome,
+};
 use mail_crypto::KeyringStore;
-use mail_store::Store;
+use mail_store::{Store, StoredMessage};
 
 const SECRET_SERVICE: &str = "mail-client-dev";
 
@@ -40,7 +42,7 @@ fn parse() -> Result<Args, String> {
     Ok(Args {
         db,
         command: command.ok_or(
-            "missing command: add-account | check | send | accounts | sync | watch | list | body | attachment | stats | export-key | import-key",
+            "missing command: add-account | check | send | accounts | sync | watch | mailboxes | list | trash | trash-purge | body | attachment | stats | retention | set-retention | export-key | import-key",
         )?,
         flags,
     })
@@ -82,6 +84,51 @@ fn flag_bool(flags: &HashMap<String, String>, name: &str, default: bool) -> bool
         .get(name)
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
         .unwrap_or(default)
+}
+
+fn print_outcome(outcome: &SyncOutcome) {
+    println!(
+        "{} tier={:?} full={} applied={} inserted={} removed={} in {} ms",
+        outcome.mailbox,
+        outcome.tier,
+        outcome.full,
+        outcome.applied,
+        outcome.inserted,
+        outcome.removed,
+        outcome.duration_ms
+    );
+}
+
+fn account_id(store: &Store, email: &str) -> Result<i64, String> {
+    store
+        .account_by_email(email)
+        .map_err(|e| e.to_string())?
+        .map(|account| account.id)
+        .ok_or_else(|| format!("unknown account {email}"))
+}
+
+fn print_message(msg: &StoredMessage) {
+    let when = msg
+        .sent_at
+        .and_then(|ts| DateTime::from_timestamp(ts, 0))
+        .map(|dt| {
+            dt.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "{when}  id={:<6} uid={:<6} [{}]  {} — {}",
+        msg.id,
+        msg.uid,
+        if msg.flags.iter().any(|flag| flag == "\\Seen") {
+            " "
+        } else {
+            "*"
+        },
+        msg.from.first().cloned().unwrap_or_default(),
+        msg.subject.clone().unwrap_or_default()
+    );
 }
 
 fn protocol_from(flags: &HashMap<String, String>) -> Result<ReceiveProtocol, String> {
@@ -312,20 +359,31 @@ async fn run() -> Result<(), String> {
         }
         "sync" => {
             let email = required(&args.flags, "email")?;
-            let mailbox = args
-                .flags
-                .get("mailbox")
-                .cloned()
-                .unwrap_or_else(|| "INBOX".to_string());
-            let outcomes = core
-                .sync(&email, &mailbox)
-                .await
-                .map_err(|e| e.to_string())?;
-            for o in outcomes {
-                println!(
-                    "{} tier={:?} full={} applied={} inserted={} removed={} in {} ms",
-                    o.mailbox, o.tier, o.full, o.applied, o.inserted, o.removed, o.duration_ms
-                );
+            match args.flags.get("mailbox") {
+                Some(mailbox) => {
+                    for outcome in core
+                        .sync(&email, mailbox)
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        print_outcome(&outcome);
+                    }
+                }
+                None => {
+                    let report = core.sync_account(&email).await.map_err(|e| e.to_string())?;
+                    for outcome in &report.outcomes {
+                        print_outcome(outcome);
+                    }
+                    for failure in &report.failures {
+                        eprintln!("warning: {} failed: {}", failure.mailbox, failure.error);
+                    }
+                    if !report.failures.is_empty() {
+                        return Err(format!(
+                            "{} mailbox(es) failed to sync",
+                            report.failures.len()
+                        ));
+                    }
+                }
             }
         }
         "watch" => {
@@ -340,22 +398,14 @@ async fn run() -> Result<(), String> {
                 .get("max-events")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(usize::MAX);
-            core.watch(&email, &mailbox, max_events, |o| {
-                println!(
-                    "{} tier={:?} full={} applied={} inserted={} removed={} in {} ms",
-                    o.mailbox, o.tier, o.full, o.applied, o.inserted, o.removed, o.duration_ms
-                );
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            core.watch(&email, &mailbox, max_events, print_outcome)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         "list" => {
             let email = required(&args.flags, "email")?;
             let store = core.store();
-            let account = store
-                .account_by_email(&email)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("unknown account {email}"))?;
+            let account = account_id(&store, &email)?;
             let limit = args
                 .flags
                 .get("limit")
@@ -367,31 +417,71 @@ async fn run() -> Result<(), String> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             for msg in store
-                .list_messages(account.id, limit, offset)
+                .list_messages(account, limit, offset)
                 .map_err(|e| e.to_string())?
             {
-                let when = msg
-                    .sent_at
-                    .and_then(|ts| DateTime::from_timestamp(ts, 0))
-                    .map(|dt| {
-                        dt.with_timezone(&Local)
-                            .format("%Y-%m-%d %H:%M")
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "-".to_string());
+                print_message(&msg);
+            }
+        }
+        "mailboxes" => {
+            let email = required(&args.flags, "email")?;
+            let store = core.store();
+            let account = account_id(&store, &email)?;
+            for mailbox in store.list_mailboxes(account).map_err(|e| e.to_string())? {
+                let count = store
+                    .count_messages_in_mailbox(mailbox.id)
+                    .map_err(|e| e.to_string())?;
                 println!(
-                    "{when}  id={:<6} uid={:<6} [{}]  {} — {}",
-                    msg.id,
-                    msg.uid,
-                    if msg.flags.iter().any(|f| f == "\\Seen") {
-                        " "
+                    "{} role={} state={} messages={count}",
+                    mailbox.remote_name,
+                    mailbox.role.as_deref().unwrap_or("-"),
+                    if mailbox.missing_at.is_some() {
+                        "missing"
                     } else {
-                        "*"
-                    },
-                    msg.from.first().cloned().unwrap_or_default(),
-                    msg.subject.unwrap_or_default()
+                        "present"
+                    }
                 );
             }
+        }
+        "trash" => {
+            let email = required(&args.flags, "email")?;
+            let store = core.store();
+            let account = account_id(&store, &email)?;
+            let limit = args
+                .flags
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            let offset = args
+                .flags
+                .get("offset")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            for msg in store
+                .list_trash(account, limit, offset)
+                .map_err(|e| e.to_string())?
+            {
+                print_message(&msg);
+            }
+        }
+        "trash-purge" => {
+            let stats = core.purge_expired_trash().map_err(|e| e.to_string())?;
+            println!(
+                "purged mailboxes={} messages={}",
+                stats.mailboxes, stats.messages
+            );
+        }
+        "retention" => {
+            let days = core.trash_retention_days().map_err(|e| e.to_string())?;
+            println!("trash retention: {days} days");
+        }
+        "set-retention" => {
+            let days: u32 = required(&args.flags, "days")?
+                .parse()
+                .map_err(|_| "--days expects a positive integer".to_string())?;
+            core.set_trash_retention_days(days)
+                .map_err(|e| e.to_string())?;
+            println!("trash retention set to {days} days");
         }
         "body" => {
             let email = required(&args.flags, "email")?;

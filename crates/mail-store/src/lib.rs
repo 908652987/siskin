@@ -28,11 +28,18 @@ pub enum StoreError {
     AccountNotFound(String),
     #[error("mailbox not found: {0}")]
     MailboxNotFound(String),
+    #[error("invalid setting {key}: {value}")]
+    InvalidSetting { key: String, value: String },
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+/// Trash retention when the user never chose one (three months).
+pub const DEFAULT_TRASH_RETENTION_DAYS: u32 = 90;
+/// Upper bound for retention; ten years is already effectively "keep forever".
+pub const MAX_TRASH_RETENTION_DAYS: u32 = 3650;
+const TRASH_RETENTION_KEY: &str = "trash_retention_days";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -56,6 +63,16 @@ pub struct Mailbox {
     pub last_sync_at: Option<i64>,
     pub last_flag_sync_at: Option<i64>,
     pub last_reconcile_at: Option<i64>,
+    /// Set when the server no longer lists the mailbox; its messages are kept
+    /// in the local trash until retention expires.
+    pub missing_at: Option<i64>,
+}
+
+/// Outcome of one trash purge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeStats {
+    pub mailboxes: usize,
+    pub messages: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -295,8 +312,13 @@ impl Store {
         let conn = self.conn.lock().expect("poisoned");
         conn.execute_batch(SCHEMA)?;
         let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if current == 1 {
+        // Columns added after the first release; the check keeps fresh databases
+        // (created from SCHEMA) from applying the same ALTER twice.
+        if !has_column(&conn, "mailboxes", "last_reconcile_at")? {
             conn.execute_batch("ALTER TABLE mailboxes ADD COLUMN last_reconcile_at INTEGER;")?;
+        }
+        if !has_column(&conn, "mailboxes", "missing_at")? {
+            conn.execute_batch("ALTER TABLE mailboxes ADD COLUMN missing_at INTEGER;")?;
         }
         if current < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -413,7 +435,8 @@ impl Store {
         conn.execute(
             "INSERT INTO mailboxes (account_id, remote_name, role) VALUES (?1, ?2, ?3)
              ON CONFLICT(account_id, remote_name) DO UPDATE SET
-                 role = COALESCE(excluded.role, mailboxes.role)",
+                 role = COALESCE(excluded.role, mailboxes.role),
+                 missing_at = NULL",
             params![account_id, remote_name, role],
         )?;
         let id: i64 = conn.query_row(
@@ -423,6 +446,97 @@ impl Store {
         )?;
         Self::load_mailbox(&conn, id)?
             .ok_or_else(|| StoreError::MailboxNotFound(remote_name.into()))
+    }
+
+    /// Every mailbox of an account, ordered by remote name.
+    pub fn list_mailboxes(&self, account_id: i64) -> Result<Vec<Mailbox>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt =
+            conn.prepare("SELECT id FROM mailboxes WHERE account_id = ?1 ORDER BY remote_name")?;
+        let ids: Vec<i64> = stmt
+            .query_map([account_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(mailbox) = Self::load_mailbox(&conn, id)? {
+                out.push(mailbox);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Marks mailboxes that the server no longer lists as missing. Their
+    /// messages stay in the local trash until retention expires. INBOX is
+    /// always treated as present: servers must list it, but a broken LIST
+    /// response must not drop the primary mailbox.
+    pub fn mark_missing_mailboxes(
+        &self,
+        account_id: i64,
+        present: &[String],
+        now: i64,
+    ) -> Result<usize> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, String, Option<i64>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, remote_name, missing_at FROM mailboxes WHERE account_id = ?1",
+            )?;
+            let rows = stmt.query_map([account_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+
+        let mut marked = 0usize;
+        for (id, name, missing_at) in rows {
+            let still_present = name.eq_ignore_ascii_case("INBOX")
+                || present.iter().any(|present| present == &name);
+            match (still_present, missing_at) {
+                (false, None) => {
+                    tx.execute(
+                        "UPDATE mailboxes SET missing_at = ?2 WHERE id = ?1",
+                        params![id, now],
+                    )?;
+                    record_change(&tx, account_id, "mailbox", &id.to_string(), "removed")?;
+                    marked += 1;
+                }
+                (true, Some(_)) => {
+                    tx.execute("UPDATE mailboxes SET missing_at = NULL WHERE id = ?1", [id])?;
+                    record_change(&tx, account_id, "mailbox", &id.to_string(), "restored")?;
+                }
+                _ => {}
+            }
+        }
+        tx.commit()?;
+        Ok(marked)
+    }
+
+    /// Renames a vanished mailbox out of the way so a recreated mailbox can
+    /// own its server name; the retired row keeps its messages (and retention
+    /// clock) until purge. Returns the retired name.
+    pub fn retire_mailbox(&self, mailbox_id: i64) -> Result<String> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let (account_id, name): (i64, String) = tx.query_row(
+            "SELECT account_id, remote_name FROM mailboxes WHERE id = ?1",
+            [mailbox_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let retired = format!("{name} (local trash {mailbox_id})");
+        tx.execute(
+            "UPDATE mailboxes SET remote_name = ?2, role = NULL WHERE id = ?1",
+            params![mailbox_id, retired],
+        )?;
+        record_change(
+            &tx,
+            account_id,
+            "mailbox",
+            &mailbox_id.to_string(),
+            "retired",
+        )?;
+        tx.commit()?;
+        Ok(retired)
     }
 
     fn load_mailbox(conn: &Connection, id: i64) -> Result<Option<Mailbox>> {
@@ -437,12 +551,14 @@ impl Store {
             last_sync_at: Option<i64>,
             last_flag_sync_at: Option<i64>,
             last_reconcile_at: Option<i64>,
+            missing_at: Option<i64>,
         }
 
         let raw: Option<Row> = conn
             .query_row(
                 "SELECT id, account_id, remote_name, role, uidvalidity, uidnext,
-                        highest_modseq, last_sync_at, last_flag_sync_at, last_reconcile_at
+                        highest_modseq, last_sync_at, last_flag_sync_at, last_reconcile_at,
+                        missing_at
                  FROM mailboxes WHERE id = ?1",
                 [id],
                 |row| {
@@ -457,6 +573,7 @@ impl Store {
                         last_sync_at: row.get(7)?,
                         last_flag_sync_at: row.get(8)?,
                         last_reconcile_at: row.get(9)?,
+                        missing_at: row.get(10)?,
                     })
                 },
             )
@@ -473,6 +590,7 @@ impl Store {
             last_sync_at: row.last_sync_at,
             last_flag_sync_at: row.last_flag_sync_at,
             last_reconcile_at: row.last_reconcile_at,
+            missing_at: row.missing_at,
         }))
     }
 
@@ -520,42 +638,7 @@ impl Store {
             "DELETE FROM message_locations WHERE mailbox_id = ?1",
             [mailbox_id],
         )?;
-        // Messages left without any location are dropped below; release the
-        // blobs they referenced first so the cache does not leak.
-        {
-            let mut stmt = tx.prepare(
-                "SELECT blob_hash, COUNT(*) FROM (
-                     SELECT blob_hash FROM message_parts
-                      WHERE message_id IN (
-                          SELECT id FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)
-                      ) AND blob_hash IS NOT NULL
-                     UNION ALL
-                     SELECT blob_hash FROM attachments
-                      WHERE message_id IN (
-                          SELECT id FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)
-                      ) AND blob_hash IS NOT NULL
-                 ) GROUP BY blob_hash",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            let orphans: Vec<(Vec<u8>, i64)> = rows.collect::<rusqlite::Result<_>>()?;
-            drop(stmt);
-            for (hash, count) in orphans {
-                tx.execute(
-                    "UPDATE blobs SET refcount = refcount - ?2 WHERE hash = ?1",
-                    params![hash, count],
-                )?;
-                tx.execute(
-                    "DELETE FROM blobs WHERE hash = ?1 AND refcount <= 0",
-                    [hash],
-                )?;
-            }
-        }
-        tx.execute(
-            "DELETE FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)",
-            [],
-        )?;
+        purge_orphan_messages(&tx)?;
         tx.execute(
             "UPDATE mailboxes SET uidvalidity = ?2, uidnext = NULL, highest_modseq = NULL,
                     last_sync_at = NULL, last_flag_sync_at = NULL WHERE id = ?1",
@@ -601,6 +684,8 @@ impl Store {
         Ok(stats)
     }
 
+    /// Messages visible outside the trash: one row per message even when the
+    /// same message is stored in several mailboxes (INBOX and Archive, say).
     pub fn list_messages(
         &self,
         account_id: i64,
@@ -614,6 +699,11 @@ impl Store {
              FROM messages m
              JOIN message_locations l ON l.message_id = m.id
              WHERE m.account_id = ?1
+               AND l.mailbox_id = (
+                   SELECT l2.mailbox_id FROM message_locations l2
+                   JOIN mailboxes b2 ON b2.id = l2.mailbox_id
+                   WHERE l2.message_id = m.id AND b2.missing_at IS NULL
+                   ORDER BY l2.mailbox_id LIMIT 1)
              ORDER BY COALESCE(m.sent_at, 0) DESC, m.id DESC
              LIMIT ?2 OFFSET ?3",
         )?;
@@ -655,6 +745,11 @@ impl Store {
         let conn = self.conn.lock().expect("poisoned");
         let columns = "m.id, l.uid, l.mailbox_id, m.message_id, m.subject, m.from_json, m.to_json,
                        m.sent_at, m.size, l.flags, m.snippet";
+        let live_location = "l.mailbox_id = (
+                   SELECT l2.mailbox_id FROM message_locations l2
+                   JOIN mailboxes b2 ON b2.id = l2.mailbox_id
+                   WHERE l2.message_id = m.id AND b2.missing_at IS NULL
+                   ORDER BY l2.mailbox_id LIMIT 1)";
         let mut out = Vec::new();
         if trimmed.chars().count() < 3 {
             let pattern = format!("%{trimmed}%");
@@ -662,6 +757,7 @@ impl Store {
                 "SELECT {columns} FROM messages m
                  JOIN message_locations l ON l.message_id = m.id
                  WHERE m.account_id = ?1
+                   AND {live_location}
                    AND (m.subject LIKE ?2 OR m.from_json LIKE ?2 OR m.snippet LIKE ?2)
                  ORDER BY COALESCE(m.sent_at, 0) DESC LIMIT ?3"
             ))?;
@@ -676,6 +772,7 @@ impl Store {
                  JOIN messages m ON m.id = f.rowid
                  JOIN message_locations l ON l.message_id = m.id
                  WHERE message_fts MATCH ?1 AND m.account_id = ?2
+                   AND {live_location}
                  ORDER BY COALESCE(m.sent_at, 0) DESC LIMIT ?3"
             ))?;
             let rows = stmt.query_map(params![phrase, account_id, limit], map_message)?;
@@ -689,14 +786,111 @@ impl Store {
     pub fn count_messages(&self, account_id: i64) -> Result<i64> {
         let conn = self.conn.lock().expect("poisoned");
         Ok(conn.query_row(
-            "SELECT COUNT(*) FROM message_locations l
-             JOIN messages m ON m.id = l.message_id WHERE m.account_id = ?1",
+            "SELECT COUNT(*) FROM messages m
+             WHERE m.account_id = ?1 AND EXISTS (
+                 SELECT 1 FROM message_locations l
+                 JOIN mailboxes b ON b.id = l.mailbox_id
+                 WHERE l.message_id = m.id AND b.missing_at IS NULL)",
             [account_id],
             |row| row.get(0),
         )?)
     }
 
+    /// Messages whose only copies live in mailboxes the server no longer
+    /// lists; they are purged once retention expires.
+    pub fn list_trash(
+        &self,
+        account_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT m.id, l.uid, l.mailbox_id, m.message_id, m.subject, m.from_json, m.to_json,
+                    m.sent_at, m.size, l.flags, m.snippet
+             FROM messages m
+             JOIN message_locations l ON l.message_id = m.id
+             JOIN mailboxes b ON b.id = l.mailbox_id
+             WHERE m.account_id = ?1 AND b.missing_at IS NOT NULL
+               AND l.mailbox_id = (
+                   SELECT l2.mailbox_id FROM message_locations l2
+                   JOIN mailboxes b2 ON b2.id = l2.mailbox_id
+                   WHERE l2.message_id = m.id AND b2.missing_at IS NOT NULL
+                   ORDER BY l2.mailbox_id LIMIT 1)
+             ORDER BY COALESCE(m.sent_at, 0) DESC, m.id DESC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit, offset], map_message)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Drops mailboxes missing for at least `retention_days`, then removes the
+    /// messages they kept alive. Ephemeral `now` keeps the cutoff testable.
+    pub fn purge_trash(&self, retention_days: u32, now: i64) -> Result<PurgeStats> {
+        let cutoff = now - i64::from(retention_days) * 86_400;
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let mailboxes = tx.execute(
+            "DELETE FROM mailboxes WHERE missing_at IS NOT NULL AND missing_at <= ?1",
+            [cutoff],
+        )?;
+        let messages = purge_orphan_messages(&tx)?;
+        tx.commit()?;
+        Ok(PurgeStats {
+            mailboxes,
+            messages,
+        })
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Days a missing mailbox is kept locally before its messages are deleted.
+    pub fn trash_retention_days(&self) -> Result<u32> {
+        let Some(raw) = self.setting(TRASH_RETENTION_KEY)? else {
+            return Ok(DEFAULT_TRASH_RETENTION_DAYS);
+        };
+        raw.parse()
+            .ok()
+            .filter(|days| *days >= 1 && *days <= MAX_TRASH_RETENTION_DAYS)
+            .ok_or_else(|| StoreError::InvalidSetting {
+                key: TRASH_RETENTION_KEY.to_string(),
+                value: raw,
+            })
+    }
+
+    pub fn set_trash_retention_days(&self, days: u32) -> Result<()> {
+        if !(1..=MAX_TRASH_RETENTION_DAYS).contains(&days) {
+            return Err(StoreError::InvalidSetting {
+                key: TRASH_RETENTION_KEY.to_string(),
+                value: days.to_string(),
+            });
+        }
+        self.set_setting(TRASH_RETENTION_KEY, &days.to_string())
+    }
+
     /// Routing data needed to fetch one message's content from its server.
+    /// Live mailboxes win over trash copies of the same message.
     pub fn message_context(&self, message_id: i64) -> Result<Option<MessageContext>> {
         let conn = self.conn.lock().expect("poisoned");
         conn.query_row(
@@ -705,7 +899,7 @@ impl Store {
              JOIN message_locations l ON l.message_id = m.id
              JOIN mailboxes b ON b.id = l.mailbox_id
              WHERE m.id = ?1
-             ORDER BY l.mailbox_id LIMIT 1",
+             ORDER BY (b.missing_at IS NOT NULL), l.mailbox_id LIMIT 1",
             [message_id],
             |row| {
                 Ok(MessageContext {
@@ -1228,6 +1422,54 @@ fn release_blob(tx: &Transaction<'_>, hash: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Deletes messages no mailbox references any more, releasing their blobs and
+/// full-text rows. Returns the number of messages dropped.
+fn purge_orphan_messages(tx: &Transaction<'_>) -> Result<usize> {
+    let orphans =
+        "SELECT id FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)";
+    let blob_refs = format!(
+        "SELECT blob_hash, COUNT(*) FROM (
+             SELECT blob_hash FROM message_parts
+              WHERE message_id IN ({orphans}) AND blob_hash IS NOT NULL
+             UNION ALL
+             SELECT blob_hash FROM attachments
+              WHERE message_id IN ({orphans}) AND blob_hash IS NOT NULL
+         ) GROUP BY blob_hash"
+    );
+    let blobs: Vec<(Vec<u8>, i64)> = {
+        let mut stmt = tx.prepare(&blob_refs)?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (hash, count) in blobs {
+        tx.execute(
+            "UPDATE blobs SET refcount = refcount - ?2 WHERE hash = ?1",
+            params![hash, count],
+        )?;
+        tx.execute(
+            "DELETE FROM blobs WHERE hash = ?1 AND refcount <= 0",
+            [hash],
+        )?;
+    }
+    // FTS5 contentless-delete tables accept DELETE by rowid.
+    tx.execute(
+        &format!("DELETE FROM message_fts WHERE rowid IN ({orphans})"),
+        [],
+    )?;
+    let dropped = tx.execute(&format!("DELETE FROM messages WHERE id IN ({orphans})"), [])?;
+    Ok(dropped)
+}
+
+/// True when `table` already has `column`; migrations run against both fresh
+/// databases (columns from SCHEMA) and upgraded ones.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
 /// Removes layout rows that the server no longer reports, releasing blobs.
 fn prune_rows(
     tx: &Transaction<'_>,
@@ -1337,7 +1579,13 @@ CREATE TABLE IF NOT EXISTS mailboxes (
   last_sync_at       INTEGER,
   last_flag_sync_at  INTEGER,
   last_reconcile_at  INTEGER,
+  missing_at         INTEGER,
   UNIQUE (account_id, remote_name)
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS messages (

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_imap::imap_proto::types::{
     Address, BodyContentCommon, BodyContentSinglePart, BodyStructure, ContentEncoding,
-    MessageSection, SectionPath,
+    MessageSection, NameAttribute, SectionPath,
 };
 use async_imap::types::{Capability, Flag, Name};
 use async_imap::Session;
@@ -24,6 +24,7 @@ use tokio_rustls::TlsConnector;
 
 pub mod pop3;
 pub mod smtp;
+mod utf7;
 
 /// Transport security for protocol connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,10 +95,39 @@ pub struct ImapConfig {
     pub password: String,
 }
 
+/// RFC 6154 special-use attribute of a mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialUse {
+    /// All messages (virtual on Gmail).
+    All,
+    Archive,
+    Drafts,
+    /// Virtual mailbox of flagged messages.
+    Flagged,
+    Junk,
+    Sent,
+    Trash,
+}
+
 #[derive(Debug, Clone)]
 pub struct MailboxInfo {
     pub name: String,
+    /// Canonical IMAP attributes (`\Noselect`, `\Sent`, ...) for diagnostics.
     pub attributes: Vec<String>,
+    pub special_use: Option<SpecialUse>,
+    /// False for hierarchy placeholders and non-existent mailboxes.
+    pub selectable: bool,
+}
+
+impl MailboxInfo {
+    /// Virtual mailboxes only aggregate messages stored elsewhere; syncing
+    /// them would duplicate what the real mailboxes already hold.
+    pub fn is_virtual(&self) -> bool {
+        matches!(
+            self.special_use,
+            Some(SpecialUse::All | SpecialUse::Flagged)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,10 +358,12 @@ impl ImapSession {
     }
 
     pub async fn select(&mut self, mailbox: &str) -> Result<SelectedMailbox> {
+        // The crate speaks UTF-8 names; the wire expects modified UTF-7.
+        let wire = utf7::encode(mailbox);
         let selected = if self.capabilities.condstore {
-            self.session().select_condstore(mailbox).await?
+            self.session().select_condstore(&wire).await?
         } else {
-            self.session().select(mailbox).await?
+            self.session().select(&wire).await?
         };
         Ok(SelectedMailbox {
             exists: selected.exists,
@@ -423,7 +455,8 @@ impl ImapSession {
     }
 
     pub async fn append(&mut self, mailbox: &str, flags: Option<&str>, body: &[u8]) -> Result<()> {
-        self.session().append(mailbox, flags, None, body).await?;
+        let wire = utf7::encode(mailbox);
+        self.session().append(&wire, flags, None, body).await?;
         Ok(())
     }
 
@@ -438,13 +471,12 @@ impl ImapSession {
 
     /// Moves a message, using MOVE when available and copy+delete otherwise.
     pub async fn move_message(&mut self, uid: u32, destination: &str) -> Result<&'static str> {
+        let wire = utf7::encode(destination);
         if self.capabilities.can_move {
-            self.session().uid_mv(uid.to_string(), destination).await?;
+            self.session().uid_mv(uid.to_string(), &wire).await?;
             Ok("move")
         } else {
-            self.session()
-                .uid_copy(uid.to_string(), destination)
-                .await?;
+            self.session().uid_copy(uid.to_string(), &wire).await?;
             let mut stream = self
                 .session()
                 .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
@@ -519,10 +551,49 @@ fn capability_name(cap: &Capability) -> String {
 }
 
 fn convert_name(name: &Name) -> MailboxInfo {
+    let raw = name.name();
+    let (attributes, special_use, selectable) = classify_attributes(name.attributes());
     MailboxInfo {
-        name: name.name().to_string(),
-        attributes: name.attributes().iter().map(|a| format!("{a:?}")).collect(),
+        name: utf7::decode(raw).unwrap_or_else(|| raw.to_string()),
+        attributes,
+        special_use,
+        selectable,
     }
+}
+
+fn classify_attributes(
+    attributes: &[NameAttribute<'_>],
+) -> (Vec<String>, Option<SpecialUse>, bool) {
+    let mut names = Vec::with_capacity(attributes.len());
+    let mut special_use = None;
+    let mut selectable = true;
+    for attribute in attributes {
+        let (name, use_kind) = match attribute {
+            NameAttribute::NoInferiors => ("\\Noinferiors", None),
+            NameAttribute::NoSelect => ("\\Noselect", None),
+            NameAttribute::Marked => ("\\Marked", None),
+            NameAttribute::Unmarked => ("\\Unmarked", None),
+            NameAttribute::All => ("\\All", Some(SpecialUse::All)),
+            NameAttribute::Archive => ("\\Archive", Some(SpecialUse::Archive)),
+            NameAttribute::Drafts => ("\\Drafts", Some(SpecialUse::Drafts)),
+            NameAttribute::Flagged => ("\\Flagged", Some(SpecialUse::Flagged)),
+            NameAttribute::Junk => ("\\Junk", Some(SpecialUse::Junk)),
+            NameAttribute::Sent => ("\\Sent", Some(SpecialUse::Sent)),
+            NameAttribute::Trash => ("\\Trash", Some(SpecialUse::Trash)),
+            NameAttribute::Extension(name) => (name.as_ref(), None),
+            // NameAttribute is non_exhaustive; keep future attributes visible.
+            other => {
+                names.push(format!("{other:?}"));
+                continue;
+            }
+        };
+        if matches!(attribute, NameAttribute::NoSelect) {
+            selectable = false;
+        }
+        names.push(name.to_string());
+        special_use = special_use.or(use_kind);
+    }
+    (names, special_use, selectable)
 }
 
 fn convert_fetch(item: &async_imap::types::Fetch) -> FetchedMessage {
@@ -837,5 +908,18 @@ mod body_structure_tests {
     fn section_paths_match_imap_sections() {
         assert_eq!(section_path(""), SectionPath::Full(MessageSection::Text));
         assert_eq!(section_path("2.1"), SectionPath::Part(vec![2, 1], None));
+    }
+
+    #[test]
+    fn special_use_attributes_are_classified() {
+        let (names, use_kind, selectable) =
+            classify_attributes(&[NameAttribute::Sent, NameAttribute::Unmarked]);
+        assert_eq!(names, vec!["\\Sent", "\\Unmarked"]);
+        assert_eq!(use_kind, Some(SpecialUse::Sent));
+        assert!(selectable);
+
+        let (_, use_kind, selectable) = classify_attributes(&[NameAttribute::NoSelect]);
+        assert!(use_kind.is_none());
+        assert!(!selectable, "hierarchy placeholders are not selectable");
     }
 }
