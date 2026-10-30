@@ -1,10 +1,12 @@
 //! Secret storage and authenticated encryption.
 //!
 //! Credentials never live in SQLite: they are addressed by a key and stored in
-//! the platform keychain. Envelope encryption is available for data that must
-//! be sealed at rest (server vault, encrypted blobs).
+//! the platform keychain. [`FileStore`] exists only for development, where
+//! macOS re-prompts on every ad-hoc signed rebuild. Envelope encryption is
+//! available for data that must be sealed at rest (server vault, blobs).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -13,7 +15,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -31,6 +33,8 @@ pub enum CryptoError {
     Decrypt,
     #[error("encoding: {0}")]
     Encoding(String),
+    #[error("secret file: {0}")]
+    Io(String),
 }
 
 pub type Result<T, E = CryptoError> = std::result::Result<T, E>;
@@ -82,6 +86,90 @@ impl SecretStore for KeyringStore {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(CryptoError::Keychain(e.to_string())),
         }
+    }
+}
+
+/// Development-only store: one 0600 file per secret inside a 0700 directory.
+///
+/// macOS keys keychain grants to the binary's CDHash, so every rebuild of an
+/// ad-hoc signed dev binary triggers a new authorisation prompt. This store
+/// lets a developer opt out of the keychain explicitly; it must never be the
+/// default, because the secrets then live in plain files.
+pub struct FileStore {
+    dir: PathBuf,
+}
+
+impl FileStore {
+    pub fn new(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir).map_err(|e| CryptoError::Io(e.to_string()))?;
+        restrict(&dir, 0o700);
+        Ok(Self { dir })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn path(&self, key: &str) -> PathBuf {
+        let digest = Sha256::digest(key.as_bytes());
+        let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.dir.join(name)
+    }
+}
+
+impl SecretStore for FileStore {
+    fn set(&self, key: &str, secret: &[u8]) -> Result<()> {
+        write_private(&self.path(key), secret).map_err(|e| CryptoError::Io(e.to_string()))
+    }
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        match std::fs::read(self.path(key)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(CryptoError::Io(err.to_string())),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.path(key)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(CryptoError::Io(err.to_string())),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    // Best effort: the directory may live on a filesystem without permissions.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) {}
+
+/// Creates the file with 0600 from the start, so the secret is never briefly
+/// readable by other users.
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(data)?;
+        restrict(path, 0o600);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
     }
 }
 
@@ -226,6 +314,50 @@ mod tests {
         assert_eq!(store.get("k").unwrap().unwrap(), b"secret");
         store.delete("k").unwrap();
         assert!(store.get("k").unwrap().is_none());
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("eyrie-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn file_store_roundtrip_isolates_keys() {
+        let dir = temp_dir("filestore");
+        let store = FileStore::new(&dir).unwrap();
+        assert!(store.get("account:a").unwrap().is_none());
+        store.set("account:a", b"one").unwrap();
+        store.set("account:b", b"two").unwrap();
+        store.set("account:a", b"one-updated").unwrap();
+        assert_eq!(store.get("account:a").unwrap().unwrap(), b"one-updated");
+        assert_eq!(store.get("account:b").unwrap().unwrap(), b"two");
+        store.delete("account:a").unwrap();
+        assert!(store.get("account:a").unwrap().is_none());
+        assert_eq!(store.get("account:b").unwrap().unwrap(), b"two");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("filemode");
+        let store = FileStore::new(&dir).unwrap();
+        store.set("master-key", b"secret").unwrap();
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let file_mode = std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"secret");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

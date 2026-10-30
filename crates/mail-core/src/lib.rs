@@ -12,8 +12,8 @@ use mail_proto::pop3::{Pop3Config, Pop3Session};
 use mail_proto::smtp::{SmtpConfig, SmtpSession};
 use mail_proto::{IdleEvent, ImapConfig, ImapSession, ProtoError, Security};
 use mail_store::{
-    Account, AttachmentMetaInput, BodyPartInput, BodyState, DbKey, MessageBody, MessageContext,
-    PartMetaInput, PurgeStats, Store, StoreError,
+    Account, AttachmentMetaInput, BodyPartInput, BodyState, ChangeWindow, Compaction, DbKey,
+    MessageBody, MessageContext, PartMetaInput, PurgeStats, Store, StoreError,
 };
 use mail_sync::{pop3_uid, Pop3SyncEngine, SyncEngine, SyncError};
 pub use mail_sync::{AccountSyncReport, SyncOutcome};
@@ -231,7 +231,7 @@ impl Core {
         let account = self.account(email)?;
         let settings = settings_of(&account)?;
         self.purge_expired_trash()?;
-        match settings.protocol {
+        let outcomes = match settings.protocol {
             ReceiveProtocol::Imap => {
                 let mut session = self.connect_imap(&account).await?;
                 let engine = SyncEngine::new(Arc::clone(&self.store));
@@ -239,16 +239,18 @@ impl Core {
                     .sync_mailbox(account.id, &mut session, mailbox)
                     .await?;
                 session.logout().await;
-                Ok(vec![outcome])
+                vec![outcome]
             }
             ReceiveProtocol::Pop3 => {
                 let mut session = self.connect_pop3(&account).await?;
                 let engine = Pop3SyncEngine::new(Arc::clone(&self.store));
                 let outcome = engine.sync(account.id, &mut session).await?;
                 session.quit().await;
-                Ok(vec![outcome])
+                vec![outcome]
             }
-        }
+        };
+        self.compact_account(account.id)?;
+        Ok(outcomes)
     }
 
     /// Syncs every selectable mailbox of an IMAP account and moves mailboxes
@@ -258,25 +260,63 @@ impl Core {
         let account = self.account(email)?;
         let settings = settings_of(&account)?;
         self.purge_expired_trash()?;
-        match settings.protocol {
+        let report = match settings.protocol {
             ReceiveProtocol::Imap => {
                 let mut session = self.connect_imap(&account).await?;
                 let engine = SyncEngine::new(Arc::clone(&self.store));
                 let report = engine.sync_account(account.id, &mut session).await?;
                 session.logout().await;
-                Ok(report)
+                report
             }
             ReceiveProtocol::Pop3 => {
                 let mut session = self.connect_pop3(&account).await?;
                 let engine = Pop3SyncEngine::new(Arc::clone(&self.store));
                 let outcome = engine.sync(account.id, &mut session).await?;
                 session.quit().await;
-                Ok(AccountSyncReport {
+                AccountSyncReport {
                     outcomes: vec![outcome],
                     failures: Vec::new(),
-                })
+                }
             }
+        };
+        self.compact_account(account.id)?;
+        Ok(report)
+    }
+
+    /// Cursor bookkeeping for incremental consumers; a cursor below
+    /// `oldest_seq` (or `snapshot_seq`) must reload the snapshot.
+    pub fn change_window(&self, email: &str) -> Result<ChangeWindow> {
+        let account = self.account(email)?;
+        Ok(self.store.change_window(account.id)?)
+    }
+
+    /// Replaces the change log with a snapshot once it grows past
+    /// `change_log_max_rows` (20,000 by default). Runs after every sync.
+    pub fn compact_changes(&self, email: &str) -> Result<Option<Compaction>> {
+        let account = self.account(email)?;
+        self.compact_account(account.id)
+    }
+
+    /// Long-running watch loops must not die because compaction failed; the
+    /// log stays bounded at the next successful sync instead.
+    fn compact_quietly(&self, account_id: i64) {
+        if let Err(err) = self.compact_account(account_id) {
+            tracing::warn!(%err, "change log compaction failed");
         }
+    }
+
+    fn compact_account(&self, account_id: i64) -> Result<Option<Compaction>> {
+        let max_rows = self.store.change_log_max_rows()?;
+        let compaction = self.store.compact_changes(account_id, max_rows)?;
+        if let Some(compaction) = compaction {
+            tracing::info!(
+                account_id,
+                snapshot_seq = compaction.snapshot_seq,
+                removed = compaction.removed_changes,
+                "compacted change log"
+            );
+        }
+        Ok(compaction)
     }
 
     /// Deletes trash older than the configured retention (three months by
@@ -356,6 +396,7 @@ impl Core {
                 Ok(outcome) => {
                     on_event(&outcome);
                     delivered += 1;
+                    self.compact_quietly(account.id);
                     if delivered >= max_events {
                         session.logout().await;
                         return Ok(());
@@ -377,6 +418,7 @@ impl Core {
                             Ok(outcome) => {
                                 on_event(&outcome);
                                 delivered += 1;
+                                self.compact_quietly(account.id);
                                 if delivered >= max_events {
                                     session.logout().await;
                                     return Ok(());
@@ -423,6 +465,7 @@ impl Core {
                         Ok(outcome) => {
                             on_event(&outcome);
                             delivered += 1;
+                            self.compact_quietly(account.id);
                         }
                         Err(err) => tracing::warn!(%err, "POP3 sync failed"),
                     }

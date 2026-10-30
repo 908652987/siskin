@@ -36,6 +36,10 @@
 | D6 | 邮件统一走 IMAP/POP3 + SMTP，不接 Gmail API / Graph | 规避 restricted scope 与 CASA 年审 | 失去部分 Gmail 专有能力 |
 | D7 | 日历走 CalDAV / Google Calendar API / Microsoft Graph | 微软不提供 CalDAV，必须 Graph | 三套日历适配器 |
 | D8 | AGPL-3.0 | 自托管产品防闭源白嫖；与 GPL-3 代码可组合 | 商业客户敏感 |
+| D9 | 组件策略：优先平台官方与成熟库，只有同步状态机与 HTML 净化自研 | 减少自研面，降低长期维护成本 | 依赖较多，需做许可与维护状态审查 |
+| D10 | 首发平台 macOS + Windows（同一里程碑，先后实现） | 覆盖主要桌面用户 | 移动端与 Linux 延后 |
+| D11 | Windows 内存路线：先 WinUI 3（目标 110–130 MB），不满意再评估 C++/WinRT 或 Slint | 先用最省事的原生栈验证内存目标 | 未在 Windows 上验证 |
+| D12 | Linux 桌面 UI 用 Slint（纯 Rust，单进程直连 `mail-core`） | 无 WebView、无 GTK/Qt 运行时依赖，内存与启动开销可控；macOS 上即可编译运行同一份代码，验证不受 Linux 机器限制 | 第四套 UI 代码；Slint DSL 与三端原生 UI 不共享布局 |
 
 ---
 
@@ -106,12 +110,13 @@ flowchart TB
 │   ├── mail-translate/         # provider trait 与缓存
 │   ├── mail-ffi/               # UniFFI 定义与绑定生成
 │   ├── mail-api/               # JMAP 子集（服务端与本地共用）
-│   └── mail-hub/               # 服务端二进制
-├── apps/
+│   ├── mail-hub/               # 服务端二进制
+├── apps/                       # 各平台 UI 一律放这里，不混进 crates/
 │   ├── macos/                  # SwiftUI
 │   ├── windows/                # WinUI 3 + C#
 │   ├── ios/                    # SwiftUI
-│   └── android/                # Kotlin + Compose
+│   ├── android/                # Kotlin + Compose
+│   └── linux/                  # Slint（Rust 二进制，workspace 成员，未创建）
 ├── docs/
 └── tests/
     ├── conformance/            # IMAP/CalDAV 兼容矩阵
@@ -127,11 +132,14 @@ mail-core → mail-sync → mail-proto
          → mail-crypto
          → mail-translate
 mail-ffi → mail-core
+apps/linux → mail-core
 mail-api → mail-store
 mail-hub → mail-api, mail-core
 ```
 
-`mail-parse` 不得依赖网络；`mail-store` 不得依赖 UI；`mail-api` 不得依赖 IMAP 类型。
+`mail-parse` 不得依赖网络；`mail-store` 不得依赖 UI；`mail-api` 不得依赖 IMAP 类型；
+`apps/linux` 是唯一允许引入 Slint 的 workspace 成员，其余 crate 不得依赖 UI 工具链；
+它与其他平台的 UI 一样只通过门面（`mail-core`，未来是 `mail-ffi`）访问核心。
 
 ---
 
@@ -222,7 +230,7 @@ CREATE TABLE attachments (
   PRIMARY KEY (message_id, part)
 );
 
--- 变更日志：客户端增量同步的唯一来源
+-- 变更日志：增量同步的来源，超过阈值后被快照取代
 CREATE TABLE changes (
   seq         INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id  INTEGER NOT NULL,
@@ -230,6 +238,15 @@ CREATE TABLE changes (
   entity_id   TEXT NOT NULL,
   op          TEXT NOT NULL,            -- created|updated|destroyed
   at          INTEGER NOT NULL
+);
+
+-- 每账户一份全量状态快照；seq 即其覆盖到的水位。游标早于该水位
+-- （或早于最旧保留的 change）时必须重新全量加载，等价于 cannotCalculateChanges
+CREATE TABLE change_snapshots (
+  account_id  INTEGER PRIMARY KEY,
+  seq         INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL,
+  state       BLOB NOT NULL             -- JSON：mailboxes + messages + locations/flags
 );
 
 -- 日历
@@ -375,6 +392,8 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 `Calendar/get|changes`、`CalendarEvent/query|get|changes|set`、`Identity/get`、`Core/echo`。
 
 状态字符串格式：`<account_id>:<seq>`。客户端持有旧 state，调用 `/changes` 拿增量；服务端无法计算时返回 `cannotCalculateChanges`，客户端降级全量刷新。
+
+本地库的变更日志有界：超过 `change_log_max_rows`（默认 20,000）后，`compact_changes` 在当前水位写一份全量快照并删除被覆盖的 `changes` 行。水位（`latest_change_seq`）取快照 seq 与剩余 `changes` 最大 seq 的较大值，因此压缩不会让状态字符串倒退；早于最旧保留行的游标由 `change_window` 识别并要求重载快照。
 
 推送：SSE 事件只携带 `{type, state}`，不含正文；手机端由 Hub 转 APNs/FCM 静默推送，载荷只含"有新变更"。
 

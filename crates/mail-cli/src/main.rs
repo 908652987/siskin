@@ -9,7 +9,7 @@ use chrono::{DateTime, Local};
 use mail_core::{
     presets, AccountSpec, Core, ReceiveProtocol, SecurityMode, SmtpSettings, SyncOutcome,
 };
-use mail_crypto::KeyringStore;
+use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Store, StoredMessage};
 
 const SECRET_SERVICE: &str = "mail-client-dev";
@@ -42,7 +42,7 @@ fn parse() -> Result<Args, String> {
     Ok(Args {
         db,
         command: command.ok_or(
-            "missing command: add-account | check | send | accounts | sync | watch | mailboxes | list | trash | trash-purge | body | attachment | stats | retention | set-retention | export-key | import-key",
+            "missing command: add-account | check | send | accounts | sync | watch | mailboxes | list | trash | trash-purge | body | attachment | stats | retention | set-retention | changes | changes-compact | set-change-max-rows | export-key | import-key",
         )?,
         flags,
     })
@@ -53,6 +53,23 @@ fn required(flags: &HashMap<String, String>, name: &str) -> Result<String, Strin
         .get(name)
         .cloned()
         .ok_or_else(|| format!("missing --{name}"))
+}
+
+/// The keychain is the default. macOS ties its grants to each binary's CDHash,
+/// so ad-hoc signed dev builds prompt again after every rebuild; `--dev-secret-dir`
+/// (or `EYRIE_DEV_SECRET_DIR`) switches to 0600 files for development only.
+fn secret_store(flags: &HashMap<String, String>) -> Result<Arc<dyn SecretStore>, String> {
+    let dir = flags
+        .get("dev-secret-dir")
+        .cloned()
+        .or_else(|| std::env::var("EYRIE_DEV_SECRET_DIR").ok());
+    match dir {
+        Some(dir) => {
+            eprintln!("using development secret store at {dir}; the keychain is not used");
+            Ok(Arc::new(FileStore::new(dir).map_err(|e| e.to_string())?))
+        }
+        None => Ok(Arc::new(KeyringStore::new(SECRET_SERVICE))),
+    }
 }
 
 /// Reads the account password from stdin with `--password-stdin`, so it never
@@ -263,7 +280,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), String> {
     let args = parse()?;
-    let secrets = Arc::new(KeyringStore::new(SECRET_SERVICE));
+    let secrets = secret_store(&args.flags)?;
 
     // Key commands must run before the core opens (and possibly creates) a key.
     match args.command.as_str() {
@@ -482,6 +499,52 @@ async fn run() -> Result<(), String> {
             core.set_trash_retention_days(days)
                 .map_err(|e| e.to_string())?;
             println!("trash retention set to {days} days");
+        }
+        "set-change-max-rows" => {
+            let rows: i64 = required(&args.flags, "rows")?
+                .parse()
+                .map_err(|_| "--rows expects a positive integer".to_string())?;
+            let store = core.store();
+            store
+                .set_change_log_max_rows(rows)
+                .map_err(|e| e.to_string())?;
+            println!("change log compacts above {rows} rows");
+        }
+        "changes" => {
+            let email = required(&args.flags, "email")?;
+            let store = core.store();
+            let account = account_id(&store, &email)?;
+            let window = core.change_window(&email).map_err(|e| e.to_string())?;
+            let count = store.count_changes(account).map_err(|e| e.to_string())?;
+            let max_rows = store.change_log_max_rows().map_err(|e| e.to_string())?;
+            let show = |seq: Option<i64>| seq.map_or_else(|| "-".to_string(), |s| s.to_string());
+            println!(
+                "latest_seq={} snapshot_seq={} oldest_change_seq={} changes={count} max_rows={max_rows}",
+                window.latest_seq,
+                show(window.snapshot_seq),
+                show(window.oldest_seq)
+            );
+        }
+        "changes-compact" => {
+            let email = required(&args.flags, "email")?;
+            let store = core.store();
+            let account = account_id(&store, &email)?;
+            let max_rows = match args.flags.get("max-rows") {
+                Some(raw) => raw
+                    .parse()
+                    .map_err(|_| "--max-rows expects a positive integer".to_string())?,
+                None => store.change_log_max_rows().map_err(|e| e.to_string())?,
+            };
+            match store
+                .compact_changes(account, max_rows)
+                .map_err(|e| e.to_string())?
+            {
+                Some(done) => println!(
+                    "compacted into snapshot seq={} removed_changes={}",
+                    done.snapshot_seq, done.removed_changes
+                ),
+                None => println!("change log has at most {max_rows} rows; nothing to compact"),
+            }
         }
         "body" => {
             let email = required(&args.flags, "email")?;

@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；**图形界面、日历、Hub 服务端尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；Linux 桌面 UI 技术栈定为 Slint（D12），**图形界面、日历、Hub 服务端尚未开始**。
 
 ---
 
@@ -27,6 +27,7 @@
 | D9 | 组件策略 | 优先平台官方与成熟库，只有同步状态机与 HTML 净化自研 | |
 | D10 | 首发平台 | macOS + Windows（同一里程碑，先后实现） | |
 | D11 | Windows 内存路线 | 先 WinUI 3（目标 110–130 MB），若不接受再评估 C++/WinRT 或 Slint | 未在 Windows 上验证 |
+| D12 | Linux 桌面 UI 技术栈 | Slint（纯 Rust，单进程直连 `mail-core`） | 无 WebView / GTK / Qt 运行时依赖；macOS 上即可编译运行验证。代价：第四套 UI，Windows 若也转 Slint 需重评 D11 |
 
 完整理由与代价见 `docs/ARCHITECTURE.md` §2。
 
@@ -54,11 +55,12 @@
 | 正文与附件拉取 | 完成 | `mail-proto` BODYSTRUCTURE + `BODY.PEEK`；`mail-parse` 解码与净化；Dovecot 实跑，二次打开离线 39 ms |
 | 多邮箱遍历与角色映射 | 完成 | `mail-sync::sync_account`；SPECIAL-USE 优先、名字/中文回退；修改版 UTF-7 名称；Dovecot 6 邮箱实跑 |
 | 本地回收站与保留期 | 完成 | `mail-store::missing_at`/`purge_trash`/`settings`；删除邮箱进回收站，默认 90 天，`sync` 自动清理；同名单重建保留旧数据 |
+| 变更日志压缩与快照 | 完成 | `mail-store::compact_changes` + `change_snapshots`；默认 20,000 行阈值，`sync`/`sync_account`/`watch` 每轮同步后自动执行；Dovecot 10,010 条压缩后日志归零、水位不倒退 |
 | HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
 | Hub / JMAP | 未开始 | |
 | 日历 | 未开始 | |
 | 翻译 | 未开始 | |
-| 三端 UI | 未开始 | |
+| 桌面/移动 UI | 未开始 | Linux 栈已定 Slint（D12）；macOS/Windows/iOS/Android 仍按 D2 |
 | Windows / 移动端验证 | 未开始 | 本机无 Windows、无 .NET SDK |
 | 代码规范与风格固化 | 完成 | `AGENTS.md` + `docs/CONVENTIONS.md` + rustfmt/clippy/CI |
 
@@ -68,7 +70,7 @@
 
 ```
 crates/
-  mail-crypto/src/lib.rs   SecretStore trait、KeyringStore、MemoryStore、
+  mail-crypto/src/lib.rs   SecretStore trait、KeyringStore、FileStore（仅开发）、MemoryStore、
                            MasterKey（HKDF 发送子密钥）、seal/open（XChaCha20-Poly1305 + AAD）
   mail-store/src/lib.rs    SQLCipher 打开（PRAGMA key + 错密钥/明文库拒绝）、schema、
                            迁移、账户/邮箱/消息/位置/变更日志、settings、
@@ -77,9 +79,12 @@ crates/
                            missing_at / mark_missing_mailboxes / retire_mailbox、
                            list_trash / purge_trash（回收站保留期）、
                            blobs（内容寻址 + 引用计数）、message_parts/attachments、
-                           record_body_structure/store_body_parts/store_attachment
-  mail-store/tests/        21 个存储测试（含错密钥、明文库、落盘无明文、blob 回收、
-                           回收站与保留期）
+                           record_body_structure/store_body_parts/store_attachment、
+                           changes_since/latest_change_seq/change_window、
+                           account_state/latest_snapshot/compact_changes、
+                           change_log_max_rows
+  mail-store/tests/        26 个存储测试（含错密钥、明文库、落盘无明文、blob 回收、
+                           回收站与保留期、变更日志快照与压缩）
   mail-proto/src/lib.rs    Stream（TLS/明文/STARTTLS）、ImapSession、CapabilitySet、
                            Tier(A/B/C)、fetch_range/fetch_flags/CHANGEDSINCE、
                            list_uids、fetch_body_layout（BODYSTRUCTURE 扁平化）、
@@ -102,7 +107,8 @@ crates/
   mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
   mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch / mailboxes /
                            list / trash / trash-purge / body / attachment / stats /
-                           retention / set-retention / export-key / import-key
+                           retention / set-retention / changes / changes-compact /
+                           set-change-max-rows / export-key / import-key
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -127,8 +133,9 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 79 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 86 个测试全过
 ~/.cargo/bin/cargo build --release
+export EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets   # 开发期绕开钥匙串；发布验证不要设置
 
 # 2) 起测试服务器
 docker start mail-spike-dovecot               # 若容器不在：见 README 快速开始
@@ -157,6 +164,12 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db body --email vmail@example
 cargo run --release -p mail-cli -- --db /tmp/smoke.db attachment --email vmail@example.com \
   --id 42 --part 2 --out /tmp/attachment.bin
 
+# 3.3) 变更日志：默认超过 20,000 行在 sync 结束时自动压缩；也可手动触发
+cargo run --release -p mail-cli -- --db /tmp/smoke.db changes --email vmail@example.com
+cargo run --release -p mail-cli -- --db /tmp/smoke.db set-change-max-rows --rows 1000
+cargo run --release -p mail-cli -- --db /tmp/smoke.db changes-compact --email vmail@example.com
+# 压缩后 changes=0、snapshot_seq=latest_seq，`list/stats` 数据不受影响
+
 # 4) 主密钥备份 / 恢复（输出即密钥本身：存进密码管理器，勿贴日志或提交）
 cargo run --release -p mail-cli -- --db /tmp/smoke.db export-key
 cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base64>'
@@ -182,7 +195,9 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | 钥匙串 | `keyring` crate 必须启用特性 `apple-native / windows-native / sync-secret-service / crypto-rust`，否则写入静默失效、读取为空（已踩过） |
 | SQLCipher | `rusqlite` 特性 `bundled-sqlcipher-vendored-openssl`；首次构建会编译 vendored OpenSSL（本机约 20 s），不依赖系统 openssl |
 | 数据库密钥 | 钥匙串条目 `mail-client-dev / master-key`（`secret_key` 用于账户密码，两者不同）；库密钥由主密钥 HKDF-SHA256(info=`eyrie/sqlite/v1`) 派生 |
+| 开发密钥存储 | 默认钥匙串（生产唯一路径）。cargo 产物是 ad-hoc 签名，钥匙串 ACL 的 partition 按 **cdhash** 记录，每次重建都重新弹窗（见 §11；自签名证书实测无效）。开发用 `--dev-secret-dir <dir>` 或 `EYRIE_DEV_SECRET_DIR` 切到 `FileStore`（目录 0700、文件 0600），主密钥与账户密码都是该目录下的文件，完全不碰钥匙串，重建后无需授权。**发布验证必须走钥匙串** |
 | 网络 | 2026-10-29 实测 `imap.gmail.com:993` 直连可用（TLS 1.3 握手成功），尚未用账户登录验证；其余源码镜像可达 |
+| UI 工具链 | Slint 为纯 Rust 依赖，本机可编译运行；**无 pkg-config、GTK、Qt 开发库**，GTK4/Tauri 方案在本机无法编译验证（D12 据此选定 Slint） |
 
 ---
 
@@ -213,6 +228,9 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | 服务器删掉邮箱 | `sync` 后该行 `state=missing`，消息只在 `trash` 出现，`list` 排除 |
 | 同名单重建 | 旧行改名 `项目 (local trash 2)` 保留消息；新 `项目` 全量同步，回收站不丢 |
 | 回收站保留期 | 默认 90 天；`set-retention --days 30` 回读 30；未到期 `trash-purge` 返回 0 |
+| 变更日志手动压缩（Dovecot 10,007 封） | 同步后 changes=10,010；压缩为快照 seq=10010，删除 10,010 行；`latest_seq` 仍为 10010，`list` 正常 |
+| 变更日志自动压缩（阈值 1，注入 1 封新邮件） | `sync` 写入 2 条后自动压缩：`snapshot_seq=10012`、changes=0 |
+| 变更日志 watch 路径压缩（阈值 1） | `watch --max-events 1` 首轮同步写入 2 条后压缩：`snapshot_seq=10014`、changes=0 |
 | RRULE | 22 例 21 通过，失败项为夏令时空洞时间，需归一化 |
 
 完整方法与命令见 `docs/SPIKE-REPORT.md`。
@@ -224,7 +242,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 1. **不支持 Outlook/Hotmail**。2026-10-29 范围决策：微软已禁用密码登录，仅 OAuth2，且测试账号无 Entra 租户；Gmail 走应用专用密码（见 §10）。**验收**：不适用（范围外）。
 2. **常驻监听只覆盖单个邮箱**。批量 `sync` 已遍历全部可选邮箱，`watch` 仍只对一个邮箱 IDLE。**验收**：每个可选邮箱都进入实时同步（多会话或轮询调度），或在 UI 上明确标注仅 INBOX 实时。
 3. **正文未进 FTS**。正文已按需拉取与解码，但全文索引仍只覆盖主题/地址/摘要。**验收**：正文入 `body_text` 索引后重建迁移，10 万封下中文查询仍满足 §8-7 的时延。
-4. **变更日志线性增长**。全量同步每封写一条。**验收**：10 万封场景下日志有界（快照 + 增量），状态可由快照重建。
+4. ~~**变更日志线性增长**~~。已实现快照压缩：`change_snapshots` 每账户一行，超过 `change_log_max_rows`（默认 20,000）后以当前水位取全量状态并删除被覆盖的 `changes`；`latest_change_seq` 取快照 seq 兜底，`change_window` 暴露最旧可读游标。**已验证**：Dovecot 10,010 条压缩后日志归零、水位不变、`list` 正常；未验证：10 万封下快照体积与耗时。
 5. **B/C 档未实跑**。**验收**：iCloud（C 档）账户实际同步，移动邮件走 COPY+删除；B 档需一台不广告 CONDSTORE 的服务器。
 6. **重连未做故障注入**。**验收**：同步中重启服务器，`watch` 按退避恢复且不产生重复行。
 7. **中文 1–2 字搜索走 LIKE 扫描**。10 万封内可接受。**验收**：10 万封下 2 字查询 P95 < 150 ms。
@@ -248,7 +266,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 
 2. ~~正文与附件按需拉取；接入 `spike/html-probe` 的净化规则。~~（完成）
 3. ~~多邮箱遍历与角色映射。~~（完成；含修改版 UTF-7 与本地回收站）
-4. 变更日志压缩与快照。
+4. ~~变更日志压缩与快照。~~（完成）
 
 ### 第 4 段：服务端与移动
 
@@ -264,6 +282,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 
 9. macOS SwiftUI（列表/阅读/撰写/搜索）。
 10. Windows WinUI 3（复用 Rust 核心）。
+11. Linux Slint（`apps/linux`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定，实现未开始。
 
 ---
 
@@ -276,7 +295,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | 一个 iCloud 账户（应用专用密码） | C 档与 COPY+删除路径实测 | 阻塞 §8-5 的 C 档验证 |
 | 一台 Windows 11 机器 + .NET SDK | WinUI 3 + UniFFI 内存验证 | 阻塞 Windows UI 段 |
 | APNs / FCM 凭据 | 手机推送 | 阻塞移动端 |
-| 是否先做 Hub 还是先做桌面 UI | 排序 | 影响第 4–6 段顺序 |
+| 是否先做 Hub 还是先做桌面 UI | 排序 | 影响第 4–6 段顺序；Linux UI 栈已定 Slint（D12），仍需确认是否排在 Hub 之前 |
 
 ---
 
@@ -287,7 +306,8 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 - 主密钥条目名 `master-key` 与账户密码条目 `account:<email>:password` 不同；`MASTER_KEY_REF` 或 HKDF info（`eyrie/sqlite/v1`）一旦变更，既有库永久打不开。
 - 旧明文库必须显式拒绝：`StoreError::PlaintextDatabase`。迁移只能 `sqlcipher_export` 或重新同步，不能原地改。
 - 验收加密库不要用 `sqlite3 file '.tables'`（对非库文件可能退出 0 且无输出）；用 `sqlite3 file 'select count(*) from sqlite_master;'` 看错误码 26。
-- 重建 `mail-cli` 后首次访问钥匙串会弹出授权框（新二进制被 macOS 视为不同应用）；无 TTY 的自动化调用会一直挂起。冒烟脚本要先手动批准一次，或改用 `MemoryStore` 的单测路径。
+- 重建 `mail-cli` 后首次访问钥匙串会弹出授权框，点“始终允许”也不跨版本生效。根因：cargo 产物是 **ad-hoc 签名**（`Signature=adhoc`，即使 Identifier 稳定），macOS 对 ad-hoc 二进制的钥匙串 ACL 绑的是 CDHash，每次重建 CDHash 都变；`target/debug` 与 `target/release` 还是两个不同身份。已实测证伪的“修复”：用自签名证书重签并固定 `-i com.eyrie.mail-cli` **无效**——无 Team ID 时钥匙串 partition 仍落在 cdhash 上，`securityd` 记 `ACL partition mismatch: client cdhash:… ACL (cdhash:…)`，每次重建照样弹窗（2026-10-30 实测，debug 与 release 各弹一次）。能真正稳定 partition 的只有 Apple Developer ID（带 Team ID）签名。开发时用 `--dev-secret-dir` / `EYRIE_DEV_SECRET_DIR` 切到文件存储即可绕开（2026-10-30 实测：重编后 0.25 s 完成取密钥，无弹窗）；无 TTY 的自动化冒烟走 `MemoryStore` 单测路径，发布验证必须回到钥匙串，不要依赖已授权的 GUI 交互。
+- 切换密钥存储不会迁移主密钥：`--dev-secret-dir` 下没有钥匙串里的那把密钥，会新生成一把；用它打开钥匙串加密的旧库会报 `WrongKey`。要换存储先 `export-key`，再用 `import-key --value '<base64>'` 导入，或直接用新库重新同步。
 - `export-key` 的标准输出就是主密钥本身：只让用户复制进密码管理器，不要进 shell 历史、日志、提交或聊天记录；调试时比对 sha256 前缀。
 - `import-key` 必须先验证再落库：库存在且导入密钥打不开它时直接失败，不覆盖钥匙串；只有 `--force true` 才替换已有的不同密钥。
 - FTS5 `contentless_delete=1` 必须同时写 `content=''`，否则建表失败。
@@ -314,7 +334,12 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 - 同名单重建（新 UIDVALIDITY）先 `retire_mailbox` 再 `ensure_mailbox`，否则 `reset_mailbox` 会立即清掉回收站里的旧消息。
 - 多邮箱下同 Message-ID 只有一条 `messages` 行、多条 `message_locations`；列表/搜索/计数必须取一个代表位置（`missing_at IS NULL` 的最小 `mailbox_id`），否则 INBOX 与 Archive 重复。
 - 回收站清理顺序：先释放 blob 引用、再删 FTS 行、最后删消息；漏删 FTS 会留下无法 join 的孤儿行。
-- `settings` 表是全局配置（不是 account.settings）；保留期键 `trash_retention_days`，默认 90，范围 1–3650。
+- `settings` 表是全局配置（不是 account.settings）；保留期键 `trash_retention_days`，默认 90，范围 1–3650；变更日志阈值键 `change_log_max_rows`，默认 20,000，范围 1–1,000,000。
+- 变更日志水位不要再用 `SELECT MAX(seq) FROM changes`：压缩后日志可以为空，必须取 `max(snapshot.seq, max(changes.seq))`（`latest_change_seq` 已封装，直接用）。
+- 压缩的顺序是“同一事务内取状态 → 写快照 → 删被覆盖的行”；先删后取会把已删的变更丢掉，取状态与写快照不在同一事务会让快照与实际状态错位。
+- `change_snapshots` 每账户只有一行，再次压缩会覆盖旧快照；要保留历史快照必须先加版本列，不要直接改主键。
+- 快照只含 id/位置/标志位，不含正文散列与 FTS：它用于重建“有哪些邮件在哪”，正文仍按需拉取。
+- Linux UI 用 Slint（D12）：本机无 pkg-config / GTK / Qt 开发库，GTK4 与 Tauri 方案在此既不能编译也不能验证；Slint 是纯 Rust 依赖，可直接在本机编译运行同一份代码。
 
 ---
 

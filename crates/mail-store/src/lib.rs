@@ -34,12 +34,17 @@ pub enum StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 /// Trash retention when the user never chose one (three months).
 pub const DEFAULT_TRASH_RETENTION_DAYS: u32 = 90;
 /// Upper bound for retention; ten years is already effectively "keep forever".
 pub const MAX_TRASH_RETENTION_DAYS: u32 = 3650;
 const TRASH_RETENTION_KEY: &str = "trash_retention_days";
+/// Change log rows kept before a snapshot replaces the log.
+pub const DEFAULT_CHANGE_LOG_MAX_ROWS: i64 = 20_000;
+/// Upper bound on the change log; one million rows is already ~50 MB.
+pub const MAX_CHANGE_LOG_MAX_ROWS: i64 = 1_000_000;
+const CHANGE_LOG_MAX_ROWS_KEY: &str = "change_log_max_rows";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -128,6 +133,63 @@ pub struct ChangeRecord {
     pub entity_id: String,
     pub op: String,
     pub at: i64,
+}
+
+/// Everything a client needs to rebuild an account without the change log.
+/// Snapshots carry ids, locations and flags only; bodies stay content-addressed
+/// and are fetched on demand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountState {
+    pub mailboxes: Vec<MailboxState>,
+    pub messages: Vec<MessageState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxState {
+    pub id: i64,
+    pub remote_name: String,
+    pub role: Option<String>,
+    /// Set when the mailbox only exists in the local trash.
+    pub missing_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageState {
+    pub id: i64,
+    pub message_id: Option<String>,
+    pub locations: Vec<MessageLocationState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageLocationState {
+    pub mailbox_id: i64,
+    pub uid: i64,
+    pub flags: Vec<String>,
+}
+
+/// Full account state at `seq`; changes at or below `seq` are not retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSnapshot {
+    pub seq: i64,
+    pub created_at: i64,
+    pub state: AccountState,
+}
+
+/// What one compaction did; `None` means the log was already small enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compaction {
+    pub snapshot_seq: i64,
+    pub removed_changes: usize,
+}
+
+/// Cursor bookkeeping for incremental consumers. A cursor older than
+/// `oldest_seq` (or `snapshot_seq` when the log is empty) cannot be served and
+/// the consumer must reload the snapshot instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeWindow {
+    pub oldest_seq: Option<i64>,
+    pub latest_seq: i64,
+    pub snapshot_seq: Option<i64>,
 }
 
 /// How much of a message's content is cached locally.
@@ -889,6 +951,30 @@ impl Store {
         self.set_setting(TRASH_RETENTION_KEY, &days.to_string())
     }
 
+    /// Change log size that triggers compaction into a snapshot.
+    pub fn change_log_max_rows(&self) -> Result<i64> {
+        let Some(raw) = self.setting(CHANGE_LOG_MAX_ROWS_KEY)? else {
+            return Ok(DEFAULT_CHANGE_LOG_MAX_ROWS);
+        };
+        raw.parse()
+            .ok()
+            .filter(|rows| (1..=MAX_CHANGE_LOG_MAX_ROWS).contains(rows))
+            .ok_or_else(|| StoreError::InvalidSetting {
+                key: CHANGE_LOG_MAX_ROWS_KEY.to_string(),
+                value: raw,
+            })
+    }
+
+    pub fn set_change_log_max_rows(&self, rows: i64) -> Result<()> {
+        if !(1..=MAX_CHANGE_LOG_MAX_ROWS).contains(&rows) {
+            return Err(StoreError::InvalidSetting {
+                key: CHANGE_LOG_MAX_ROWS_KEY.to_string(),
+                value: rows.to_string(),
+            });
+        }
+        self.set_setting(CHANGE_LOG_MAX_ROWS_KEY, &rows.to_string())
+    }
+
     /// Routing data needed to fetch one message's content from its server.
     /// Live mailboxes win over trash copies of the same message.
     pub fn message_context(&self, message_id: i64) -> Result<Option<MessageContext>> {
@@ -1269,15 +1355,118 @@ impl Store {
         Ok(out)
     }
 
+    /// Watermark for the account. Compaction deletes log rows, so the latest
+    /// snapshot seq counts as well; otherwise a compacted account would appear
+    /// to have gone backwards.
     pub fn latest_change_seq(&self, account_id: i64) -> Result<i64> {
+        Ok(self.change_window(account_id)?.latest_seq)
+    }
+
+    pub fn count_changes(&self, account_id: i64) -> Result<i64> {
         let conn = self.conn.lock().expect("poisoned");
-        Ok(conn
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM changes WHERE account_id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn change_window(&self, account_id: i64) -> Result<ChangeWindow> {
+        let conn = self.conn.lock().expect("poisoned");
+        let oldest_seq = conn.query_row(
+            "SELECT MIN(seq) FROM changes WHERE account_id = ?1",
+            [account_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        let newest_change = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM changes WHERE account_id = ?1",
+            [account_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let snapshot_seq = conn
             .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM changes WHERE account_id = ?1",
+                "SELECT seq FROM change_snapshots WHERE account_id = ?1",
                 [account_id],
                 |row| row.get(0),
             )
-            .unwrap_or(0))
+            .optional()?;
+        Ok(ChangeWindow {
+            oldest_seq,
+            latest_seq: newest_change.max(snapshot_seq.unwrap_or(0)),
+            snapshot_seq,
+        })
+    }
+
+    /// Current account state, matching what a snapshot would record right now.
+    pub fn account_state(&self, account_id: i64) -> Result<AccountState> {
+        let conn = self.conn.lock().expect("poisoned");
+        read_account_state(&conn, account_id)
+    }
+
+    pub fn latest_snapshot(&self, account_id: i64) -> Result<Option<ChangeSnapshot>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let row = conn
+            .query_row(
+                "SELECT seq, created_at, state FROM change_snapshots WHERE account_id = ?1",
+                [account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((seq, created_at, payload)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ChangeSnapshot {
+            seq,
+            created_at,
+            state: serde_json::from_slice(&payload)?,
+        }))
+    }
+
+    /// Replaces the change log with a snapshot once it holds more than
+    /// `max_rows` rows. The snapshot is taken at the current watermark, so
+    /// every deleted row is covered by it; later writes keep appending above it.
+    pub fn compact_changes(&self, account_id: i64, max_rows: i64) -> Result<Option<Compaction>> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM changes WHERE account_id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        if count <= max_rows {
+            return Ok(None);
+        }
+        let snapshot_seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM changes WHERE account_id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        if snapshot_seq == 0 {
+            return Ok(None);
+        }
+        let payload = serde_json::to_vec(&read_account_state(&tx, account_id)?)?;
+        tx.execute(
+            "INSERT INTO change_snapshots (account_id, seq, created_at, state)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id) DO UPDATE SET seq = excluded.seq,
+                 created_at = excluded.created_at, state = excluded.state",
+            params![account_id, snapshot_seq, Utc::now().timestamp(), payload],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM changes WHERE account_id = ?1 AND seq <= ?2",
+            params![account_id, snapshot_seq],
+        )?;
+        tx.commit()?;
+        Ok(Some(Compaction {
+            snapshot_seq,
+            removed_changes: removed,
+        }))
     }
 }
 
@@ -1536,6 +1725,60 @@ fn refresh_body_state(tx: &Transaction<'_>, message_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Reads the snapshot payload for one account within the caller's transaction
+/// so the state and the watermark cannot disagree.
+fn read_account_state(conn: &Connection, account_id: i64) -> Result<AccountState> {
+    let mut mailbox_stmt = conn.prepare(
+        "SELECT id, remote_name, role, missing_at FROM mailboxes
+         WHERE account_id = ?1 ORDER BY id",
+    )?;
+    let mailboxes = mailbox_stmt
+        .query_map([account_id], |row| {
+            Ok(MailboxState {
+                id: row.get(0)?,
+                remote_name: row.get(1)?,
+                role: row.get(2)?,
+                missing_at: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut location_stmt = conn.prepare(
+        "SELECT m.id, m.message_id, l.mailbox_id, l.uid, l.flags
+         FROM messages m JOIN message_locations l ON l.message_id = m.id
+         WHERE m.account_id = ?1 ORDER BY m.id, l.mailbox_id",
+    )?;
+    let rows = location_stmt
+        .query_map([account_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                MessageLocationState {
+                    mailbox_id: row.get(2)?,
+                    uid: row.get(3)?,
+                    flags: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut messages: Vec<MessageState> = Vec::new();
+    for (id, message_id, location) in rows {
+        match messages.last_mut() {
+            Some(last) if last.id == id => last.locations.push(location),
+            _ => messages.push(MessageState {
+                id,
+                message_id,
+                locations: vec![location],
+            }),
+        }
+    }
+    Ok(AccountState {
+        mailboxes,
+        messages,
+    })
+}
+
 fn record_change(
     tx: &Transaction<'_>,
     account_id: i64,
@@ -1623,6 +1866,14 @@ CREATE TABLE IF NOT EXISTS changes (
   at           INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS changes_account_seq ON changes (account_id, seq);
+
+-- Full account state at a watermark; replaces the log rows it covers.
+CREATE TABLE IF NOT EXISTS change_snapshots (
+  account_id INTEGER PRIMARY KEY,
+  seq        INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  state      BLOB NOT NULL
+);
 
 -- Content-addressed bodies and attachments; refcount keeps one copy per hash.
 CREATE TABLE IF NOT EXISTS blobs (

@@ -11,12 +11,12 @@
 | crate | 职责 | 关键点 |
 |---|---|---|
 | `mail-crypto` | 凭据保险箱 + 信封加密 | 系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；XChaCha20-Poly1305 带 AAD；主密钥首次使用时生成并存入钥匙串，HKDF-SHA256 派生用途子密钥 |
-| `mail-store` | SQLite 存储（SQLCipher） | 账户、邮箱、消息、位置、变更日志、FTS5；内容寻址 `blobs` + 引用计数；`message_parts`/`attachments` 与 `body_state`；WAL；schema 版本迁移；UIDVALIDITY 重建；邮箱 `missing_at` 本地回收站与保留期清理；`settings` 表；打开时先验密钥，错密钥与明文旧库都显式报错 |
+| `mail-store` | SQLite 存储（SQLCipher） | 账户、邮箱、消息、位置、变更日志、FTS5；内容寻址 `blobs` + 引用计数；`message_parts`/`attachments` 与 `body_state`；变更日志有界（`change_snapshots` 全量快照 + 压缩，水位不倒退）；WAL；schema 版本迁移；UIDVALIDITY 重建；邮箱 `missing_at` 本地回收站与保留期清理；`settings` 表；打开时先验密钥，错密钥与明文旧库都显式报错 |
 | `mail-parse` | MIME 解码与净化 | 传输编码（base64/quoted-printable）、charset（encoding_rs，含 GBK）、RFC 2047 文件名、ammonia 白名单净化、HTML→纯文本、整封 MIME 遍历（POP3 路径） |
 | `mail-proto` | IMAP/POP3/SMTP 传输 | IMAP：TLS/STARTTLS/明文、能力探测、三档、UID 抓取、BODYSTRUCTURE + `BODY.PEEK` 分段取正文、IDLE、MOVE、RFC 6154 SPECIAL-USE、修改版 UTF-7 邮箱名；POP3：LIST/UIDL/TOP/RETR、STLS；SMTP：EHLO、STARTTLS、AUTH、DATA |
 | `mail-sync` | 增量同步 | IMAP：首同步、UID/标志位增量、删除检测、UIDVALIDITY 重建、全账户遍历（跳过 `\Noselect`/`\All`/`\Flagged`）、消失邮箱转本地回收站；POP3：UIDL 镜像与轮询 |
-| `mail-core` | 门面 | 账户添加、预设解析、IMAP/POP3 分派、`sync`/`sync_account`、`watch`、`check`、`send`（SMTP + Sent 归档）、`fetch_body`（缓存优先）、`fetch_attachment`（按需）、回收站保留期设置与自动清理 |
-| `mail-cli` | 开发工具 | `add-account / check / send / accounts / sync / watch / mailboxes / list / trash / trash-purge / body / attachment / stats / retention / set-retention / export-key / import-key` |
+| `mail-core` | 门面 | 账户添加、预设解析、IMAP/POP3 分派、`sync`/`sync_account`/`watch`（每轮同步后按阈值压缩变更日志）、`check`、`send`（SMTP + Sent 归档）、`fetch_body`（缓存优先）、`fetch_attachment`（按需）、回收站保留期设置与自动清理、`change_window`/`compact_changes` |
+| `mail-cli` | 开发工具 | `add-account / check / send / accounts / sync / watch / mailboxes / list / trash / trash-purge / body / attachment / stats / retention / set-retention / changes / changes-compact / set-change-max-rows / export-key / import-key` |
 
 产品 UI、Hub、日历、翻译不在本段范围内。
 
@@ -129,6 +129,14 @@ flowchart TD
 
 ## 6. 运行方式
 
+macOS 上 `cargo run` 产出的二进制是 ad-hoc 签名，钥匙串 ACL 按 cdhash 记录授权，**每次重建后首次访问都会弹授权框**，点“始终允许”也只对当次产物有效；自签名证书同样无效（无 Team ID，partition 仍是 cdhash，详见 `docs/HANDOFF.md` §11）。开发时显式切到文件存储即可绕开钥匙串：
+
+```bash
+export EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets   # 目录 0700、文件 0600；仅开发
+```
+
+也可以用 `--dev-secret-dir <dir>` 逐条命令指定。发布验证和真实用户路径必须不设置它（默认走钥匙串）；自动化冒烟仍走 `Store::open_in_memory` + `MemoryStore` 测试路径。
+
 ```bash
 # 1) 测试服务器（脚本见 docs/SPIKE-REPORT.md）
 docker start mail-spike-dovecot
@@ -197,7 +205,7 @@ cargo test --workspace
 2. **常驻监听仍只覆盖单个邮箱**。批量 `sync` 已遍历全部可选邮箱，但 `watch` 只对一个邮箱 IDLE；多邮箱实时监听需要多会话或轮询。POP3 仍为单 INBOX 镜像。
 3. **正文未进 FTS**。正文已按需拉取并解码，但全文索引仍只覆盖主题/发件人/收件人/摘要；把 `body_text` 并入 FTS 需要重建索引的迁移。
 4. **B/C 档未实跑**。代码路径已实现，但没有 iCloud 等 C 档测试账户；能力矩阵来自未登录探测。
-5. **变更日志会持续增长**。全量同步会为每封邮件写一条变更记录，需要压缩/快照机制（Hub 上线前必须做）。
+5. ~~**变更日志会持续增长**~~。已实现快照压缩：超过 `change_log_max_rows`（默认 20,000）后写 `change_snapshots` 并删除被覆盖的 `changes` 行，水位由快照 seq 兜底；`change_window` 暴露最旧可读游标。剩余缺口只在 Hub/JMAP 侧：`cannotCalculateChanges` 尚未有 HTTP 端点消费该信号。
 6. **中文 1–2 字搜索走 LIKE 扫描**。10 万封以内可接受，更大规模需要专门的分词索引。
 7. **重连退避未做故障注入**。逻辑在 `Core::watch` 中，但未模拟断网/服务器重启。
 8. **POP3 语义受限**。无文件夹/标志位/IDLE；UIDL 以 63 位哈希映射为数字 uid；服务器删除通过 UIDL 消失检测。
@@ -214,6 +222,6 @@ cargo test --workspace
 按依赖顺序：
 
 1. 发信补齐：HTML、附件、草稿与 Sent 去重
-2. FTS 正文索引（`body_text`）与中文索引策略、变更日志压缩
+2. FTS 正文索引（`body_text`）与中文索引策略
 3. 多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）
 4. 主密钥导出/恢复与库密钥轮换

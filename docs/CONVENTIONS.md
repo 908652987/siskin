@@ -88,7 +88,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
 - schema 变更只追加：新增列用 `ALTER TABLE`，并提升 `user_version`；**不得修改已发布的建表语句**。
 - 多行写入必须在一个事务里；`apply_fetch` 是唯一写消息的入口。
-- 变更日志（`changes`）只增不改；任何写操作都要记一条。
+- 变更日志（`changes`）只增不改；任何写操作都要记一条。唯一例外是压缩：`compact_changes` 在同一事务里先写 `change_snapshots`（seq = 当前水位）再删除被覆盖的行；压缩后 `latest_change_seq` 必须取 `max(snapshot.seq, max(changes.seq))`，不能让水位倒退。
 - 外键开启（`PRAGMA foreign_keys=ON`），级联删除按账户 → 邮箱 → 位置。
 - 查询必须显式列名，禁止 `SELECT *`。
 - FTS5 使用 `tokenize='trigram'`，因此 <3 字符查询走 LIKE 回退；新增搜索入口必须保留该回退。
@@ -110,6 +110,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 ## 8. 安全
 
 - 凭据只存 `SecretStore`；数据库只存引用键。
+- 平台钥匙串是默认与发布路径。开发期允许用 `FileStore`（`--dev-secret-dir` / `EYRIE_DEV_SECRET_DIR`，目录 0700、文件 0600）显式接管；不得默认启用，发布验证与真实用户路径必须走钥匙串。
 - 日志与错误信息中禁止出现：密码、令牌、完整邮箱地址、正文、附件名。
 - 邮件 HTML 统一走净化策略：默认阻断全部外部资源，仅放行 `cid:` 与光栅 data URI；UI 侧禁用 JS。
 - 打开外部链接前必须展示真实目标；IDN 同形字告警由 UI 层统一实现。
