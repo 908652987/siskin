@@ -89,6 +89,18 @@ impl SyncEngine {
         account_id: i64,
         session: &mut ImapSession,
     ) -> Result<AccountSyncReport> {
+        self.sync_account_except(account_id, session, &[]).await
+    }
+
+    /// Like [`SyncEngine::sync_account`], but leaves `skip` mailboxes to another
+    /// session that already watches them. Skipped mailboxes still count as
+    /// present, so the trash detection stays correct.
+    pub async fn sync_account_except(
+        &self,
+        account_id: i64,
+        session: &mut ImapSession,
+        skip: &[String],
+    ) -> Result<AccountSyncReport> {
         let listed = session.list_mailboxes().await?;
         let targets = plan_mailboxes(&listed);
         let present: Vec<String> = listed.iter().map(|info| info.name.clone()).collect();
@@ -96,6 +108,9 @@ impl SyncEngine {
         let mut outcomes = Vec::new();
         let mut failures = Vec::new();
         for target in &targets {
+            if skip.iter().any(|name| name == &target.name) {
+                continue;
+            }
             match self
                 .sync_mailbox_with_role(account_id, session, &target.name, target.role)
                 .await

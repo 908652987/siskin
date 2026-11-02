@@ -1,7 +1,9 @@
 //! Facade: account setup, credential handling, and sync orchestration.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -10,13 +12,15 @@ use chrono::Utc;
 use mail_crypto::{CryptoError, MasterKey, SecretStore};
 use mail_proto::pop3::{Pop3Config, Pop3Session};
 use mail_proto::smtp::{SmtpConfig, SmtpSession};
-use mail_proto::{IdleEvent, ImapConfig, ImapSession, ProtoError, Security};
+use mail_proto::{IdleEvent, ImapConfig, ImapSession, ProtoError, Security, Tier};
 use mail_store::{
     Account, AttachmentMetaInput, BodyPartInput, BodyState, ChangeWindow, Compaction, DbKey,
     MessageBody, MessageContext, PartMetaInput, PurgeStats, Store, StoreError,
 };
-use mail_sync::{pop3_uid, Pop3SyncEngine, SyncEngine, SyncError};
+use mail_sync::{plan_mailboxes, pop3_uid, MailboxTarget, Pop3SyncEngine, SyncEngine, SyncError};
 pub use mail_sync::{AccountSyncReport, SyncOutcome};
+use tokio::sync::watch;
+use tokio::task::{AbortHandle, JoinSet};
 use uuid::Uuid;
 
 pub mod presets;
@@ -172,6 +176,327 @@ pub struct SendOutcome {
     pub save_error: Option<String>,
 }
 
+/// Connection budget of the multi-mailbox watcher.
+#[derive(Debug, Clone, Copy)]
+pub struct WatchOptions {
+    /// Mailboxes that get a dedicated IDLE session; the rest are polled.
+    pub idle_sessions: usize,
+    /// Seconds between sweeps for mailboxes without a session of their own.
+    pub sweep_seconds: u64,
+}
+
+impl Default for WatchOptions {
+    fn default() -> Self {
+        // Gmail allows 15 IMAP connections per account; one sweep plus four
+        // IDLE sessions stays far below that with several accounts open.
+        Self {
+            idle_sessions: 4,
+            sweep_seconds: 120,
+        }
+    }
+}
+
+/// Event budget and stop signal shared by every session of one account watcher.
+struct WatchControl {
+    max_events: usize,
+    delivered: AtomicUsize,
+    stop: watch::Sender<bool>,
+}
+
+impl WatchControl {
+    fn new(max_events: usize) -> Self {
+        let (stop, _receiver) = watch::channel(false);
+        Self {
+            max_events,
+            delivered: AtomicUsize::new(0),
+            stop,
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    /// Counts one delivered event and stops every watcher once the budget is
+    /// spent. Returns true when this event exhausted the budget.
+    fn record(&self) -> bool {
+        let delivered = self.delivered.fetch_add(1, Ordering::Relaxed) + 1;
+        let spent = delivered >= self.max_events;
+        if spent {
+            self.stop.send_replace(true);
+        }
+        spent
+    }
+}
+
+fn emit<F>(sink: &StdMutex<F>, outcome: &SyncOutcome)
+where
+    F: FnMut(&SyncOutcome),
+{
+    let mut callback = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    callback(outcome);
+}
+
+/// Whether an outcome is worth forwarding: new or dropped messages, or a
+/// mailbox that was rebuilt or newly discovered. Flag-only outcomes are not
+/// forwarded because a periodic full flag rescan looks exactly like a real
+/// change; consumers read those through the change log instead.
+fn is_event(outcome: &SyncOutcome) -> bool {
+    outcome.inserted > 0 || outcome.removed > 0 || outcome.full
+}
+
+/// Sleeps unless the watcher is asked to stop first; returns true when stopping.
+async fn sleep_or_stop(stop: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    if *stop.borrow() {
+        return true;
+    }
+    tokio::select! {
+        _ = stop.changed() => true,
+        _ = tokio::time::sleep(delay) => false,
+    }
+}
+
+/// Keeps one mailbox live: sync, then wait on IDLE, reconnecting with backoff
+/// when the session dies. Stopping the task drops the connection, because an
+/// IDLE session cannot be handed back while it is waiting.
+async fn watch_mailbox_worker<F>(
+    core: Core,
+    account: Account,
+    mailbox: String,
+    control: Arc<WatchControl>,
+    sink: Arc<StdMutex<F>>,
+    mut stop: watch::Receiver<bool>,
+) where
+    F: FnMut(&SyncOutcome) + Send + 'static,
+{
+    let engine = SyncEngine::new(core.store());
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let mut session = match core.connect_imap(&account).await {
+            Ok(session) => {
+                backoff = Duration::from_secs(1);
+                session
+            }
+            Err(err) => {
+                tracing::warn!(%err, mailbox, "connect failed, retrying");
+                if sleep_or_stop(&mut stop, backoff).await {
+                    return;
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                continue;
+            }
+        };
+
+        match engine
+            .sync_mailbox(account.id, &mut session, &mailbox)
+            .await
+        {
+            Ok(outcome) => {
+                core.compact_quietly(account.id);
+                if is_event(&outcome) {
+                    emit(&sink, &outcome);
+                    if control.record() {
+                        session.logout().await;
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, mailbox, "initial sync failed, reconnecting");
+                session.logout().await;
+                if sleep_or_stop(&mut stop, backoff).await {
+                    return;
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                continue;
+            }
+        }
+
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+            let event = tokio::select! {
+                _ = stop.changed() => return,
+                event = session.idle_wait(Duration::from_secs(29 * 60)) => event,
+            };
+            match event {
+                Ok(IdleEvent::NewData(_)) => {
+                    match engine
+                        .sync_mailbox(account.id, &mut session, &mailbox)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            core.compact_quietly(account.id);
+                            if is_event(&outcome) {
+                                emit(&sink, &outcome);
+                                if control.record() {
+                                    session.logout().await;
+                                    return;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, mailbox, "sync after idle failed, reconnecting");
+                            break;
+                        }
+                    }
+                }
+                Ok(IdleEvent::Timeout) => continue,
+                Ok(IdleEvent::Interrupted) => break,
+                Err(err) => {
+                    tracing::warn!(%err, mailbox, "idle failed, reconnecting");
+                    break;
+                }
+            }
+        }
+
+        session.logout().await;
+        if sleep_or_stop(&mut stop, backoff).await {
+            return;
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+/// Account-level supervisor: one sweep connection re-plans the mailbox set and
+/// syncs everything without a session of its own, while IDLE workers cover the
+/// mailboxes the server can push for.
+struct AccountWatcher<F> {
+    core: Core,
+    account: Account,
+    options: WatchOptions,
+    control: Arc<WatchControl>,
+    sink: Arc<StdMutex<F>>,
+    workers: HashMap<String, AbortHandle>,
+    tasks: JoinSet<()>,
+}
+
+impl<F> AccountWatcher<F>
+where
+    F: FnMut(&SyncOutcome) + Send + 'static,
+{
+    async fn run(&mut self) -> Result<()> {
+        let mut stop = self.control.subscribe();
+        let mut backoff = Duration::from_secs(1);
+        while !*stop.borrow() {
+            match self.core.connect_imap(&self.account).await {
+                Ok(mut session) => {
+                    backoff = Duration::from_secs(1);
+                    let tier = session.tier();
+                    let listed = match session.list_mailboxes().await {
+                        Ok(listed) => listed,
+                        Err(err) => {
+                            tracing::warn!(%err, "listing mailboxes failed, reconnecting");
+                            session.logout().await;
+                            if sleep_or_stop(&mut stop, backoff).await {
+                                break;
+                            }
+                            backoff = (backoff * 2).min(Duration::from_secs(60));
+                            continue;
+                        }
+                    };
+                    let targets = plan_mailboxes(&listed);
+                    let present: HashSet<&str> =
+                        listed.iter().map(|info| info.name.as_str()).collect();
+                    self.replan(tier, &targets, &present);
+
+                    let watched: Vec<String> = self.workers.keys().cloned().collect();
+                    let sweep = SyncEngine::new(self.core.store())
+                        .sync_account_except(self.account.id, &mut session, &watched)
+                        .await;
+                    match sweep {
+                        Ok(report) => {
+                            for outcome in &report.outcomes {
+                                if !is_event(outcome) {
+                                    continue;
+                                }
+                                emit(&self.sink, outcome);
+                                self.core.compact_quietly(self.account.id);
+                                if self.control.record() {
+                                    break;
+                                }
+                            }
+                            for failure in &report.failures {
+                                tracing::warn!(
+                                    mailbox = %failure.mailbox,
+                                    error = %failure.error,
+                                    "mailbox sync failed"
+                                );
+                            }
+                        }
+                        Err(err) => tracing::warn!(%err, "account sweep failed"),
+                    }
+                    session.logout().await;
+                    self.core.compact_quietly(self.account.id);
+                    if let Err(err) = self.core.purge_expired_trash() {
+                        tracing::warn!(%err, "purging expired trash failed");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "connect failed, retrying");
+                    if sleep_or_stop(&mut stop, backoff).await {
+                        break;
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                    continue;
+                }
+            }
+            let sweep = Duration::from_secs(self.options.sweep_seconds.max(1));
+            if sleep_or_stop(&mut stop, sweep).await {
+                break;
+            }
+        }
+        self.tasks.shutdown().await;
+        Ok(())
+    }
+
+    /// Stops workers whose mailbox vanished and gives idle-capable mailboxes a
+    /// session while slots are free. Tier C servers cannot push, so every
+    /// mailbox stays on the sweep.
+    fn replan(&mut self, tier: Tier, targets: &[MailboxTarget], present: &HashSet<&str>) {
+        let vanished: Vec<String> = self
+            .workers
+            .keys()
+            .filter(|name| !present.contains(name.as_str()))
+            .cloned()
+            .collect();
+        for name in vanished {
+            if let Some(handle) = self.workers.remove(&name) {
+                tracing::info!(mailbox = %name, "mailbox vanished, stopping its watcher");
+                handle.abort();
+            }
+        }
+        if !matches!(tier, Tier::A | Tier::B) {
+            return;
+        }
+        for target in targets {
+            if self.workers.len() >= self.options.idle_sessions {
+                break;
+            }
+            if self.workers.contains_key(&target.name) {
+                continue;
+            }
+            let worker = watch_mailbox_worker(
+                self.core.clone(),
+                self.account.clone(),
+                target.name.clone(),
+                Arc::clone(&self.control),
+                Arc::clone(&self.sink),
+                self.control.subscribe(),
+            );
+            let handle = self.tasks.spawn(worker);
+            self.workers.insert(target.name.clone(), handle);
+        }
+    }
+}
+
+/// Facade handle; clones share the store and the secret store, which lets the
+/// watcher run one session per mailbox.
+#[derive(Clone)]
 pub struct Core {
     store: Arc<Store>,
     secrets: Arc<dyn SecretStore>,
@@ -454,6 +779,22 @@ impl Core {
     where
         F: FnMut(&SyncOutcome),
     {
+        self.watch_pop3_events(account, max_events, false, on_event)
+            .await
+    }
+
+    /// POP3 poll loop. With `events_only`, quiet polls do not reach `on_event`
+    /// and do not spend the event budget.
+    async fn watch_pop3_events<F>(
+        &self,
+        account: &Account,
+        max_events: usize,
+        events_only: bool,
+        on_event: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&SyncOutcome),
+    {
         let engine = Pop3SyncEngine::new(Arc::clone(&self.store));
         let mut delivered = 0usize;
         let mut backoff = Duration::from_secs(60);
@@ -463,9 +804,11 @@ impl Core {
                     backoff = Duration::from_secs(60);
                     match engine.sync(account.id, &mut session).await {
                         Ok(outcome) => {
-                            on_event(&outcome);
-                            delivered += 1;
-                            self.compact_quietly(account.id);
+                            if !events_only || is_event(&outcome) {
+                                on_event(&outcome);
+                                delivered += 1;
+                                self.compact_quietly(account.id);
+                            }
                         }
                         Err(err) => tracing::warn!(%err, "POP3 sync failed"),
                     }
@@ -483,6 +826,49 @@ impl Core {
         }
     }
 
+    /// Keeps every selectable mailbox of an account live. Mailboxes whose
+    /// server can push get their own IDLE session (up to
+    /// [`WatchOptions::idle_sessions`]); a sweep connection polls the rest and
+    /// re-plans the mailbox set, moving vanished mailboxes into the local
+    /// trash. POP3 accounts have a single INBOX and stay on polling.
+    ///
+    /// Only outcomes that carry new/dropped messages or a rebuild reach
+    /// `on_event`; `max_events` counts those, so a quiet account never wakes
+    /// the caller just because a sweep ran.
+    pub async fn watch_account<F>(
+        &self,
+        email: &str,
+        max_events: usize,
+        options: WatchOptions,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&SyncOutcome) + Send + 'static,
+    {
+        let account = self.account(email)?;
+        let settings = settings_of(&account)?;
+        match settings.protocol {
+            ReceiveProtocol::Imap => {
+                let mut watcher = AccountWatcher {
+                    core: self.clone(),
+                    account,
+                    options,
+                    control: Arc::new(WatchControl::new(max_events)),
+                    sink: Arc::new(StdMutex::new(on_event)),
+                    workers: HashMap::new(),
+                    tasks: JoinSet::new(),
+                };
+                watcher.run().await
+            }
+            ReceiveProtocol::Pop3 => {
+                let sink = Arc::new(StdMutex::new(on_event));
+                let mut forward = |outcome: &SyncOutcome| emit(&sink, outcome);
+                self.watch_pop3_events(&account, max_events, true, &mut forward)
+                    .await
+            }
+        }
+    }
+
     // ---- message content ---------------------------------------------------
 
     /// Loads a message's body, fetching it from the server on first use.
@@ -497,6 +883,13 @@ impl Core {
             .ok_or(CoreError::MessageNotFound(message_id))?;
 
         if let Some(content) = self.cached_content(message_id)? {
+            // Bodies cached before the index existed (or by an older build) get
+            // indexed the first time the message is opened.
+            if let Some(text) = content.text.as_deref() {
+                if let Err(err) = self.store.index_body_text_if_missing(message_id, text) {
+                    tracing::warn!(%err, "indexing cached body failed");
+                }
+            }
             return Ok(content);
         }
 
@@ -782,8 +1175,19 @@ impl Core {
                 data: part.data.as_bytes(),
             })
             .collect();
+        // Text/plain wins over HTML→text, matching what the reader shows.
+        let index_text = parts
+            .iter()
+            .find(|part| !part.is_html)
+            .map(|part| part.data.clone())
+            .or_else(|| {
+                parts
+                    .iter()
+                    .find(|part| part.is_html)
+                    .map(|part| mail_parse::html_to_text(&part.data))
+            });
         self.store
-            .store_body_parts(account_id, message_id, &inputs)?;
+            .store_body_parts(account_id, message_id, &inputs, index_text.as_deref())?;
         Ok(())
     }
 
@@ -1065,6 +1469,39 @@ pub fn import_master_key(
 mod tests {
     use super::*;
     use mail_crypto::MemoryStore;
+
+    fn outcome(full: bool, inserted: usize, applied: usize, removed: usize) -> SyncOutcome {
+        SyncOutcome {
+            mailbox: "INBOX".to_string(),
+            tier: Tier::A,
+            full,
+            inserted,
+            applied,
+            removed,
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn flag_rescans_are_not_events() {
+        // A periodic full flag rescan reports every row as applied; that must
+        // not wake a caller that only cares about real changes.
+        assert!(!is_event(&outcome(false, 0, 10_000, 0)));
+        assert!(is_event(&outcome(false, 1, 1, 0)));
+        assert!(is_event(&outcome(false, 0, 0, 2)));
+        assert!(is_event(&outcome(true, 0, 0, 0)));
+    }
+
+    #[test]
+    fn event_budget_stops_every_watcher() {
+        let control = WatchControl::new(2);
+        let stop = control.subscribe();
+        assert!(!control.record());
+        assert!(!*stop.borrow());
+        assert!(control.record());
+        assert!(*stop.borrow());
+        assert!(control.record());
+    }
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()

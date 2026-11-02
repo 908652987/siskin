@@ -34,7 +34,7 @@ pub enum StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 /// Trash retention when the user never chose one (three months).
 pub const DEFAULT_TRASH_RETENTION_DAYS: u32 = 90;
 /// Upper bound for retention; ten years is already effectively "keep forever".
@@ -45,6 +45,12 @@ pub const DEFAULT_CHANGE_LOG_MAX_ROWS: i64 = 20_000;
 /// Upper bound on the change log; one million rows is already ~50 MB.
 pub const MAX_CHANGE_LOG_MAX_ROWS: i64 = 1_000_000;
 const CHANGE_LOG_MAX_ROWS_KEY: &str = "change_log_max_rows";
+
+/// Characters of body text kept for the full-text index. Measured on 10k
+/// messages with CJK bodies: 1,000 chars add ~50 MB and 4,000 add ~160 MB of
+/// index on top of the 124 MB of blobs, and a two-character LIKE costs 52 ms
+/// versus 137 ms. 4,000 covers a typical message and keeps the index bounded.
+pub const BODY_INDEX_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -371,7 +377,7 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("poisoned");
+        let mut conn = self.conn.lock().expect("poisoned");
         conn.execute_batch(SCHEMA)?;
         let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         // Columns added after the first release; the check keeps fresh databases
@@ -381,6 +387,13 @@ impl Store {
         }
         if !has_column(&conn, "mailboxes", "missing_at")? {
             conn.execute_batch("ALTER TABLE mailboxes ADD COLUMN missing_at INTEGER;")?;
+        }
+        if !has_column(&conn, "messages", "body_text")? {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN body_text TEXT;")?;
+        }
+        conn.execute_batch(FTS_SCHEMA)?;
+        if !has_column(&conn, "message_fts", "body_text")? {
+            rebuild_fts(&mut conn)?;
         }
         if current < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -820,7 +833,8 @@ impl Store {
                  JOIN message_locations l ON l.message_id = m.id
                  WHERE m.account_id = ?1
                    AND {live_location}
-                   AND (m.subject LIKE ?2 OR m.from_json LIKE ?2 OR m.snippet LIKE ?2)
+                   AND (m.subject LIKE ?2 OR m.from_json LIKE ?2 OR m.snippet LIKE ?2
+                        OR m.body_text LIKE ?2)
                  ORDER BY COALESCE(m.sent_at, 0) DESC LIMIT ?3"
             ))?;
             let rows = stmt.query_map(params![account_id, pattern, limit], map_message)?;
@@ -1079,6 +1093,7 @@ impl Store {
         account_id: i64,
         message_id: i64,
         parts: &[BodyPartInput<'_>],
+        index_text: Option<&str>,
     ) -> Result<()> {
         let mut conn = self.conn.lock().expect("poisoned");
         let tx = conn.transaction()?;
@@ -1119,6 +1134,9 @@ impl Store {
             }
         }
         refresh_body_state(&tx, message_id)?;
+        if let Some(text) = index_text {
+            index_body_text(&tx, message_id, text)?;
+        }
         record_change(
             &tx,
             account_id,
@@ -1128,6 +1146,35 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Writes the indexed body text for a message whose body was cached before
+    /// the index existed. Returns whether the index changed.
+    pub fn index_body_text_if_missing(&self, message_id: i64, text: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let written = tx.execute(
+            "UPDATE messages SET body_text = ?2 WHERE id = ?1 AND body_text IS NULL",
+            params![message_id, truncate_body(text)],
+        )?;
+        if written > 0 {
+            rewrite_fts(&tx, message_id)?;
+        }
+        tx.commit()?;
+        Ok(written > 0)
+    }
+
+    /// Indexed body text of one message, `None` until the body was fetched.
+    pub fn body_text(&self, message_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT body_text FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Caches one attachment's bytes, replacing any previously stored copy.
@@ -1545,7 +1592,7 @@ fn upsert_message(
                     ],
                 )?;
                 let id = tx.last_insert_rowid();
-                index_message(tx, id, msg)?;
+                rewrite_fts(tx, id)?;
                 id
             }
         };
@@ -1567,18 +1614,124 @@ fn upsert_message(
     Ok(usize::from(existing.is_none()))
 }
 
-fn index_message(tx: &Transaction<'_>, id: i64, msg: &NewMessage) -> Result<()> {
+/// One message as the full-text index needs it: subject, address JSON, snippet
+/// and indexed body text.
+type FtsRow = (
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Rebuilds one message's full-text row from what the store holds. FTS5
+/// contentless tables cannot update a row, so the old row is dropped first.
+fn rewrite_fts(tx: &Transaction<'_>, message_id: i64) -> Result<()> {
+    let row: Option<FtsRow> = tx
+        .query_row(
+            "SELECT subject, from_json, to_json, snippet, body_text
+             FROM messages WHERE id = ?1",
+            [message_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((subject, from_json, to_json, snippet, body_text)) = row else {
+        return Ok(());
+    };
+    tx.execute("DELETE FROM message_fts WHERE rowid = ?1", [message_id])?;
     tx.execute(
-        "INSERT INTO message_fts (rowid, subject, from_text, to_text, snippet)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO message_fts (rowid, subject, from_text, to_text, snippet, body_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
-            id,
-            msg.subject.clone().unwrap_or_default(),
-            msg.from.join(", "),
-            msg.to.join(", "),
-            msg.snippet.clone().unwrap_or_default()
+            message_id,
+            subject.unwrap_or_default(),
+            addresses_text(&from_json),
+            addresses_text(&to_json),
+            snippet.unwrap_or_default(),
+            body_text.unwrap_or_default()
         ],
     )?;
+    Ok(())
+}
+
+/// Address lists are stored as JSON arrays; the index wants one searchable line.
+fn addresses_text(json: &str) -> String {
+    serde_json::from_str::<Vec<String>>(json)
+        .map(|addresses| addresses.join(", "))
+        .unwrap_or_default()
+}
+
+/// Writes the indexed form of a body and refreshes its full-text row.
+fn index_body_text(tx: &Transaction<'_>, message_id: i64, text: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE messages SET body_text = ?2 WHERE id = ?1",
+        params![message_id, truncate_body(text)],
+    )?;
+    rewrite_fts(tx, message_id)
+}
+
+fn truncate_body(text: &str) -> String {
+    text.chars().take(BODY_INDEX_CHARS).collect()
+}
+
+/// Drops and recreates the full-text table with the body column, recovering
+/// plain-text bodies from the blob cache. HTML-only bodies need the parser, so
+/// they are indexed the next time the message is opened.
+fn rebuild_fts(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch("DROP TABLE IF EXISTS message_fts;")?;
+    tx.execute_batch(FTS_SCHEMA)?;
+    tx.execute_batch(
+        "UPDATE messages SET body_text = (
+             SELECT CAST(group_concat(CAST(b.data AS TEXT), char(10)) AS TEXT)
+             FROM message_parts p
+             JOIN blobs b ON b.hash = p.blob_hash
+             WHERE p.message_id = messages.id AND p.is_html = 0
+               AND b.encoding = 'identity')
+         WHERE body_text IS NULL",
+    )?;
+    let rows: Vec<(i64, FtsRow)> = {
+        let mut stmt =
+            tx.prepare("SELECT id, subject, from_json, to_json, snippet, body_text FROM messages")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                (
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, (subject, from_json, to_json, snippet, body_text)) in rows {
+        tx.execute(
+            "INSERT INTO message_fts (rowid, subject, from_text, to_text, snippet, body_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                subject.unwrap_or_default(),
+                addresses_text(&from_json),
+                addresses_text(&to_json),
+                snippet.unwrap_or_default(),
+                body_text
+                    .map(|text| truncate_body(&text))
+                    .unwrap_or_default()
+            ],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1843,7 +1996,8 @@ CREATE TABLE IF NOT EXISTS messages (
   size        INTEGER,
   snippet     TEXT,
   has_attach  INTEGER NOT NULL DEFAULT 0,
-  body_state  TEXT NOT NULL DEFAULT 'headers'
+  body_state  TEXT NOT NULL DEFAULT 'headers',
+  body_text   TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS messages_account_message_id
   ON messages (account_id, message_id) WHERE message_id IS NOT NULL;
@@ -1906,9 +2060,13 @@ CREATE TABLE IF NOT EXISTS attachments (
   blob_hash    BLOB,
   PRIMARY KEY (message_id, part)
 );
+"#;
 
+/// FTS5 cannot add a column, so the body index is a separate statement that
+/// both schema creation and the migration rebuild use verbatim.
+const FTS_SCHEMA: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
-  subject, from_text, to_text, snippet,
+  subject, from_text, to_text, snippet, body_text,
   content='',
   contentless_delete=1,
   tokenize='trigram'
@@ -1929,4 +2087,140 @@ fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
         flags: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
         snippet: row.get(10)?,
     })
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "siskin-store-{name}-{}-{nanos}.db",
+            std::process::id()
+        ))
+    }
+
+    /// Rolls a fresh database back to the pre-body-index shape: four-column
+    /// FTS table, no `body_text`, and one message whose body sits in the blob
+    /// cache but not in the index.
+    #[test]
+    fn adding_the_body_index_upgrades_an_existing_database() {
+        let path = temp_path("migrate");
+        let key = DbKey::from_bytes(&[3u8; 32]).expect("key");
+        let (account, message_id) = {
+            let store = Store::open(&path, &key).expect("store");
+            let account = store
+                .create_account(
+                    "imap",
+                    "m@example.com",
+                    None,
+                    "account:m@example.com",
+                    &serde_json::json!({}),
+                )
+                .expect("account");
+            let mailbox = store
+                .ensure_mailbox(account, "INBOX", Some("inbox"))
+                .expect("mailbox");
+            store
+                .apply_fetch(
+                    account,
+                    mailbox.id,
+                    &[NewMessage {
+                        uid: 1,
+                        message_id: Some("<m1@example.com>".to_string()),
+                        subject: Some("legacy subject".to_string()),
+                        from: vec!["a@example.com".to_string()],
+                        to: vec!["m@example.com".to_string()],
+                        sent_at: Some(1),
+                        size: Some(20),
+                        flags: vec![],
+                        snippet: None,
+                    }],
+                    &[],
+                )
+                .expect("fetch");
+            let message_id = store.list_messages(account, 1, 0).expect("list")[0].id;
+            store
+                .record_body_structure(
+                    account,
+                    message_id,
+                    &[PartMetaInput {
+                        part: "1",
+                        content_type: "text/plain",
+                        charset: Some("utf-8"),
+                        is_html: false,
+                        size: 17,
+                    }],
+                    &[],
+                )
+                .expect("structure");
+            store
+                .store_body_parts(
+                    account,
+                    message_id,
+                    &[BodyPartInput {
+                        part: "1",
+                        content_type: "text/plain",
+                        charset: Some("utf-8"),
+                        is_html: false,
+                        data: b"legacy body token",
+                    }],
+                    None,
+                )
+                .expect("body");
+
+            {
+                let conn = store.conn.lock().expect("poisoned");
+                conn.execute_batch(&format!(
+                    "DROP TABLE message_fts;
+                     CREATE VIRTUAL TABLE message_fts USING fts5(
+                         subject, from_text, to_text, snippet,
+                         content='', contentless_delete=1, tokenize='trigram');
+                     INSERT INTO message_fts (rowid, subject, from_text, to_text, snippet)
+                         VALUES ({message_id}, 'legacy subject', 'a@example.com',
+                                 'm@example.com', '');
+                     ALTER TABLE messages DROP COLUMN body_text;
+                     PRAGMA user_version = 5;"
+                ))
+                .expect("degrade to v5");
+            }
+            (account, message_id)
+        };
+
+        let store = Store::open(&path, &key).expect("reopen");
+        let version: i64 = {
+            let conn = store.conn.lock().expect("poisoned");
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version")
+        };
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .search_messages(account, "legacy subject", 10)
+                .expect("search")
+                .len(),
+            1,
+            "the subject index must survive the rebuild"
+        );
+        assert_eq!(
+            store.body_text(message_id).expect("read").as_deref(),
+            Some("legacy body token"),
+            "plain-text bodies are recovered from the blob cache"
+        );
+        assert_eq!(
+            store
+                .search_messages(account, "legacy body", 10)
+                .expect("search")
+                .len(),
+            1
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -1,8 +1,8 @@
-# 实现说明（同步内核 + 加密库 + 多协议 + 正文 + 多邮箱与本地回收站）
+# 实现说明（同步内核 + 加密库 + 多协议 + 正文索引 + 多邮箱实时监听）
 
 日期：2026-10-30
-范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP/POP3 接收、SMTP 发送、提供商预设、正文/附件按需拉取与 HTML 净化、全账户多邮箱遍历、本地回收站与保留期、开发 CLI
-状态：协议路径已实测（Dovecot + 88 服务器 STARTTLS）；正文与附件、多邮箱、回收站对 Dovecot 实跑；真实账号收发未验收
+范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP/POP3 接收、SMTP 发送、提供商预设、正文/附件按需拉取与 HTML 净化、正文全文索引（schema v6）、全账户多邮箱遍历与实时监听、本地回收站与保留期、开发 CLI
+状态：协议路径已实测（Dovecot + 88 服务器 STARTTLS）；正文与附件、多邮箱、回收站、实时监听、正文搜索对 Dovecot 实跑；真实账号收发未验收
 
 ---
 
@@ -11,12 +11,12 @@
 | crate | 职责 | 关键点 |
 |---|---|---|
 | `mail-crypto` | 凭据保险箱 + 信封加密 | 系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；XChaCha20-Poly1305 带 AAD；主密钥首次使用时生成并存入钥匙串，HKDF-SHA256 派生用途子密钥 |
-| `mail-store` | SQLite 存储（SQLCipher） | 账户、邮箱、消息、位置、变更日志、FTS5；内容寻址 `blobs` + 引用计数；`message_parts`/`attachments` 与 `body_state`；变更日志有界（`change_snapshots` 全量快照 + 压缩，水位不倒退）；WAL；schema 版本迁移；UIDVALIDITY 重建；邮箱 `missing_at` 本地回收站与保留期清理；`settings` 表；打开时先验密钥，错密钥与明文旧库都显式报错 |
+| `mail-store` | SQLite 存储（SQLCipher） | 账户、邮箱、消息、位置、变更日志、FTS5（主题/地址/摘要/正文）；内容寻址 `blobs` + 引用计数；`message_parts`/`attachments` 与 `body_state`；`body_text` 存前 4,000 字纯文本，FTS 行用 `rewrite_fts` 删+插重建（contentless 不能 UPDATE）；变更日志有界（`change_snapshots` 全量快照 + 压缩，水位不倒退）；WAL；schema v6 迁移（重建 FTS 并从 blob 回填正文）；UIDVALIDITY 重建；邮箱 `missing_at` 本地回收站与保留期清理；`settings` 表；打开时先验密钥，错密钥与明文旧库都显式报错 |
 | `mail-parse` | MIME 解码与净化 | 传输编码（base64/quoted-printable）、charset（encoding_rs，含 GBK）、RFC 2047 文件名、ammonia 白名单净化、HTML→纯文本、整封 MIME 遍历（POP3 路径） |
 | `mail-proto` | IMAP/POP3/SMTP 传输 | IMAP：TLS/STARTTLS/明文、能力探测、三档、UID 抓取、BODYSTRUCTURE + `BODY.PEEK` 分段取正文、IDLE、MOVE、RFC 6154 SPECIAL-USE、修改版 UTF-7 邮箱名；POP3：LIST/UIDL/TOP/RETR、STLS；SMTP：EHLO、STARTTLS、AUTH、DATA |
 | `mail-sync` | 增量同步 | IMAP：首同步、UID/标志位增量、删除检测、UIDVALIDITY 重建、全账户遍历（跳过 `\Noselect`/`\All`/`\Flagged`）、消失邮箱转本地回收站；POP3：UIDL 镜像与轮询 |
-| `mail-core` | 门面 | 账户添加、预设解析、IMAP/POP3 分派、`sync`/`sync_account`/`watch`（每轮同步后按阈值压缩变更日志）、`check`、`send`（SMTP + Sent 归档）、`fetch_body`（缓存优先）、`fetch_attachment`（按需）、回收站保留期设置与自动清理、`change_window`/`compact_changes` |
-| `mail-cli` | 开发工具 | `add-account / check / send / accounts / sync / watch / mailboxes / list / trash / trash-purge / body / attachment / stats / retention / set-retention / changes / changes-compact / set-change-max-rows / export-key / import-key` |
+| `mail-core` | 门面 | 账户添加、预设解析、IMAP/POP3 分派、`sync`/`sync_account`、`watch`（单邮箱）/`watch_account`（全邮箱：IDLE 池 + 扫尾连接，只推送真实变更；每轮同步后按阈值压缩变更日志）、`check`、`send`（SMTP + Sent 归档）、`fetch_body`（缓存优先，命中时补写正文索引）、`fetch_attachment`（按需）、回收站保留期设置与自动清理、`change_window`/`compact_changes` |
+| `mail-cli` | 开发工具 | `add-account / check / send / accounts / sync / watch / mailboxes / list / search / trash / trash-purge / body / attachment / stats / retention / set-retention / changes / changes-compact / set-change-max-rows / export-key / import-key` |
 
 产品 UI、Hub、日历、翻译不在本段范围内。
 
@@ -49,6 +49,24 @@ flowchart TD
 ```
 
 删除检测不再每次全量扫描：只有服务端 `EXISTS` 与本地条数不一致，或距上次对账超过 15 分钟，才执行 `UID SEARCH ALL`。实测把一次删除同步从 3.4 s 降到 69 ms。
+
+### 2.1 常驻监听（`watch_account`）
+
+```mermaid
+flowchart LR
+  S[扫尾连接<br/>每 120 s] -->|LIST + 重规划| P[邮箱计划]
+  P -->|A/B 档且有空位| W[IDLE 会话池 ≤4]
+  S -->|同步未覆盖邮箱<br/>mark_missing| DB[(SQLite)]
+  W -->|新数据即增量同步| DB
+  W --> E[事件汇: 仅新增/删除/重建]
+  S --> E
+```
+
+- A/B 档（广告 IDLE）的邮箱各占一条连接，按 `plan_mailboxes` 顺序取前 `idle_sessions` 个（默认 4，`--idle-sessions 0` 即纯轮询）。
+- 其余邮箱由扫尾连接轮询（`--sweep-seconds`，默认 120 s）；扫尾同时重新 LIST，新增邮箱补进计划、消失邮箱停掉 worker 并进回收站。
+- 扫尾用 `sync_account_except` 跳过已有会话的邮箱，避免同一邮箱双写；跳过列表仍参与 `mark_missing_mailboxes`。
+- 事件只在 `inserted + removed > 0` 或 `full`（新邮箱/UIDVALIDITY 重建）时发出：周期性全量标志位重扫会把每行都算成 `applied`，无法与真实变化区分。POP3 保持 60 s 轮询，同样只回调真实变更。
+- 故障：连接断开按 1→2→4 s 退避（上限 60 s）重连；退出时直接丢弃 IDLE 连接（IDLE 中的会话无法退回）。
 
 ---
 
@@ -97,7 +115,15 @@ flowchart TD
 | 服务器删除邮箱 | 删 `项目` 后 sync：该行 `state=missing`，消息只在 `trash` 出现，`list` 不再返回 |
 | 同名单重建 | 旧行改名为 `项目 (local trash 2)` 并保留消息，新 `项目` 全量同步；回收站内容未丢 |
 | 保留期设置 | 默认 90 天；`set-retention --days 30` 后 `retention` 回读 30；`trash-purge` 未到期返回 0 |
-| 单测 | 79 个全绿（crypto/store/sync/proto/parse/core） |
+| 多邮箱 watch（Dovecot 6 邮箱） | 非 INBOX（`项目`，IDLE 覆盖）投递后 ≤1 s 入库；`Sent`（扫尾覆盖，sweep 3 s）≤3 s；`--max-events 2` 收到 2 个真实事件后退出 |
+| 多邮箱 watch：服务器重启 | 4 个 IDLE 会话同时断线，按 1/2/4 s 退避重连；恢复后新邮件正常入库 |
+| 多邮箱 watch：邮箱删除 | worker 停止，无重复报错；该邮箱 `state=missing` |
+| 全量同步（release，含 FTS 行重写） | 10,009 封 / **451 ms**，数据库 5.79 MB |
+| 正文索引体积（10k 封，CJK 正文 ~3,800 字/封） | 仅正文缓存 124 MB；1,000 字/封索引 +50 MB；4,000 字/封 +160 MB |
+| 正文索引查询（10k 封） | 命中全表的 3 字词 ~55 ms；中文 2 字 LIKE 52 ms（1,000 字/封）/ 137 ms（4,000 字/封）；选择性短语 0.1–0.3 ms |
+| 正文搜索（Dovecot 端到端） | 拉取前搜 `zebraqilin` 无结果，`body` 后命中；中文 2 字 `营收` 经 LIKE 命中 |
+| schema v5→v6 迁移 | 主题索引保留、正文从 blob 回填、`user_version=6`（单测） |
+| 单测 | 92 个全绿（crypto/store/sync/proto/parse/core） |
 
 首次同步后进程启动有一次钥匙串授权检查（新二进制），之后的同步都在 40 ms 内。
 
@@ -180,8 +206,15 @@ cargo run -p mail-cli -- --db /tmp/mail.db body --email vmail@example.com --id 4
 cargo run -p mail-cli -- --db /tmp/mail.db attachment --email vmail@example.com \
   --id 42 --part 2 --out /tmp/report.pdf
 
-# 6) 常驻监听（收到新邮件即增量同步）
+# 5.2) 搜索：主题/地址/摘要 + 已拉取正文的前 4,000 字；中文 1–2 字走 LIKE
+cargo run -p mail-cli -- --db /tmp/mail.db search --email vmail@example.com --query 营收
+
+# 6) 常驻监听：省略 --mailbox 覆盖全部可选邮箱（IDLE 池 4 + 扫尾 120 s）
 cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com
+cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com \
+  --idle-sessions 0 --sweep-seconds 2   # 纯轮询路径
+cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com --mailbox INBOX
+# 事件只在有新增/删除/重建时触发；投递测试邮件要带 docker exec -i，否则存入空邮件
 
 # 7) 验证加密：首次打开会自动在主密钥条目下生成密钥
 sqlite3 /tmp/mail.db 'select count(*) from sqlite_master;'   # 期望 file is not a database
@@ -202,12 +235,12 @@ cargo test --workspace
 ## 7. 已知缺口（按优先级）
 
 1. **仅支持密码/应用专用密码认证**。Outlook 需 OAuth2 应用身份，按 2026-10-29 范围决策不接；Gmail 走应用专用密码（待真实账户验证）。
-2. **常驻监听仍只覆盖单个邮箱**。批量 `sync` 已遍历全部可选邮箱，但 `watch` 只对一个邮箱 IDLE；多邮箱实时监听需要多会话或轮询。POP3 仍为单 INBOX 镜像。
-3. **正文未进 FTS**。正文已按需拉取并解码，但全文索引仍只覆盖主题/发件人/收件人/摘要；把 `body_text` 并入 FTS 需要重建索引的迁移。
+2. ~~**常驻监听仅单邮箱**~~。`watch` 省略 `--mailbox` 时走 `watch_account`：A/B 档邮箱各一条 IDLE 会话（默认 4 条），其余由扫尾连接轮询（默认 120 s），并重新规划邮箱集合。未覆盖：Gmail 虚拟邮箱（`\All`/`\Flagged`）按规则跳过；UI 尚未消费事件流。
+3. ~~**正文未进 FTS**~~。`messages.body_text` 保存前 4,000 字纯文本并进 `message_fts`（schema v6，重建迁移 + 打开邮件自愈）。未验证：10 万封下正文 LIKE 的时延。
 4. **B/C 档未实跑**。代码路径已实现，但没有 iCloud 等 C 档测试账户；能力矩阵来自未登录探测。
 5. ~~**变更日志会持续增长**~~。已实现快照压缩：超过 `change_log_max_rows`（默认 20,000）后写 `change_snapshots` 并删除被覆盖的 `changes` 行，水位由快照 seq 兜底；`change_window` 暴露最旧可读游标。剩余缺口只在 Hub/JMAP 侧：`cannotCalculateChanges` 尚未有 HTTP 端点消费该信号。
-6. **中文 1–2 字搜索走 LIKE 扫描**。10 万封以内可接受，更大规模需要专门的分词索引。
-7. **重连退避未做故障注入**。逻辑在 `Core::watch` 中，但未模拟断网/服务器重启。
+6. **中文 1–2 字搜索走 LIKE 扫描**，现在也扫 `body_text`。10k 封实测 137 ms；10 万封按线性外推 ~1.4 s（未验证），更大规模需要专门的分词索引。
+7. ~~**重连退避未做故障注入**~~。`watch_account` 下实测 Dovecot 重启：IDLE 会话同时断线并按退避重连，恢复后正常入库。未覆盖网络分区（连接挂起）等更隐蔽的故障。
 8. **POP3 语义受限**。无文件夹/标志位/IDLE；UIDL 以 63 位哈希映射为数字 uid；服务器删除通过 UIDL 消失检测。
 9. **发信能力窄**。仅纯文本；无附件、HTML、草稿；Sent 归档只在 IMAP 尝试，失败仅告警。
 10. **真实账号未验收**。QQ/88/Gmail 的同步与发信需要授权码/专用密码。
@@ -222,6 +255,6 @@ cargo test --workspace
 按依赖顺序：
 
 1. 发信补齐：HTML、附件、草稿与 Sent 去重
-2. FTS 正文索引（`body_text`）与中文索引策略
-3. 多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）
+2. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）
+3. ~~多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）~~（完成；IDLE 池 + 扫尾）
 4. 主密钥导出/恢复与库密钥轮换

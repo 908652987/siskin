@@ -8,6 +8,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Local};
 use mail_core::{
     presets, AccountSpec, Core, ReceiveProtocol, SecurityMode, SmtpSettings, SyncOutcome,
+    WatchOptions,
 };
 use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Store, StoredMessage};
@@ -42,7 +43,7 @@ fn parse() -> Result<Args, String> {
     Ok(Args {
         db,
         command: command.ok_or(
-            "missing command: add-account | check | send | accounts | sync | watch | mailboxes | list | trash | trash-purge | body | attachment | stats | retention | set-retention | changes | changes-compact | set-change-max-rows | export-key | import-key",
+            "missing command: add-account | check | send | accounts | sync | watch | mailboxes | list | search | trash | trash-purge | body | attachment | stats | retention | set-retention | changes | changes-compact | set-change-max-rows | export-key | import-key",
         )?,
         flags,
     })
@@ -405,19 +406,35 @@ async fn run() -> Result<(), String> {
         }
         "watch" => {
             let email = required(&args.flags, "email")?;
-            let mailbox = args
-                .flags
-                .get("mailbox")
-                .cloned()
-                .unwrap_or_else(|| "INBOX".to_string());
             let max_events = args
                 .flags
                 .get("max-events")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(usize::MAX);
-            core.watch(&email, &mailbox, max_events, print_outcome)
-                .await
-                .map_err(|e| e.to_string())?;
+            match args.flags.get("mailbox") {
+                Some(mailbox) => core
+                    .watch(&email, mailbox, max_events, print_outcome)
+                    .await
+                    .map_err(|e| e.to_string())?,
+                None => {
+                    let defaults = WatchOptions::default();
+                    let options = WatchOptions {
+                        idle_sessions: args
+                            .flags
+                            .get("idle-sessions")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(defaults.idle_sessions),
+                        sweep_seconds: args
+                            .flags
+                            .get("sweep-seconds")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(defaults.sweep_seconds),
+                    };
+                    core.watch_account(&email, max_events, options, print_outcome)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
         }
         "list" => {
             let email = required(&args.flags, "email")?;
@@ -435,6 +452,23 @@ async fn run() -> Result<(), String> {
                 .unwrap_or(0);
             for msg in store
                 .list_messages(account, limit, offset)
+                .map_err(|e| e.to_string())?
+            {
+                print_message(&msg);
+            }
+        }
+        "search" => {
+            let email = required(&args.flags, "email")?;
+            let query = required(&args.flags, "query")?;
+            let limit = args
+                .flags
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            let store = core.store();
+            let account = account_id(&store, &email)?;
+            for msg in store
+                .search_messages(account, &query, limit)
                 .map_err(|e| e.to_string())?
             {
                 print_message(&msg);

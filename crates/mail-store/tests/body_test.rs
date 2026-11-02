@@ -1,5 +1,6 @@
 use mail_store::{
     AttachmentMetaInput, BodyPartInput, BodyState, DbKey, NewMessage, PartMetaInput, Store,
+    BODY_INDEX_CHARS,
 };
 
 fn test_key() -> DbKey {
@@ -119,6 +120,7 @@ fn bodies_and_attachments_move_the_state_to_full() {
                     data: b"<p>hello</p>",
                 },
             ],
+            None,
         )
         .expect("bodies");
 
@@ -178,6 +180,7 @@ fn identical_bodies_share_one_blob() {
                     is_html: false,
                     data: b"shared body",
                 }],
+                None,
             )
             .expect("body");
     }
@@ -210,7 +213,7 @@ fn restoring_the_same_body_does_not_leak_references() {
         .record_body_structure(account, message_id, &[text_part("1")], &[])
         .expect("structure");
     store
-        .store_body_parts(account, message_id, &[part])
+        .store_body_parts(account, message_id, &[part], None)
         .expect("first store");
     store
         .store_body_parts(
@@ -223,6 +226,7 @@ fn restoring_the_same_body_does_not_leak_references() {
                 is_html: false,
                 data: b"repeated",
             }],
+            None,
         )
         .expect("second store");
     assert_eq!(store.blob_bytes().expect("bytes"), 8);
@@ -274,6 +278,122 @@ fn a_new_layout_drops_stale_parts_and_their_blobs() {
         .expect("exists");
     assert!(body.attachments.is_empty());
     assert_eq!(store.blob_bytes().expect("bytes"), 0);
+}
+
+#[test]
+fn body_text_is_searchable_after_it_is_stored() {
+    let (store, account, mailbox) = setup();
+    let id = store_message(&store, account, mailbox, 1, "body-search");
+    store
+        .record_body_structure(account, id, &[text_part("1")], &[])
+        .expect("structure");
+    let body = "季度营收超预期 quarterly revenue exceeded guidance";
+    store
+        .store_body_parts(
+            account,
+            id,
+            &[BodyPartInput {
+                part: "1",
+                content_type: "text/plain",
+                charset: Some("utf-8"),
+                is_html: false,
+                data: body.as_bytes(),
+            }],
+            Some(body),
+        )
+        .expect("body");
+
+    let hits = store
+        .search_messages(account, "revenue", 10)
+        .expect("search");
+    assert_eq!(hits.len(), 1, "body words must reach the full-text index");
+    assert_eq!(hits[0].id, id);
+
+    // Two-character Chinese words are shorter than the trigram tokenizer
+    // supports, so they take the LIKE fallback over the body column.
+    let hits = store
+        .search_messages(account, "营收", 10)
+        .expect("cjk search");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn long_bodies_keep_only_the_head_for_search() {
+    let (store, account, mailbox) = setup();
+    let id = store_message(&store, account, mailbox, 1, "body-long");
+    store
+        .record_body_structure(account, id, &[text_part("1")], &[])
+        .expect("structure");
+    let body = format!("head-marker {}tail-marker", "x".repeat(BODY_INDEX_CHARS));
+    store
+        .store_body_parts(
+            account,
+            id,
+            &[BodyPartInput {
+                part: "1",
+                content_type: "text/plain",
+                charset: Some("utf-8"),
+                is_html: false,
+                data: body.as_bytes(),
+            }],
+            Some(&body),
+        )
+        .expect("body");
+
+    let indexed = store.body_text(id).expect("read").expect("indexed");
+    assert_eq!(indexed.chars().count(), BODY_INDEX_CHARS);
+    assert!(
+        store
+            .search_messages(account, "head-marker", 10)
+            .expect("search")
+            .len()
+            == 1
+    );
+    assert!(
+        store
+            .search_messages(account, "tail-marker", 10)
+            .expect("search")
+            .is_empty(),
+        "text past the index limit must not be searchable"
+    );
+}
+
+#[test]
+fn bodies_cached_without_an_index_are_backfilled_once() {
+    let (store, account, mailbox) = setup();
+    let id = store_message(&store, account, mailbox, 1, "body-legacy");
+    store
+        .record_body_structure(account, id, &[text_part("1")], &[])
+        .expect("structure");
+    store
+        .store_body_parts(
+            account,
+            id,
+            &[BodyPartInput {
+                part: "1",
+                content_type: "text/plain",
+                charset: Some("utf-8"),
+                is_html: false,
+                data: b"legacy needle",
+            }],
+            None,
+        )
+        .expect("legacy body");
+    assert!(store
+        .search_messages(account, "legacy needle", 10)
+        .expect("search")
+        .is_empty());
+
+    assert!(store
+        .index_body_text_if_missing(id, "legacy needle")
+        .expect("backfill"));
+    assert!(!store
+        .index_body_text_if_missing(id, "ignored second call")
+        .expect("no-op"));
+    let hits = store
+        .search_messages(account, "legacy needle", 10)
+        .expect("search");
+    assert_eq!(hits.len(), 1);
 }
 
 #[test]

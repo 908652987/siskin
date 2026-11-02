@@ -191,6 +191,7 @@ fn purging_waits_for_retention_then_drops_messages_and_blobs() {
                 is_html: false,
                 data: b"hello",
             }],
+            None,
         )
         .unwrap();
     assert!(store.blob_bytes().unwrap() > 0);

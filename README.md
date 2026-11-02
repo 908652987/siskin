@@ -34,7 +34,8 @@ cargo run -p mail-cli -- --db /tmp/mail.db add-account \
   --username vmail --password testpass
 cargo run -p mail-cli -- --db /tmp/mail.db sync --email vmail@example.com
 cargo run -p mail-cli -- --db /tmp/mail.db list --email vmail@example.com
-cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com
+cargo run -p mail-cli -- --db /tmp/mail.db search --email vmail@example.com --query 项目
+cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com   # 全部可选邮箱
 ```
 
 ## 仓库结构
@@ -42,10 +43,10 @@ cargo run -p mail-cli -- --db /tmp/mail.db watch --email vmail@example.com
 | 路径 | 内容 |
 |---|---|
 | `crates/mail-crypto` | 凭据保险箱、XChaCha20-Poly1305 信封加密 |
-| `crates/mail-store` | SQLite schema、变更日志、FTS5 |
+| `crates/mail-store` | SQLite schema、变更日志、FTS5（含正文索引） |
 | `crates/mail-proto` | IMAP/TLS、能力探测、三档同步原语 |
 | `crates/mail-sync` | 增量同步引擎 |
-| `crates/mail-core` | 门面与常驻 IDLE 循环 |
+| `crates/mail-core` | 门面与多邮箱常驻同步（IDLE 池 + 轮询扫尾） |
 | `crates/mail-cli` | 开发命令行 |
 | `spike/` | 开工前验证工程（IMAP 压测、RRULE、HTML 净化、Swift 基准） |
 | `docs/` | 架构、验证报告、实现说明、交接存档 |
