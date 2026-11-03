@@ -34,7 +34,7 @@ pub enum StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 /// Trash retention when the user never chose one (three months).
 pub const DEFAULT_TRASH_RETENTION_DAYS: u32 = 90;
 /// Upper bound for retention; ten years is already effectively "keep forever".
@@ -109,6 +109,72 @@ pub struct StoredMessage {
     pub size: Option<i64>,
     pub flags: Vec<String>,
     pub snippet: Option<String>,
+}
+
+/// Total and unread counts of one live mailbox, as the sync layer sees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxCount {
+    pub mailbox_id: i64,
+    pub total: i64,
+    pub unread: i64,
+}
+
+/// One live location of a message. Keywords are per location in IMAP, so the
+/// union across locations becomes the message's JMAP keywords.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageLocationInfo {
+    pub mailbox_id: i64,
+    pub flags: Vec<String>,
+}
+
+/// A message with every live location, for callers that must expose mailbox
+/// membership (the Hub does; the CLI only shows one representative).
+#[derive(Debug, Clone)]
+pub struct MessageWithLocations {
+    pub id: i64,
+    pub message_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub subject: Option<String>,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+    pub sent_at: Option<i64>,
+    pub size: Option<i64>,
+    pub snippet: Option<String>,
+    pub has_attach: bool,
+    pub locations: Vec<MessageLocationInfo>,
+}
+
+/// Filter/sort parameters of the Hub's message list. `text` searches subject,
+/// addresses, snippet and indexed body; `seen`/`flagged` filter on the union of
+/// keywords across live locations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageQuery {
+    pub mailbox_id: Option<i64>,
+    pub text: Option<String>,
+    pub seen: Option<bool>,
+    pub flagged: Option<bool>,
+    /// Exclusive bounds on `sent_at` (Unix seconds); messages without a date
+    /// never match them.
+    pub before: Option<i64>,
+    pub after: Option<i64>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// One page plus the total number of matches before paging.
+#[derive(Debug, Clone, Default)]
+pub struct MessagePage {
+    pub messages: Vec<StoredMessage>,
+    pub total: i64,
+}
+
+/// One paired Hub device. The token itself is never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -739,11 +805,41 @@ impl Store {
             stats.applied += 1;
         }
 
+        // Removals must be visible to incremental consumers (the Hub's
+        // Email/changes reports them as destroyed), so capture the message id
+        // before dropping the location.
+        let mut orphans = false;
         for uid in removed_uids {
-            stats.removed += tx.execute(
+            let message_id: Option<i64> = tx
+                .query_row(
+                    "SELECT message_id FROM message_locations WHERE mailbox_id = ?1 AND uid = ?2",
+                    params![mailbox_id, *uid],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let removed = tx.execute(
                 "DELETE FROM message_locations WHERE mailbox_id = ?1 AND uid = ?2",
                 params![mailbox_id, *uid],
             )?;
+            stats.removed += removed;
+            if let (1, Some(message_id)) = (removed, message_id) {
+                let remaining: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM message_locations WHERE message_id = ?1",
+                    [message_id],
+                    |row| row.get(0),
+                )?;
+                record_change(
+                    &tx,
+                    account_id,
+                    "message",
+                    &message_id.to_string(),
+                    if remaining == 0 { "removed" } else { "updated" },
+                )?;
+                orphans = true;
+            }
+        }
+        if orphans {
+            purge_orphan_messages(&tx)?;
         }
 
         if stats.applied > 0 || stats.removed > 0 {
@@ -870,6 +966,255 @@ impl Store {
             [account_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// Live mailbox totals and unread counts. `\Seen` is tracked per location,
+    /// so each location is counted once; mailboxes without messages are absent.
+    pub fn mailbox_counts(&self, account_id: i64) -> Result<Vec<MailboxCount>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            r#"SELECT l.mailbox_id, COUNT(*),
+                      SUM(CASE WHEN EXISTS (
+                            SELECT 1 FROM json_each(l.flags) WHERE json_each.value = '\Seen'
+                          ) THEN 0 ELSE 1 END)
+               FROM message_locations l
+               JOIN mailboxes b ON b.id = l.mailbox_id
+               WHERE b.account_id = ?1 AND b.missing_at IS NULL
+               GROUP BY l.mailbox_id"#,
+        )?;
+        let rows = stmt.query_map([account_id], |row| {
+            Ok(MailboxCount {
+                mailbox_id: row.get(0)?,
+                total: row.get(1)?,
+                unread: row.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Filtered, paged message list. All filters are applied in SQL with the
+    /// same representative-location rule as `list_messages`, so paging and
+    /// totals agree.
+    pub fn query_messages(&self, account_id: i64, query: &MessageQuery) -> Result<MessagePage> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut conditions = String::from(
+            " AND EXISTS (SELECT 1 FROM message_locations ll
+                           JOIN mailboxes bb ON bb.id = ll.mailbox_id
+                           WHERE ll.message_id = m.id AND bb.missing_at IS NULL)",
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![account_id.into()];
+
+        if let Some(mailbox_id) = query.mailbox_id {
+            conditions.push_str(
+                " AND EXISTS (SELECT 1 FROM message_locations lm
+                               JOIN mailboxes bm ON bm.id = lm.mailbox_id
+                               WHERE lm.message_id = m.id AND lm.mailbox_id = ?
+                                 AND bm.missing_at IS NULL)",
+            );
+            params.push(mailbox_id.into());
+        }
+        // Keywords are the union across live locations, so a message archived
+        // after being read stays seen.
+        let keyword_clause = |flag: &str, present: bool| {
+            let op = if present { " AND" } else { " AND NOT" };
+            format!(
+                r#"{op} EXISTS (SELECT 1 FROM message_locations lk
+                                 JOIN mailboxes bk ON bk.id = lk.mailbox_id
+                                 WHERE lk.message_id = m.id AND bk.missing_at IS NULL
+                                   AND EXISTS (SELECT 1 FROM json_each(lk.flags)
+                                               WHERE json_each.value = '{flag}'))"#
+            )
+        };
+        if let Some(value) = query.seen {
+            conditions.push_str(&keyword_clause("\\Seen", value));
+        }
+        if let Some(value) = query.flagged {
+            conditions.push_str(&keyword_clause("\\Flagged", value));
+        }
+        if let Some(text) = query.text.as_deref() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                if trimmed.chars().count() < 3 {
+                    let pattern = format!("%{trimmed}%");
+                    conditions.push_str(
+                        " AND (m.subject LIKE ? OR m.from_json LIKE ? OR m.to_json LIKE ?
+                               OR m.snippet LIKE ? OR m.body_text LIKE ?)",
+                    );
+                    for _ in 0..5 {
+                        params.push(pattern.clone().into());
+                    }
+                } else {
+                    let phrase = format!("\"{}\"", trimmed.replace('"', "\"\""));
+                    conditions.push_str(
+                        " AND m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)",
+                    );
+                    params.push(phrase.into());
+                }
+            }
+        }
+        if let Some(before) = query.before {
+            conditions.push_str(" AND m.sent_at IS NOT NULL AND m.sent_at < ?");
+            params.push(before.into());
+        }
+        if let Some(after) = query.after {
+            conditions.push_str(" AND m.sent_at IS NOT NULL AND m.sent_at > ?");
+            params.push(after.into());
+        }
+
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM messages m WHERE m.account_id = ?1{conditions}"),
+            rusqlite::params_from_iter(params.iter()),
+            |row| row.get(0),
+        )?;
+
+        let sql = format!(
+            "SELECT m.id, l.uid, l.mailbox_id, m.message_id, m.subject, m.from_json, m.to_json,
+                    m.sent_at, m.size, l.flags, m.snippet
+             FROM messages m
+             JOIN message_locations l ON l.message_id = m.id
+             WHERE m.account_id = ?1
+               AND l.mailbox_id = (
+                   SELECT l2.mailbox_id FROM message_locations l2
+                   JOIN mailboxes b2 ON b2.id = l2.mailbox_id
+                   WHERE l2.message_id = m.id AND b2.missing_at IS NULL
+                   ORDER BY l2.mailbox_id LIMIT 1)
+               {conditions}
+             ORDER BY COALESCE(m.sent_at, 0) DESC, m.id DESC
+             LIMIT ? OFFSET ?"
+        );
+        params.push(query.limit.into());
+        params.push(query.offset.into());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), map_message)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(MessagePage { messages, total })
+    }
+
+    /// Messages by local id with every live location, for callers that must
+    /// report all mailbox memberships. Ids that do not exist are omitted.
+    pub fn messages_with_locations(
+        &self,
+        account_id: i64,
+        ids: &[i64],
+    ) -> Result<Vec<MessageWithLocations>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().expect("poisoned");
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut params: Vec<rusqlite::types::Value> = vec![account_id.into()];
+        params.extend(ids.iter().map(|id| rusqlite::types::Value::from(*id)));
+
+        let sql = format!(
+            "SELECT m.id, m.message_id, m.thread_id, m.subject, m.from_json, m.to_json,
+                    m.sent_at, m.size, m.snippet, m.has_attach
+             FROM messages m
+             WHERE m.account_id = ?1 AND m.id IN ({placeholders})
+             ORDER BY m.id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                MessageWithLocations {
+                    id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    thread_id: row.get(2)?,
+                    subject: row.get(3)?,
+                    from: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    to: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                    sent_at: row.get(6)?,
+                    size: row.get(7)?,
+                    snippet: row.get(8)?,
+                    has_attach: row.get::<_, i64>(9)? != 0,
+                    locations: Vec::new(),
+                },
+                row.get::<_, i64>(0)?,
+            ))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+
+        let location_sql = format!(
+            "SELECT l.message_id, l.mailbox_id, l.flags
+             FROM message_locations l
+             JOIN mailboxes b ON b.id = l.mailbox_id
+             WHERE b.account_id = ?1 AND b.missing_at IS NULL
+               AND l.message_id IN ({placeholders})
+             ORDER BY l.message_id, l.mailbox_id"
+        );
+        let mut stmt = conn.prepare(&location_sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                MessageLocationInfo {
+                    mailbox_id: row.get(1)?,
+                    flags: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
+                },
+            ))
+        })?;
+        let mut by_id: std::collections::HashMap<i64, Vec<MessageLocationInfo>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (id, location) = row?;
+            by_id.entry(id).or_default().push(location);
+        }
+        let mut out = Vec::with_capacity(messages.len());
+        for (message, id) in messages {
+            let mut message = message;
+            message.locations = by_id.remove(&id).unwrap_or_default();
+            out.push(message);
+        }
+        Ok(out)
+    }
+
+    /// Registers a paired device. `token_hash` is a hash of the bearer token,
+    /// never the token itself.
+    pub fn create_device(&self, name: &str, token_hash: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.execute(
+            "INSERT INTO hub_devices (name, token_hash, created_at) VALUES (?1, ?2, ?3)",
+            params![name, token_hash, Utc::now().timestamp()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn device_by_token_hash(&self, token_hash: &str) -> Result<Option<Device>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT id, name, created_at, last_seen_at FROM hub_devices
+                 WHERE token_hash = ?1",
+                [token_hash],
+                |row| {
+                    Ok(Device {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        created_at: row.get(2)?,
+                        last_seen_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn touch_device(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.execute(
+            "UPDATE hub_devices SET last_seen_at = ?2 WHERE id = ?1",
+            params![id, Utc::now().timestamp()],
+        )?;
+        Ok(())
     }
 
     /// Messages whose only copies live in mailboxes the server no longer
@@ -1609,7 +1954,11 @@ fn upsert_message(
         account_id,
         "message",
         &message_row.to_string(),
-        "upsert",
+        if existing.is_none() {
+            "created"
+        } else {
+            "updated"
+        },
     )?;
     Ok(usize::from(existing.is_none()))
 }
@@ -2027,6 +2376,16 @@ CREATE TABLE IF NOT EXISTS change_snapshots (
   seq        INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   state      BLOB NOT NULL
+);
+
+-- Paired devices of the optional Hub. Only a hash of the bearer token is
+-- stored, so a database leak does not hand out API access.
+CREATE TABLE IF NOT EXISTS hub_devices (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT NOT NULL,
+  token_hash   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL,
+  last_seen_at INTEGER
 );
 
 -- Content-addressed bodies and attachments; refcount keeps one copy per hash.

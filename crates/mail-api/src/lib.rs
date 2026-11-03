@@ -1,0 +1,884 @@
+//! JMAP subset (RFC 8620 / RFC 8621) over the local store.
+//!
+//! Transport-agnostic: the Hub owns HTTP, authentication and network access.
+//! Implemented methods are `Mailbox/get`, `Email/query`, `Email/get` and
+//! `Email/changes`; everything else returns a JMAP `unknownMethod` error.
+//! Bodies are read from the store and fetched through [`BodySource`] when the
+//! client asks for values that are not cached yet.
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use mail_store::{
+    MessageBody, MessageLocationInfo, MessageQuery, MessageWithLocations, Store, StoredAttachment,
+    StoredPart,
+};
+use serde_json::{json, Map, Value};
+use thiserror::Error;
+
+pub const CORE_CAPABILITY: &str = "urn:ietf:params:jmap:core";
+pub const MAIL_CAPABILITY: &str = "urn:ietf:params:jmap:mail";
+
+/// Upper bounds advertised in the Session object and enforced here.
+pub const MAX_CALLS_IN_REQUEST: usize = 32;
+pub const MAX_OBJECTS_IN_GET: usize = 256;
+pub const MAX_MESSAGES_PER_QUERY: i64 = 1_000;
+pub const MAX_CHANGES: i64 = 1_000;
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error(transparent)]
+    Store(#[from] mail_store::StoreError),
+    #[error("invalid arguments")]
+    InvalidArguments,
+    #[error("unknown account: {0}")]
+    UnknownAccount(String),
+    #[error("unknown method: {0}")]
+    UnknownMethod(String),
+    #[error("unsupported filter")]
+    UnsupportedFilter,
+    #[error("unsupported sort")]
+    UnsupportedSort,
+    #[error("cannot calculate changes")]
+    CannotCalculateChanges,
+    #[error("body fetch failed: {0}")]
+    BodyFetch(String),
+}
+
+impl ApiError {
+    /// JMAP method-level error name (RFC 8620 §3.6.2).
+    pub fn jmap_type(&self) -> &'static str {
+        match self {
+            ApiError::Store(_) => "serverFail",
+            ApiError::InvalidArguments => "invalidArguments",
+            ApiError::UnknownAccount(_) => "accountNotFound",
+            ApiError::UnknownMethod(_) => "unknownMethod",
+            ApiError::UnsupportedFilter => "unsupportedFilter",
+            ApiError::UnsupportedSort => "unsupportedSort",
+            ApiError::CannotCalculateChanges => "cannotCalculateChanges",
+            ApiError::BodyFetch(_) => "serverFail",
+        }
+    }
+}
+
+/// A request-level failure; the Hub turns it into an HTTP problem document.
+#[derive(Debug, Error)]
+pub enum RequestError {
+    #[error("request is not a JMAP request object")]
+    NotRequest,
+    #[error("unknown capability: {0}")]
+    UnknownCapability(String),
+    #[error("request exceeds maxCallsInRequest")]
+    TooManyCalls,
+    #[error(transparent)]
+    Store(#[from] mail_store::StoreError),
+}
+
+impl RequestError {
+    /// `urn:ietf:params:jmap:error:*` suffix, or `None` for a plain bad request.
+    pub fn problem_type(&self) -> &'static str {
+        match self {
+            RequestError::UnknownCapability(_) => "unknownCapability",
+            RequestError::TooManyCalls => "limit",
+            _ => "notRequest",
+        }
+    }
+}
+
+/// Body bytes that a transport (the Hub) can fetch from the mail server.
+#[derive(Debug, Clone, Default)]
+pub struct FetchedBody {
+    pub text: Option<String>,
+    pub html: Option<String>,
+}
+
+/// On-demand body access. Implemented by the Hub with `mail-core`; keeping it
+/// behind a trait preserves the `mail-api -> mail-store` dependency edge.
+pub trait BodySource: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<FetchedBody, String>> + Send + 'a>>;
+}
+
+pub struct Jmap {
+    store: Arc<Store>,
+    bodies: Option<Arc<dyn BodySource>>,
+}
+
+impl Jmap {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self {
+            store,
+            bodies: None,
+        }
+    }
+
+    pub fn with_bodies(mut self, bodies: Arc<dyn BodySource>) -> Self {
+        self.bodies = Some(bodies);
+        self
+    }
+
+    /// Session object served from `/.well-known/jmap`. Every local account is
+    /// listed; the first one is primary.
+    pub fn session(&self) -> Result<Value, mail_store::StoreError> {
+        let accounts = self.store.list_accounts()?;
+        let mut account_objects = Map::new();
+        for account in &accounts {
+            let id = account.id.to_string();
+            account_objects.insert(
+                id,
+                json!({
+                    "name": account.display_name.clone().unwrap_or_else(|| account.email.clone()),
+                    "email": account.email,
+                    "isPersonal": true,
+                    "isReadOnly": false,
+                    "accountCapabilities": {
+                        CORE_CAPABILITY: {},
+                        MAIL_CAPABILITY: {},
+                    },
+                }),
+            );
+        }
+        let primary = accounts.first().map(|account| account.id.to_string());
+        let mut primary_accounts = Map::new();
+        if let Some(primary) = &primary {
+            primary_accounts.insert(CORE_CAPABILITY.to_string(), json!(primary));
+            primary_accounts.insert(MAIL_CAPABILITY.to_string(), json!(primary));
+        }
+        Ok(json!({
+            "capabilities": {
+                CORE_CAPABILITY: {
+                    "maxSizeUpload": 0,
+                    "maxConcurrentUpload": 0,
+                    "maxSizeRequest": 10_000_000,
+                    "maxConcurrentRequests": 4,
+                    "maxCallsInRequest": MAX_CALLS_IN_REQUEST,
+                    "maxObjectsInGet": MAX_OBJECTS_IN_GET,
+                    "maxObjectsInSet": 0,
+                    "collationAlgorithms": ["i;ascii-casemap"],
+                },
+                MAIL_CAPABILITY: {},
+            },
+            "accounts": account_objects,
+            "primaryAccounts": primary_accounts,
+            "username": accounts
+                .first()
+                .map(|account| account.email.clone())
+                .unwrap_or_default(),
+            "apiUrl": "/jmap",
+            "downloadUrl": "/download/{accountId}/{blobId}/{name}?accept={type}",
+            "uploadUrl": "/upload/{accountId}/",
+            "eventSourceUrl": "/eventsource/?types={types}&closeafter={closeafter}&ping={ping}",
+            "state": format!("s{}", accounts.len()),
+        }))
+    }
+
+    /// Executes one JMAP request. Method failures stay inside `methodResponses`
+    /// as `error` entries; only malformed requests or unknown capabilities
+    /// fail the whole call.
+    pub async fn handle(&self, request: Value) -> Result<Value, RequestError> {
+        let object = request.as_object().ok_or(RequestError::NotRequest)?;
+        if let Some(using) = object.get("using") {
+            let using = using.as_array().ok_or(RequestError::NotRequest)?;
+            for capability in using {
+                let capability = capability.as_str().ok_or(RequestError::NotRequest)?;
+                if capability != CORE_CAPABILITY && capability != MAIL_CAPABILITY {
+                    return Err(RequestError::UnknownCapability(capability.to_string()));
+                }
+            }
+        }
+        let calls = object
+            .get("methodCalls")
+            .and_then(Value::as_array)
+            .ok_or(RequestError::NotRequest)?;
+        if calls.len() > MAX_CALLS_IN_REQUEST {
+            return Err(RequestError::TooManyCalls);
+        }
+
+        let mut responses = Vec::with_capacity(calls.len());
+        for call in calls {
+            let parts = call.as_array().ok_or(RequestError::NotRequest)?;
+            if parts.len() != 3 {
+                return Err(RequestError::NotRequest);
+            }
+            let name = parts[0].as_str().ok_or(RequestError::NotRequest)?;
+            let args = parts[1].as_object().ok_or(RequestError::NotRequest)?;
+            let call_id = parts[2].as_str().ok_or(RequestError::NotRequest)?;
+            match self.dispatch(name, args).await {
+                Ok(value) => responses.push(json!([name, value, call_id])),
+                Err(err) => responses.push(json!([
+                    "error",
+                    {
+                        "type": err.jmap_type(),
+                        "description": err.to_string(),
+                    },
+                    call_id
+                ])),
+            }
+        }
+
+        Ok(json!({
+            "methodResponses": responses,
+            "sessionState": self.session_state()?,
+        }))
+    }
+
+    fn session_state(&self) -> Result<String, mail_store::StoreError> {
+        Ok(format!("s{}", self.store.list_accounts()?.len()))
+    }
+
+    async fn dispatch(&self, name: &str, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        match name {
+            "Mailbox/get" => self.mailbox_get(args),
+            "Email/query" => self.email_query(args),
+            "Email/get" => self.email_get(args).await,
+            "Email/changes" => self.email_changes(args),
+            other => Err(ApiError::UnknownMethod(other.to_string())),
+        }
+    }
+
+    fn account_id(&self, args: &Map<String, Value>) -> Result<i64, ApiError> {
+        let raw = args
+            .get("accountId")
+            .and_then(Value::as_str)
+            .ok_or(ApiError::InvalidArguments)?;
+        let id: i64 = raw.parse().map_err(|_| ApiError::InvalidArguments)?;
+        if self.store.account_by_id(id)?.is_none() {
+            return Err(ApiError::UnknownAccount(raw.to_string()));
+        }
+        Ok(id)
+    }
+
+    fn mailbox_get(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let wanted: Option<HashSet<i64>> = match args.get("ids") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let ids = value.as_array().ok_or(ApiError::InvalidArguments)?;
+                let mut out = HashSet::with_capacity(ids.len());
+                for id in ids {
+                    let raw = id.as_str().ok_or(ApiError::InvalidArguments)?;
+                    out.insert(raw.parse().map_err(|_| ApiError::InvalidArguments)?);
+                }
+                Some(out)
+            }
+        };
+        let properties = properties(args)?;
+        let counts: HashMap<i64, (i64, i64)> = self
+            .store
+            .mailbox_counts(account_id)?
+            .into_iter()
+            .map(|count| (count.mailbox_id, (count.total, count.unread)))
+            .collect();
+
+        let mut list = Vec::new();
+        let mut found = HashSet::new();
+        for mailbox in self.store.list_mailboxes(account_id)? {
+            if mailbox.missing_at.is_some() {
+                continue;
+            }
+            if let Some(wanted) = &wanted {
+                if !wanted.contains(&mailbox.id) {
+                    continue;
+                }
+            }
+            found.insert(mailbox.id);
+            let (total, unread) = counts.get(&mailbox.id).copied().unwrap_or((0, 0));
+            let mut object = Map::new();
+            object.insert("id".into(), json!(mailbox.id.to_string()));
+            object.insert("name".into(), json!(mailbox.remote_name));
+            object.insert("parentId".into(), Value::Null);
+            object.insert("role".into(), mailbox_role(mailbox.role.as_deref()));
+            object.insert("sortOrder".into(), json!(0));
+            object.insert("totalEmails".into(), json!(total));
+            object.insert("unreadEmails".into(), json!(unread));
+            object.insert("totalThreads".into(), json!(total));
+            object.insert("unreadThreads".into(), json!(unread));
+            object.insert("isSubscribed".into(), json!(true));
+            object.insert(
+                "myRights".into(),
+                json!({
+                    "mayReadItems": true,
+                    "mayAddItems": false,
+                    "mayRemoveItems": false,
+                    "maySetSeen": false,
+                    "maySetKeywords": false,
+                    "mayCreateChild": false,
+                    "mayRename": false,
+                    "mayDelete": false,
+                    "maySubmit": false,
+                }),
+            );
+            list.push(select_properties(object, &properties));
+        }
+        let not_found: Vec<String> = wanted
+            .unwrap_or_default()
+            .difference(&found)
+            .map(|id| id.to_string())
+            .collect();
+
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "state": self.store.latest_change_seq(account_id)?.to_string(),
+            "list": list,
+            "notFound": not_found,
+        }))
+    }
+
+    fn email_query(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let filter = parse_filter(args.get("filter"))?;
+        parse_sort(args.get("sort"))?;
+        let position = args.get("position").and_then(Value::as_i64).unwrap_or(0);
+        if position < 0 {
+            return Err(ApiError::InvalidArguments);
+        }
+        let limit = match args.get("limit") {
+            None | Some(Value::Null) => MAX_MESSAGES_PER_QUERY,
+            Some(value) => value
+                .as_i64()
+                .ok_or(ApiError::InvalidArguments)?
+                .clamp(1, MAX_MESSAGES_PER_QUERY),
+        };
+        let query = MessageQuery {
+            mailbox_id: filter.mailbox,
+            text: filter.text,
+            seen: filter.seen,
+            flagged: filter.flagged,
+            before: filter.before,
+            after: filter.after,
+            limit,
+            offset: position,
+        };
+        let page = self.store.query_messages(account_id, &query)?;
+        let ids: Vec<String> = page
+            .messages
+            .iter()
+            .map(|message| message.id.to_string())
+            .collect();
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "queryState": self.store.latest_change_seq(account_id)?.to_string(),
+            "canCalculateChanges": false,
+            "position": position,
+            "ids": ids,
+            "total": page.total,
+            "limit": limit,
+        }))
+    }
+
+    async fn email_get(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let ids = args
+            .get("ids")
+            .and_then(Value::as_array)
+            .ok_or(ApiError::InvalidArguments)?;
+        if ids.len() > MAX_OBJECTS_IN_GET {
+            return Err(ApiError::InvalidArguments);
+        }
+        let mut numeric = Vec::with_capacity(ids.len());
+        for id in ids {
+            let raw = id.as_str().ok_or(ApiError::InvalidArguments)?;
+            numeric.push(raw.parse::<i64>().map_err(|_| ApiError::InvalidArguments)?);
+        }
+        let properties = properties(args)?;
+        let fetch_text = flag(args, "fetchTextBodyValues");
+        let fetch_html = flag(args, "fetchHTMLBodyValues");
+        let max_body_bytes = args.get("maxBodyValueBytes").and_then(Value::as_i64);
+
+        let mut list = Vec::new();
+        let mut found = HashSet::new();
+        for message in self.store.messages_with_locations(account_id, &numeric)? {
+            found.insert(message.id);
+            let body = self
+                .body_view(account_id, message.id, fetch_text || fetch_html)
+                .await?;
+            let object = email_object(&message, &body, fetch_text, fetch_html, max_body_bytes);
+            list.push(select_properties(object, &properties));
+        }
+        let not_found: Vec<String> = numeric
+            .iter()
+            .filter(|id| !found.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "state": self.store.latest_change_seq(account_id)?.to_string(),
+            "list": list,
+            "notFound": not_found,
+        }))
+    }
+
+    fn email_changes(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let since: i64 = args
+            .get("sinceState")
+            .and_then(Value::as_str)
+            .ok_or(ApiError::InvalidArguments)?
+            .parse()
+            .map_err(|_| ApiError::InvalidArguments)?;
+        let limit = match args.get("maxChanges") {
+            None | Some(Value::Null) => MAX_CHANGES,
+            Some(value) => value
+                .as_i64()
+                .ok_or(ApiError::InvalidArguments)?
+                .clamp(1, MAX_CHANGES),
+        };
+
+        let window = self.store.change_window(account_id)?;
+        let snapshot_covers = window.snapshot_seq.is_some_and(|seq| seq > since);
+        let history_dropped = window.oldest_seq.is_some_and(|oldest| since < oldest - 1);
+        if since > window.latest_seq || snapshot_covers || history_dropped {
+            return Err(ApiError::CannotCalculateChanges);
+        }
+
+        let rows = self.store.changes_since(account_id, since, limit + 1)?;
+        let has_more = rows.len() as i64 > limit;
+        let rows = &rows[..rows.len().min(limit as usize)];
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Last {
+            Created,
+            Updated,
+            Removed,
+        }
+        let mut order: Vec<String> = Vec::new();
+        let mut last: HashMap<String, Last> = HashMap::new();
+        let mut created_since: HashSet<String> = HashSet::new();
+        for row in rows {
+            if row.entity_type != "message" {
+                continue;
+            }
+            let op = match row.op.as_str() {
+                "created" => Last::Created,
+                "removed" => Last::Removed,
+                // `upsert` is what builds written before the created/updated
+                // split recorded; treat it as an update.
+                "updated" | "upsert" => Last::Updated,
+                _ => continue,
+            };
+            if op == Last::Created {
+                created_since.insert(row.entity_id.clone());
+            }
+            if last.insert(row.entity_id.clone(), op).is_none() {
+                order.push(row.entity_id.clone());
+            }
+        }
+
+        let mut created = Vec::new();
+        let mut updated = Vec::new();
+        let mut destroyed = Vec::new();
+        for id in order {
+            let op = last.get(&id).copied();
+            let was_created = created_since.contains(&id);
+            match op {
+                Some(Last::Created) => created.push(id),
+                // A message created after `sinceState` is reported as created
+                // even if it was modified again in the same window.
+                Some(Last::Updated) if was_created => created.push(id),
+                Some(Last::Updated) => updated.push(id),
+                // Created and destroyed inside the window: the client never
+                // saw it, so it belongs to neither list.
+                Some(Last::Removed) if !was_created => destroyed.push(id),
+                _ => {}
+            }
+        }
+
+        let new_state = rows
+            .last()
+            .map(|row| row.seq.to_string())
+            .unwrap_or_else(|| since.to_string());
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "oldState": since.to_string(),
+            "newState": new_state,
+            "hasMoreChanges": has_more,
+            "created": created,
+            "updated": updated,
+            "destroyed": destroyed,
+        }))
+    }
+
+    /// Store body first, then fetch from the server only when the client asked
+    /// for values that are not cached yet.
+    async fn body_view(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        want_values: bool,
+    ) -> Result<BodyView, ApiError> {
+        let stored = self.store.message_body(message_id)?;
+        let mut view = stored.map(BodyView::from).unwrap_or_default();
+        if !want_values {
+            return Ok(view);
+        }
+        let has_html_part = view.parts.iter().any(|part| part.is_html);
+        let need_text = view.text.is_none();
+        let need_html = view.html.is_none() && (view.parts.is_empty() || has_html_part);
+        if !(need_text || need_html) {
+            return Ok(view);
+        }
+        let Some(source) = &self.bodies else {
+            return Ok(view);
+        };
+        let fetched = source
+            .fetch(account_id, message_id)
+            .await
+            .map_err(ApiError::BodyFetch)?;
+        // Fetching usually writes the decoded parts to the store; prefer those
+        // so a repeated call does not produce duplicate part ids.
+        match self.store.message_body(message_id)? {
+            Some(stored) => {
+                view = BodyView::from(stored);
+                view.text = view.text.or(fetched.text);
+                view.html = view.html.or(fetched.html);
+            }
+            None => {
+                view.text = view.text.or(fetched.text);
+                view.html = view.html.or(fetched.html);
+            }
+        }
+        Ok(view)
+    }
+}
+
+#[derive(Default)]
+struct BodyView {
+    text: Option<String>,
+    html: Option<String>,
+    parts: Vec<StoredPart>,
+    attachments: Vec<StoredAttachment>,
+}
+
+impl From<MessageBody> for BodyView {
+    fn from(body: MessageBody) -> Self {
+        Self {
+            text: body.text,
+            html: body.html,
+            parts: body.parts,
+            attachments: body.attachments,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Filter {
+    mailbox: Option<i64>,
+    text: Option<String>,
+    seen: Option<bool>,
+    flagged: Option<bool>,
+    before: Option<i64>,
+    after: Option<i64>,
+}
+
+fn parse_filter(filter: Option<&Value>) -> Result<Filter, ApiError> {
+    let mut out = Filter::default();
+    let filter = match filter {
+        None | Some(Value::Null) => return Ok(out),
+        Some(value) => value,
+    };
+    let object = filter.as_object().ok_or(ApiError::UnsupportedFilter)?;
+    for (key, value) in object {
+        match key.as_str() {
+            "inMailbox" => {
+                let raw = value.as_str().ok_or(ApiError::InvalidArguments)?;
+                out.mailbox = Some(raw.parse().map_err(|_| ApiError::InvalidArguments)?);
+            }
+            "text" => {
+                out.text = Some(
+                    value
+                        .as_str()
+                        .ok_or(ApiError::InvalidArguments)?
+                        .to_string(),
+                );
+            }
+            "hasKeyword" | "notKeyword" => {
+                let keyword = value.as_str().ok_or(ApiError::InvalidArguments)?;
+                let present = key == "hasKeyword";
+                match keyword {
+                    "$seen" => out.seen = Some(present),
+                    "$flagged" => out.flagged = Some(present),
+                    _ => return Err(ApiError::UnsupportedFilter),
+                }
+            }
+            "before" => out.before = Some(parse_date(value)?),
+            "after" => out.after = Some(parse_date(value)?),
+            _ => return Err(ApiError::UnsupportedFilter),
+        }
+    }
+    Ok(out)
+}
+
+/// The store always orders by `receivedAt` (which maps to `sent_at`) and id,
+/// both descending; anything else is rejected instead of silently reordered.
+fn parse_sort(sort: Option<&Value>) -> Result<(), ApiError> {
+    let sort = match sort {
+        None | Some(Value::Null) => return Ok(()),
+        Some(value) => value,
+    };
+    let comparators = sort.as_array().ok_or(ApiError::UnsupportedSort)?;
+    for comparator in comparators {
+        let object = comparator.as_object().ok_or(ApiError::UnsupportedSort)?;
+        let property = object
+            .get("property")
+            .and_then(Value::as_str)
+            .ok_or(ApiError::UnsupportedSort)?;
+        let ascending = object
+            .get("isAscending")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !matches!(property, "receivedAt" | "sentAt" | "id") || ascending {
+            return Err(ApiError::UnsupportedSort);
+        }
+    }
+    Ok(())
+}
+
+fn parse_date(value: &Value) -> Result<i64, ApiError> {
+    let raw = value.as_str().ok_or(ApiError::InvalidArguments)?;
+    DateTime::parse_from_rfc3339(raw)
+        .map(|date| date.timestamp())
+        .map_err(|_| ApiError::InvalidArguments)
+}
+
+fn flag(args: &Map<String, Value>, name: &str) -> bool {
+    args.get(name).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn properties(args: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
+    match args.get("properties") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(value) => {
+            let values = value.as_array().ok_or(ApiError::InvalidArguments)?;
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                out.push(
+                    value
+                        .as_str()
+                        .ok_or(ApiError::InvalidArguments)?
+                        .to_string(),
+                );
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Keeps `id` plus every requested property that the object actually carries.
+fn select_properties(object: Map<String, Value>, properties: &[String]) -> Value {
+    if properties.is_empty() {
+        return Value::Object(object);
+    }
+    let mut out = Map::new();
+    if let Some(id) = object.get("id") {
+        out.insert("id".into(), id.clone());
+    }
+    for name in properties {
+        if let Some(value) = object.get(name) {
+            out.insert(name.clone(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+fn mailbox_role(role: Option<&str>) -> Value {
+    match role {
+        Some("inbox") => json!("inbox"),
+        Some("archive") => json!("archive"),
+        Some("drafts") => json!("drafts"),
+        Some("sent") => json!("sent"),
+        Some("trash") => json!("trash"),
+        Some("spam") | Some("junk") => json!("junk"),
+        _ => Value::Null,
+    }
+}
+
+fn keywords(locations: &[MessageLocationInfo]) -> Value {
+    let mut map = Map::new();
+    for location in locations {
+        for flag in &location.flags {
+            let keyword = match flag.as_str() {
+                "\\Seen" => "$seen",
+                "\\Flagged" => "$flagged",
+                "\\Answered" => "$answered",
+                "\\Draft" => "$draft",
+                "\\Forwarded" => "$forwarded",
+                _ => continue,
+            };
+            map.insert(keyword.to_string(), json!(true));
+        }
+    }
+    Value::Object(map)
+}
+
+fn address_list(values: &[String]) -> Value {
+    Value::Array(values.iter().map(|raw| address(raw)).collect())
+}
+
+fn address(raw: &str) -> Value {
+    let raw = raw.trim();
+    let mut object = Map::new();
+    if let (Some(start), Some(end)) = (raw.rfind('<'), raw.rfind('>')) {
+        if end > start {
+            let email = raw[start + 1..end].trim();
+            let name = raw[..start].trim().trim_matches('"').trim();
+            object.insert("email".into(), json!(email));
+            object.insert(
+                "name".into(),
+                if name.is_empty() {
+                    Value::Null
+                } else {
+                    json!(name)
+                },
+            );
+            return Value::Object(object);
+        }
+    }
+    object.insert("email".into(), json!(raw));
+    object.insert("name".into(), Value::Null);
+    Value::Object(object)
+}
+
+fn utc_date(timestamp: Option<i64>) -> String {
+    let date = timestamp
+        .and_then(|value| DateTime::from_timestamp(value, 0))
+        .unwrap_or_else(Utc::now);
+    date.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn email_object(
+    message: &MessageWithLocations,
+    body: &BodyView,
+    fetch_text: bool,
+    fetch_html: bool,
+    max_body_bytes: Option<i64>,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    object.insert("id".into(), json!(message.id.to_string()));
+    object.insert(
+        "threadId".into(),
+        json!(message
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| format!("t{}", message.id))),
+    );
+    let mut mailbox_ids = Map::new();
+    for location in &message.locations {
+        mailbox_ids.insert(location.mailbox_id.to_string(), json!(true));
+    }
+    object.insert("mailboxIds".into(), Value::Object(mailbox_ids));
+    object.insert("keywords".into(), keywords(&message.locations));
+    object.insert("size".into(), json!(message.size.unwrap_or(0)));
+    object.insert("receivedAt".into(), json!(utc_date(message.sent_at)));
+    object.insert("sentAt".into(), json!(utc_date(message.sent_at)));
+    object.insert(
+        "messageId".into(),
+        match &message.message_id {
+            Some(id) => json!([id]),
+            None => json!([]),
+        },
+    );
+    object.insert("from".into(), address_list(&message.from));
+    object.insert("to".into(), address_list(&message.to));
+    object.insert("subject".into(), json!(message.subject));
+    object.insert("preview".into(), json!(message.snippet));
+    object.insert("hasAttachment".into(), json!(message.has_attach));
+
+    // Single-part messages are cached under the empty section id; JMAP needs a
+    // non-empty partId, so those become "text" / "html".
+    let text_part = body
+        .parts
+        .iter()
+        .find(|part| !part.is_html && !part.part.is_empty())
+        .map(|part| part.part.clone());
+    let html_part = body
+        .parts
+        .iter()
+        .find(|part| part.is_html && !part.part.is_empty())
+        .map(|part| part.part.clone());
+    let text_id = text_part.clone().unwrap_or_else(|| "text".to_string());
+    let html_id = html_part.clone().unwrap_or_else(|| "html".to_string());
+
+    let mut text_body = Vec::new();
+    let mut html_body = Vec::new();
+    let mut body_values = Map::new();
+    if let Some(text) = &body.text {
+        text_body.push(body_part(&text_id, "text/plain", text.len(), None));
+        if fetch_text && !text.is_empty() {
+            body_values.insert(text_id.clone(), body_value(text, max_body_bytes));
+        }
+    }
+    if let Some(html) = &body.html {
+        html_body.push(body_part(&html_id, "text/html", html.len(), None));
+        if fetch_html && !html.is_empty() {
+            body_values.insert(html_id.clone(), body_value(html, max_body_bytes));
+        }
+    }
+    object.insert("textBody".into(), Value::Array(text_body));
+    object.insert("htmlBody".into(), Value::Array(html_body));
+    object.insert("bodyValues".into(), Value::Object(body_values));
+
+    let attachments = body
+        .attachments
+        .iter()
+        .map(|attachment| {
+            body_part(
+                &attachment.part,
+                &attachment.content_type,
+                attachment.size as usize,
+                attachment.filename.as_deref(),
+            )
+        })
+        .collect();
+    object.insert("attachments".into(), Value::Array(attachments));
+    object
+}
+
+/// One `EmailBodyPart` (RFC 8621 §4.1.4) with the properties the client needs
+/// to render or list it. `blobId` stays null until blob download is served.
+fn body_part(part_id: &str, content_type: &str, size: usize, name: Option<&str>) -> Value {
+    json!({
+        "partId": part_id,
+        "blobId": Value::Null,
+        "size": size,
+        "name": name,
+        "type": content_type,
+        "charset": if content_type.starts_with("text/") { json!("utf-8") } else { Value::Null },
+        "disposition": if name.is_some() { json!("attachment") } else { Value::Null },
+        "cid": Value::Null,
+        "language": Value::Null,
+        "location": Value::Null,
+    })
+}
+
+fn body_value(text: &str, max_bytes: Option<i64>) -> Value {
+    let (value, truncated) = match max_bytes {
+        Some(limit) if limit > 0 && text.len() > limit as usize => {
+            truncate_utf8(text, limit as usize)
+        }
+        _ => (text.to_string(), false),
+    };
+    json!({
+        "value": value,
+        "isEncodingProblem": false,
+        "isTruncated": truncated,
+    })
+}
+
+/// Byte limit that never splits a multi-byte character.
+fn truncate_utf8(text: &str, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_string(), false);
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
+}

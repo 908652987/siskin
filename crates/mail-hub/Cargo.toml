@@ -1,0 +1,31 @@
+[package]
+name = "mail-hub"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mail-hub"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+mail-api = { path = "../mail-api" }
+mail-core = { path = "../mail-core" }
+mail-crypto = { path = "../mail-crypto" }
+mail-store = { path = "../mail-store" }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+
+[lints]
+workspace = true

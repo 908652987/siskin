@@ -8,6 +8,8 @@ members = [
   "crates/mail-sync",
   "crates/mail-core",
   "crates/mail-cli",
+  "crates/mail-api",
+  "crates/mail-hub",
   "spike/imap-probe",
   "spike/rrule-probe",
   "spike/html-probe",
@@ -25,6 +27,7 @@ publish = false
 [workspace.dependencies]
 ammonia = "4"
 anyhow = "1"
+axum = "0.8"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,6 +42,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }

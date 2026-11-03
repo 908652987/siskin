@@ -249,6 +249,15 @@ CREATE TABLE change_snapshots (
   state       BLOB NOT NULL             -- JSON：mailboxes + messages + locations/flags
 );
 
+-- Hub 配对设备：只存令牌哈希，令牌本体只在配对响应里出现一次
+CREATE TABLE hub_devices (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT NOT NULL,
+  token_hash   TEXT NOT NULL UNIQUE,
+  created_at   INTEGER NOT NULL,
+  last_seen_at INTEGER
+);
+
 -- 日历
 CREATE TABLE calendars (
   id          TEXT PRIMARY KEY,
@@ -382,16 +391,26 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api` | JMAP 请求体：`{using, methodCalls}` |
-| GET | `/eventsource?types=...` | SSE 推送状态变更 |
-| POST | `/upload` | 附件上传 |
-| GET | `/download/{blobId}/{name}` | 附件下载 |
+| GET | `/.well-known/jmap` | Session 对象（需 Bearer 设备令牌） |
+| POST | `/jmap` | JMAP 请求体：`{using, methodCalls}` |
+| POST | `/pair` | 用配对码换取设备令牌（只返回一次） |
+| GET | `/eventsource/` | SSE 推送状态变更（未实现，返回 501） |
+| POST | `/upload/{accountId}/` | 附件上传（未实现，返回 501） |
+| GET | `/download/{accountId}/{blobId}/{name}` | 附件下载（未实现，返回 501） |
 
-实现的 method：
-`Mailbox/get|changes`、`Email/query|get|changes|set|import`、`Thread/get`、
-`Calendar/get|changes`、`CalendarEvent/query|get|changes|set`、`Identity/get`、`Core/echo`。
+已实现的 method：`Mailbox/get`、`Email/query`、`Email/get`、`Email/changes`；
+其余（`Mailbox/changes`、`Email/set|import`、`Thread/get`、`Core/echo`、日历与身份）
+返回 `unknownMethod`。客户端不在支持范围内的筛选/排序条件返回
+`unsupportedFilter` / `unsupportedSort`，不做静默忽略。
 
-状态字符串格式：`<account_id>:<seq>`。客户端持有旧 state，调用 `/changes` 拿增量；服务端无法计算时返回 `cannotCalculateChanges`，客户端降级全量刷新。
+认证：配对码换 32 字节随机令牌，库中只存 SHA-256 哈希；每次请求校验
+`Authorization: Bearer <token>` 并更新 `last_seen_at`。
+
+状态字符串是账户内的变更水位（十进制 `seq`）。客户端持有旧 state 调
+`Email/changes` 拿增量；游标早于快照水位或早于最旧保留的 `changes` 行时返回
+`cannotCalculateChanges`，客户端降级全量刷新。正文值（`bodyValues`）只在
+客户端请求 `fetchTextBodyValues`/`fetchHTMLBodyValues` 时返回；未缓存的部分
+由 Hub 经 `mail-core` 按需拉取，不返回空正文冒充成功。
 
 本地库的变更日志有界：超过 `change_log_max_rows`（默认 20,000）后，`compact_changes` 在当前水位写一份全量快照并删除被覆盖的 `changes` 行。水位（`latest_change_seq`）取快照 seq 与剩余 `changes` 最大 seq 的较大值，因此压缩不会让状态字符串倒退；早于最旧保留行的游标由 `change_window` 识别并要求重载快照。
 

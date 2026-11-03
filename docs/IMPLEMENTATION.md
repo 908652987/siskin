@@ -1,6 +1,6 @@
-# 实现说明（同步内核 + 加密库 + 多协议 + 正文索引 + 多邮箱实时监听）
+# 实现说明（同步内核 + 加密库 + 多协议 + 正文索引 + 多邮箱实时监听 + Hub）
 
-日期：2026-10-30
+日期：2026-11-02
 范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP/POP3 接收、SMTP 发送、提供商预设、正文/附件按需拉取与 HTML 净化、正文全文索引（schema v6）、全账户多邮箱遍历与实时监听、本地回收站与保留期、开发 CLI
 状态：协议路径已实测（Dovecot + 88 服务器 STARTTLS）；正文与附件、多邮箱、回收站、实时监听、正文搜索对 Dovecot 实跑；真实账号收发未验收
 
@@ -153,6 +153,19 @@ flowchart LR
 
 ---
 
+## 5.2 Hub 与 JMAP 子集
+
+- 分层：`mail-api` 只做 JMAP 语义（Session、请求/响应、错误映射），不依赖 HTTP；`mail-hub` 是 axum 二进制，负责配对、鉴权、路由与按需拉正文。依赖方向保持 `mail-hub → mail-api, mail-core`，`mail-api → mail-store`。
+- 认证：配对码（`EYRIE_HUB_PAIRING_CODE`，未设置则每进程随机生成并打印一次）换 32 字节随机令牌；库中 `hub_devices` 只存 SHA-256 哈希与 `last_seen_at`，令牌只在配对响应里出现一次。
+- 端点：`GET /.well-known/jmap`（Session）、`POST /jmap`、`POST /pair`；`/eventsource/`、`/upload/{accountId}/`、`/download/...` 明确返回 501，不假装支持。
+- 已实现 method：`Mailbox/get`（角色映射、`totalEmails`/`unreadEmails`、`myRights` 全为只读）、`Email/query`（`inMailbox`、`text`、`hasKeyword`/`notKeyword` 的 `$seen`/`$flagged`、`before`/`after`、position/limit，`total` 与分页一致）、`Email/get`（`mailboxIds` 为全部在线位置并集、keywords 为位置并集、附件元数据、`bodyValues`）、`Email/changes`（`created`/`updated`/`destroyed`）。
+- 不支持的条件显式失败：其他 filter/sort 返回 `unsupportedFilter`/`unsupportedSort`，未知 method 返回 `unknownMethod`，不静默忽略。排序固定为 `receivedAt` 降序 + id 降序，单次查询上限 1,000 条。
+- 变更语义：`apply_fetch` 现在写 `message created/updated/removed`；同一窗口内创建后又删除的 id 不出现在任何列表，创建后又更新的 id 只出现在 `created`。游标早于快照水位或早于最旧 `changes` 行时返回 `cannotCalculateChanges`。
+- 正文：`Email/get` 只在客户端请求 `fetchTextBodyValues`/`fetchHTMLBodyValues` 时返回 `bodyValues`；未缓存时通过 `mail_api::BodySource`（Hub 用 `mail-core::fetch_body`）按需拉取，失败返回 `serverFail` 而不是空正文。单部件消息的空 section 在 JMAP 层映射为 `text`/`html`。
+- 新增存储查询：`mailbox_counts`（含 `\Seen` 未读数，json_each 检查 flags）、`query_messages`（邮箱/正文/关键词/日期过滤 + 总数）、`messages_with_locations`（全部在线位置）；schema v7 增加 `hub_devices`。
+
+---
+
 ## 6. 运行方式
 
 macOS 上 `cargo run` 产出的二进制是 ad-hoc 签名，钥匙串 ACL 按 cdhash 记录授权，**每次重建后首次访问都会弹授权框**，点“始终允许”也只对当次产物有效；自签名证书同样无效（无 Team ID，partition 仍是 cdhash，详见 `docs/HANDOFF.md` §11）。开发时显式切到文件存储即可绕开钥匙串：
@@ -226,7 +239,19 @@ cargo run -p mail-cli -- --db /tmp/mail.db import-key --value '<base64>'        
 cargo run -p mail-cli -- --db /tmp/mail.db import-key --value '<base64>' --force true
 # import-key 会用 --db 指向的库验证密钥：打不开就失败，不覆盖钥匙串
 
-# 9) 测试
+# 9) Hub（JMAP 子集）：与 mail-cli 共用同一个库与密钥存储
+EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
+EYRIE_HUB_DB=/tmp/mail.db EYRIE_HUB_BIND=127.0.0.1:8080 \
+EYRIE_HUB_PAIRING_CODE=dev-code cargo run -p mail-hub
+# 配对 → 拿 token → 带 Authorization: Bearer <token> 访问
+curl -s -X POST http://127.0.0.1:8080/pair -H 'Content-Type: application/json' \
+  -d '{"code":"dev-code","name":"phone"}'
+curl -s http://127.0.0.1:8080/.well-known/jmap -H 'Authorization: Bearer <token>'
+curl -s -X POST http://127.0.0.1:8080/jmap -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":"1"},"c0"]]}'
+
+# 10) 测试
 cargo test --workspace
 ```
 
@@ -238,7 +263,7 @@ cargo test --workspace
 2. ~~**常驻监听仅单邮箱**~~。`watch` 省略 `--mailbox` 时走 `watch_account`：A/B 档邮箱各一条 IDLE 会话（默认 4 条），其余由扫尾连接轮询（默认 120 s），并重新规划邮箱集合。未覆盖：Gmail 虚拟邮箱（`\All`/`\Flagged`）按规则跳过；UI 尚未消费事件流。
 3. ~~**正文未进 FTS**~~。`messages.body_text` 保存前 4,000 字纯文本并进 `message_fts`（schema v6，重建迁移 + 打开邮件自愈）。未验证：10 万封下正文 LIKE 的时延。
 4. **B/C 档未实跑**。代码路径已实现，但没有 iCloud 等 C 档测试账户；能力矩阵来自未登录探测。
-5. ~~**变更日志会持续增长**~~。已实现快照压缩：超过 `change_log_max_rows`（默认 20,000）后写 `change_snapshots` 并删除被覆盖的 `changes` 行，水位由快照 seq 兜底；`change_window` 暴露最旧可读游标。剩余缺口只在 Hub/JMAP 侧：`cannotCalculateChanges` 尚未有 HTTP 端点消费该信号。
+5. ~~**变更日志会持续增长**~~。已实现快照压缩：超过 `change_log_max_rows`（默认 20,000）后写 `change_snapshots` 并删除被覆盖的 `changes` 行，水位由快照 seq 兜底；`change_window` 暴露最旧可读游标。Hub 的 `Email/changes` 已消费该信号（超窗返回 `cannotCalculateChanges`）。
 6. **中文 1–2 字搜索走 LIKE 扫描**，现在也扫 `body_text`。10k 封实测 137 ms；10 万封按线性外推 ~1.4 s（未验证），更大规模需要专门的分词索引。
 7. ~~**重连退避未做故障注入**~~。`watch_account` 下实测 Dovecot 重启：IDLE 会话同时断线并按退避重连，恢复后正常入库。未覆盖网络分区（连接挂起）等更隐蔽的故障。
 8. **POP3 语义受限**。无文件夹/标志位/IDLE；UIDL 以 63 位哈希映射为数字 uid；服务器删除通过 UIDL 消失检测。
@@ -247,6 +272,9 @@ cargo test --workspace
 11. **主密钥无轮换与自动备份**。`export-key`/`import-key` 支持人工备份到密码管理器，但主密钥仍只有钥匙串一份，且库密钥不能在线轮换。
 12. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应已进入服务器 Trash 并同步到本地）；回收站不提供手工恢复，同名单重建时旧数据以 `(local trash <id>)` 行保留至保留期。
 13. **多邮箱会让 `list/search` 去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选的 UI 需要新的查询接口。
+14. **JMAP 子集未覆盖写操作与推送**。`Mailbox/changes`、`Email/set|import`、`Thread/get`、SSE、上传/下载均未实现（明确返回 501 或 `unknownMethod`）；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序。设备配对后没有吊销命令，需直接删 `hub_devices` 行。
+15. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。
+16. **Hub 正文拉取是串行且同步的**。一次 `Email/get` 请求内逐封拉取，未做并发限流；多封大邮件会让单次请求变慢。
 
 ---
 
@@ -254,7 +282,9 @@ cargo test --workspace
 
 按依赖顺序：
 
-1. 发信补齐：HTML、附件、草稿与 Sent 去重
-2. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）
-3. ~~多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）~~（完成；IDLE 池 + 扫尾）
-4. 主密钥导出/恢复与库密钥轮换
+1. Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动）、SSE 推送、附件下载
+2. 移动端薄客户端（依赖 Hub 推送与 APNs/FCM 凭据）
+3. 发信补齐：HTML、附件、草稿与 Sent 去重
+4. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）
+5. ~~多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）~~（完成；IDLE 池 + 扫尾）
+6. 主密钥导出/恢复与库密钥轮换

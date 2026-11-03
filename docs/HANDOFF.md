@@ -1,6 +1,6 @@
 # 交接存档
 
-更新日期：2026-10-30
+更新日期：2026-11-02
 分支：`main`　许可：AGPL-3.0
 用途：任何人（或下一次会话）读完本文件即可继续开发，无需回溯聊天记录。
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；Linux 桌面 UI 技术栈定为 Slint（D12），**图形界面、日历、Hub 服务端尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub 只读 JMAP 子集已落地**（`mail-api` + `mail-hub`：Session、`Mailbox/get`、`Email/query|get|changes`、配对与 Bearer 鉴权，正文按需拉取；写操作、SSE、上传/下载未做）；Linux 桌面 UI 技术栈定为 Slint（D12），**图形界面、日历、手机客户端尚未开始**。
 
 ---
 
@@ -58,7 +58,9 @@
 | 本地回收站与保留期 | 完成 | `mail-store::missing_at`/`purge_trash`/`settings`；删除邮箱进回收站，默认 90 天，`sync` 自动清理；同名单重建保留旧数据 |
 | 变更日志压缩与快照 | 完成 | `mail-store::compact_changes` + `change_snapshots`；默认 20,000 行阈值，`sync`/`sync_account`/`watch` 每轮同步后自动执行；Dovecot 10,010 条压缩后日志归零、水位不倒退 |
 | HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
-| Hub / JMAP | 未开始 | |
+| JMAP 子集（只读） | 完成 | `mail-api`：Session、`Mailbox/get`、`Email/query|get|changes`、`BodySource` 按需正文；8 个 API 测试；Dovecot 10,009 封实跑 |
+| Hub 服务端与设备配对 | 完成 | `mail-hub`（axum）：配对码换令牌、库中只存哈希、Bearer 鉴权；3 个路由测试 + 实跑 |
+| Hub 写操作与推送 | 未开始 | `Email/set`、`Mailbox/changes`、SSE、上传/下载分别返回 `unknownMethod` / 501 |
 | 日历 | 未开始 | |
 | 翻译 | 未开始 | |
 | 桌面/移动 UI | 未开始 | Linux 栈已定 Slint（D12）；macOS/Windows/iOS/Android 仍按 D2 |
@@ -113,6 +115,12 @@ crates/
                            fetch_body（缓存优先，命中时补写正文索引）、fetch_attachment（按需）、
                            purge_expired_trash / trash_retention_days
   mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
+  mail-api/src/lib.rs      JMAP 子集：Session、Mailbox/get、Email/query|get|changes、
+                           BodySource 按需正文、filter/sort 的显式拒绝
+  mail-api/tests/          8 个 API 测试（邮箱计数、筛选分页、正文、变更语义、错误）
+  mail-hub/src/main.rs     axum 服务：/.well-known/jmap、/jmap、/pair、
+                           eventsource/upload/download 返回 501、CoreBodies
+                           同文件 tests：3 个路由测试（配对只存哈希、鉴权、JMAP 调用）
   mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch（省略
                            --mailbox 即全邮箱，--idle-sessions/--sweep-seconds 可调）/
                            mailboxes / list / search / trash / trash-purge / body /
@@ -142,7 +150,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 92 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 103 个测试全过
 ~/.cargo/bin/cargo build --release
 export EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets   # 开发期绕开钥匙串；发布验证不要设置
 
@@ -196,6 +204,18 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db changes-compact --email vm
 cargo run --release -p mail-cli -- --db /tmp/smoke.db export-key
 cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base64>'
 # 换机器时先 import-key 再打开库；库已存在则密钥必须能打开它，否则拒绝写入
+
+# 4.1) Hub：与 mail-cli 共用同一个库与密钥存储
+EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets EYRIE_HUB_DB=/tmp/smoke.db \
+EYRIE_HUB_BIND=127.0.0.1:8080 EYRIE_HUB_PAIRING_CODE=dev-code \
+cargo run -p mail-hub --release
+TOKEN=$(curl -s -X POST http://127.0.0.1:8080/pair -H 'Content-Type: application/json' \
+  -d '{"code":"dev-code","name":"phone"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+curl -s http://127.0.0.1:8080/.well-known/jmap -H "Authorization: Bearer $TOKEN"
+curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":"1"},"c0"]]}'
+# 未设置 EYRIE_HUB_PAIRING_CODE 时，配对码每进程随机生成并打印一次；令牌只在配对响应里返回
 
 # 5) 选下一项：见 §9
 ```
@@ -262,6 +282,11 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | 正文索引查询（10k 封） | 命中全表的 3 字词 ~55 ms（FTS）；中文 2 字 LIKE 52 ms（1,000 字/封）/ 137 ms（4,000 字/封）；选择性短语 0.1–0.3 ms |
 | 正文搜索端到端（Dovecot） | 拉取正文前 `zebraqilin` 无结果；`body` 后命中；中文 2 字 `营收` 经 LIKE 命中 |
 | schema v5→v6 迁移 | 主题索引保留、正文从 blob 回填、`user_version=6`（单测） |
+| Hub `Mailbox/get`（Dovecot 10,009 封 / 7 邮箱） | 角色正确；INBOX total=10,009、unread=10,002 |
+| Hub `Email/get` 按需拉 3 封未缓存正文 | 179 ms（在线 Dovecot，含 3 次 IMAP 取正文） |
+| Hub `Email/changes` 增量 | 正文缓存写入后 3 条 `updated`，`hasMoreChanges=false` |
+| Hub `Email/changes` 分页 | `sinceState=0, maxChanges=2` → `created=2`、`hasMoreChanges=true`、`newState=2` |
+| Hub 断点续用 | Hub 重启后旧设备令牌仍有效，`last_seen_at` 更新 |
 | RRULE | 22 例 21 通过，失败项为夏令时空洞时间，需归一化 |
 
 完整方法与命令见 `docs/SPIKE-REPORT.md`。
@@ -284,6 +309,8 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 12. **主密钥无轮换与自动备份**。已提供 `export-key`/`import-key` 做人工备份（可存 Bitwarden 等），但主密钥仍只有钥匙串一份，丢失且无备份即数据不可恢复；库密钥无法在线轮换。**验收**：轮换后旧库可迁移；备份丢失时给出明确提示。
 13. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应先进入服务器 Trash 并同步到本地 Trash）；回收站不提供手工恢复。**验收**：UI 可按邮箱/时间浏览回收站；恢复操作有明确语义。
 14. **多邮箱列表已去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选、跨邮箱计数需要新的查询接口。**验收**：列表可按邮箱过滤且不重复，计数与筛选一致。
+15. **Hub 只覆盖只读 JMAP 子集**。`Mailbox/changes`、`Email/set|import`、`Thread/get`、SSE、上传/下载未实现；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序；配对后没有吊销命令（需直接删 `hub_devices` 行）；一次 `Email/get` 内正文串行拉取。**验收**：客户端可标已读/移动邮件并按 state 增量刷新，推送走 SSE。
+16. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。**验收**：重建后客户端能收到 `cannotCalculateChanges` 或完整 destroyed 列表。
 
 ---
 
@@ -300,10 +327,10 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 4. ~~变更日志压缩与快照。~~（完成）
 5. ~~多邮箱实时监听（IDLE 池 + 扫尾）与正文全文索引。~~（完成；见 §3/§7；正文前 4,000 字，中文 2 字仍走 LIKE）
 
-### 第 4 段：服务端与移动
+### 第 4 段：服务端与移动（进行中）
 
-6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。
-7. iOS/Android 薄客户端。
+6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**只读子集与配对完成**（2026-11-02）；剩余：写操作（`Email/set` 已读/移动）、`Mailbox/changes`、SSE、附件下载、设备吊销、APNs/FCM。
+7. iOS/Android 薄客户端（依赖 Hub 推送凭据）。
 
 ### 第 5 段：日历与翻译
 
@@ -327,7 +354,7 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 | 一个 iCloud 账户（应用专用密码） | C 档与 COPY+删除路径实测 | 阻塞 §8-5 的 C 档验证 |
 | 一台 Windows 11 机器 + .NET SDK | WinUI 3 + UniFFI 内存验证 | 阻塞 Windows UI 段 |
 | APNs / FCM 凭据 | 手机推送 | 阻塞移动端 |
-| 是否先做 Hub 还是先做桌面 UI | 排序 | 影响第 4–6 段顺序；Linux UI 栈已定 Slint（D12），仍需确认是否排在 Hub 之前 |
+| ~~是否先做 Hub 还是先做桌面 UI~~ | 排序 | 已定：先做 Hub（第 4 段），桌面 UI 顺延 |
 
 ---
 
@@ -383,6 +410,14 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 - 老库升级时正文只能从 `mail_parts` 的纯文本部件回填；HTML 邮件要等用户打开一次（`fetch_body` 命中缓存后 `index_body_text_if_missing`）才进索引。
 - 中文 1–2 字查询走 LIKE，现在也扫 `body_text`：10k 实测 137 ms，10 万封会明显超预算，扩大索引前先解决分词，不要指望 LIKE。
 - 用 `doveadm save` 投递测试邮件必须 `docker exec -i`；漏掉 `-i` 会读到 EOF，存进去的是空邮件（主题/正文全空，UID 照常增长，很容易误判成解析 bug）。
+- JMAP 的 `Email/changes` 依赖 change 的 `op` 语义：`apply_fetch` 现在写 `message created/updated/removed`；旧库里的 `upsert` 按 `updated` 处理。创建后又在同一窗口删除的 id 两个列表都不出现，创建后又更新的 id 只进 `created`。
+- 读正文会写 `message updated` 变更：`Email/get` 拉取正文后 `state` 会前进，客户端会看到该邮件一次 `updated`。这是有意为之，不要当成重复变更过滤掉。
+- `Email/changes` 的游标判断是三条：`since > latest_seq`、`snapshot_seq > since`、`since < oldest_seq - 1`，任一成立都必须 `cannotCalculateChanges`；只看 `oldest_seq` 会漏掉“压缩后日志为空”的情况。
+- `mailbox_counts` / 关键词过滤用 `json_each(flags)` 精确匹配 `\Seen`/`\Flagged`；不要换成 `flags LIKE '%\Seen%'`，自定义关键字会被误命中。
+- 单部件邮件的正文 section 是空字符串（`BODY[TEXT]`）；JMAP 的 `partId` 不能为空，映射为 `text`/`html`，`bodyValues` 也用同一键，否则客户端按 `partId` 取不到值。
+- `messages_with_locations` 只返回 `missing_at IS NULL` 的位置；回收站里的邮箱不能出现在 JMAP `mailboxIds` 或 `Mailbox/get` 里。
+- Hub 设备令牌明文只在 `/pair` 响应里出现一次；库里只有 SHA-256 哈希。配对码未配置时每进程随机生成并打印到 stdout，不要把它写进日志或提交。
+- 只跑 `cargo clippy` 不会更新 `target/debug/mail-hub`；改完 `mail-api` 后要 `cargo build -p mail-hub` 再重启，否则冒烟仍在跑旧逻辑（本次实测踩过）。
 
 ---
 
