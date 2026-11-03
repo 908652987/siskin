@@ -172,6 +172,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compat"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c97d7ff3c25d6c10d64170c12acaf5d4245e76dece3779c1d92b153a64f11df"
+dependencies = [
+ "futures-core",
+ "futures-io",
+ "once_cell",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1544,12 +1557,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-ffi"
+version = "0.1.0"
+dependencies = [
+ "mail-core",
+ "mail-crypto",
+ "mail-parse",
+ "mail-store",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "uniffi",
+]
+
+[[package]]
 name = "mail-hub"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "futures",
  "mail-api",
  "mail-core",
  "mail-crypto",
@@ -1610,6 +1638,7 @@ name = "mail-sync"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "mail-parse",
  "mail-proto",
  "mail-store",
  "serde_json",
@@ -3001,6 +3030,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7530ae8efeaaa488622865966763fe0294832779fff80508c36d69c6a874a6a"
 dependencies = [
  "anyhow",
+ "async-compat",
  "bytes",
  "once_cell",
  "static_assertions",

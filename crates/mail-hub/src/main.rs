@@ -9,27 +9,33 @@
 //! - `EYRIE_HUB_PAIRING_CODE` (fixed pairing code; otherwise one is generated
 //!   per process and printed to stdout)
 
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use mail_api::{BodySource, FetchedBody, Jmap, RequestError};
-use mail_core::Core;
+use futures::stream;
+use mail_api::{BodySource, FetchedBody, Jmap, RequestError, WriteError, WriteSink};
+use mail_core::{Core, CoreError};
 use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Device, Store};
 use rand::RngCore;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 const SECRET_SERVICE: &str = "mail-client-dev";
@@ -56,10 +62,15 @@ async fn main() -> anyhow::Result<()> {
 
     let core = Arc::new(Core::open(&db, secret_store()?)?);
     let store = core.store();
-    let jmap = Jmap::new(Arc::clone(&store)).with_bodies(Arc::new(CoreBodies {
-        core: Arc::clone(&core),
-        store: Arc::clone(&store),
-    }));
+    let jmap = Jmap::new(Arc::clone(&store))
+        .with_bodies(Arc::new(CoreBodies {
+            core: Arc::clone(&core),
+            store: Arc::clone(&store),
+        }))
+        .with_writes(Arc::new(CoreWrites {
+            core: Arc::clone(&core),
+            store: Arc::clone(&store),
+        }));
 
     let pairing_code = match std::env::var("EYRIE_HUB_PAIRING_CODE") {
         Ok(code) if !code.trim().is_empty() => code.trim().to_string(),
@@ -88,9 +99,9 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/.well-known/jmap", get(session))
         .route("/jmap", post(jmap))
         .route("/pair", post(pair))
-        .route("/download/{account_id}/{blob_id}/{name}", get(unsupported))
+        .route("/download/{account_id}/{blob_id}/{name}", get(download))
         .route("/upload/{account_id}", post(unsupported))
-        .route("/eventsource/", get(unsupported))
+        .route("/eventsource/", get(eventsource))
         .with_state(state)
 }
 
@@ -159,6 +170,172 @@ async fn unsupported() -> Response {
         "urn:ietf:params:jmap:error:serverFail",
         "this Hub endpoint is not implemented",
     )
+}
+
+/// Serves a cached body part or attachment. The blob id is scoped to the
+/// account so a paired device cannot read another account's content.
+async fn download(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((account_id, blob_id, _name)): Path<(i64, String, String)>,
+) -> Response {
+    if let Err(err) = authenticate(&headers, &state) {
+        return auth_error(err);
+    }
+    let blob = match state.store.blob_for_account(account_id, &blob_id) {
+        Ok(Some(blob)) => blob,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "urn:ietf:params:jmap:error:notFound",
+                "blob not found",
+            )
+        }
+        Err(err) => return server_error(err),
+    };
+    let content_type = blob
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let disposition = if blob.attachment {
+        "attachment"
+    } else {
+        "inline"
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::CONTENT_DISPOSITION, disposition.to_string()),
+        ],
+        blob.bytes,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct EventQuery {
+    #[serde(default)]
+    types: Option<String>,
+    #[serde(default)]
+    closeafter: Option<String>,
+    #[serde(default)]
+    ping: Option<String>,
+}
+
+/// JMAP event source (RFC 8620 §7.3). State is polled from the change log;
+/// the Hub has no push transport of its own yet.
+async fn eventsource(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<EventQuery>,
+) -> Response {
+    if let Err(err) = authenticate(&headers, &state) {
+        return auth_error(err);
+    }
+    let ping = parse_seconds(params.ping.as_deref(), 10);
+    let closeafter = parse_seconds(params.closeafter.as_deref(), 60);
+    let types: Vec<String> = params
+        .types
+        .as_deref()
+        .unwrap_or("Email,Mailbox")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| matches!(*name, "Email" | "Mailbox"))
+        .map(str::to_string)
+        .collect();
+    let types = if types.is_empty() {
+        vec!["Email".to_string(), "Mailbox".to_string()]
+    } else {
+        types
+    };
+
+    let accounts: Vec<i64> = match state.store.list_accounts() {
+        Ok(accounts) => accounts.into_iter().map(|account| account.id).collect(),
+        Err(err) => return server_error(err),
+    };
+    let mut interval = tokio::time::interval(ping);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let initial = StreamState {
+        store: Arc::clone(&state.store),
+        accounts,
+        types,
+        last: HashMap::new(),
+        interval,
+        deadline: Instant::now() + closeafter,
+        first: true,
+    };
+    let stream = stream::unfold(initial, |mut state| async move {
+        if Instant::now() >= state.deadline {
+            return None;
+        }
+        if state.first {
+            state.first = false;
+        } else {
+            state.interval.tick().await;
+            if Instant::now() >= state.deadline {
+                return None;
+            }
+        }
+
+        let mut changed = Map::new();
+        for account in &state.accounts {
+            let seq = match state.store.latest_change_seq(*account) {
+                Ok(seq) => seq,
+                Err(err) => {
+                    warn!(%err, account = *account, "event source state read failed");
+                    continue;
+                }
+            };
+            if state.last.get(account) == Some(&seq) {
+                continue;
+            }
+            let mut per_type = Map::new();
+            for name in &state.types {
+                per_type.insert(name.clone(), json!(seq.to_string()));
+            }
+            changed.insert(account.to_string(), Value::Object(per_type));
+            state.last.insert(*account, seq);
+        }
+
+        let event = if changed.is_empty() {
+            Event::default().event("ping").data("{}")
+        } else {
+            Event::default()
+                .event("state")
+                .data(json!({"@type": "StateChange", "changed": changed}).to_string())
+        };
+        Some((Ok::<_, Infallible>(event), state))
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+struct StreamState {
+    store: Arc<Store>,
+    accounts: Vec<i64>,
+    types: Vec<String>,
+    last: HashMap<i64, i64>,
+    interval: tokio::time::Interval,
+    deadline: Instant,
+    first: bool,
+}
+
+/// Accepts both plain seconds and the `PT30S` duration form.
+fn parse_seconds(raw: Option<&str>, default: u64) -> Duration {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Duration::from_secs(default);
+    };
+    let seconds = raw.parse::<u64>().ok().or_else(|| {
+        raw.strip_prefix("PT")
+            .and_then(|raw| raw.strip_suffix('S'))?
+            .parse()
+            .ok()
+    });
+    Duration::from_secs(seconds.unwrap_or(default).clamp(1, 300))
 }
 
 enum AuthError {
@@ -296,12 +473,73 @@ impl BodySource for CoreBodies {
     }
 }
 
+/// Applies JMAP writes through `mail-core`; credentials stay in the core.
+struct CoreWrites {
+    core: Arc<Core>,
+    store: Arc<Store>,
+}
+
+impl CoreWrites {
+    fn email(&self, account_id: i64) -> Result<String, WriteError> {
+        self.store
+            .account_by_id(account_id)
+            .map_err(|err| WriteError::Server(err.to_string()))?
+            .map(|account| account.email)
+            .ok_or_else(|| WriteError::NotFound(format!("account {account_id} not found")))
+    }
+}
+
+impl WriteSink for CoreWrites {
+    fn set_keywords<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+        add: Vec<String>,
+        remove: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            let email = self.email(account_id)?;
+            self.core
+                .set_keywords(&email, message_id, &add, &remove)
+                .await
+                .map_err(core_write_error)
+        })
+    }
+
+    fn move_message<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+        mailbox_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            let email = self.email(account_id)?;
+            self.core
+                .move_message(&email, message_id, mailbox_id)
+                .await
+                .map_err(core_write_error)
+        })
+    }
+}
+
+fn core_write_error(err: CoreError) -> WriteError {
+    match err {
+        CoreError::MessageNotFound(_) | CoreError::MailboxNotFound(_) => {
+            WriteError::NotFound(err.to_string())
+        }
+        CoreError::Unsupported(_)
+        | CoreError::MultipleLocations(_)
+        | CoreError::UnknownKeyword(_) => WriteError::NotSupported(err.to_string()),
+        other => WriteError::Server(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use mail_store::DbKey;
+    use mail_store::{BodyPartInput, DbKey, NewMessage};
     use tower::ServiceExt;
 
     fn state() -> Arc<AppState> {
@@ -419,5 +657,146 @@ mod tests {
             payload["methodResponses"][0][1]["type"],
             json!("accountNotFound")
         );
+    }
+
+    fn seed_blob(state: &Arc<AppState>) -> (i64, String) {
+        let account = state
+            .store
+            .create_account("imap", "me@example.com", None, "secret", &json!({}))
+            .expect("account");
+        let inbox = state
+            .store
+            .ensure_mailbox(account, "INBOX", Some("inbox"))
+            .expect("inbox")
+            .id;
+        state
+            .store
+            .apply_fetch(
+                account,
+                inbox,
+                &[NewMessage {
+                    uid: 1,
+                    message_id: Some("<1@example.com>".to_string()),
+                    subject: Some("hello".to_string()),
+                    from: vec!["Alice <alice@example.com>".to_string()],
+                    to: vec!["me@example.com".to_string()],
+                    sent_at: Some(1_700_000_000),
+                    size: Some(10),
+                    flags: Vec::new(),
+                    snippet: Some("hello".to_string()),
+                }],
+                &[],
+            )
+            .expect("fetch");
+        let message_id = state.store.list_messages(account, 10, 0).unwrap()[0].id;
+        state
+            .store
+            .store_body_parts(
+                account,
+                message_id,
+                &[BodyPartInput {
+                    part: "1",
+                    content_type: "text/plain",
+                    charset: Some("utf-8"),
+                    is_html: false,
+                    data: b"hello blob",
+                }],
+                None,
+            )
+            .expect("body");
+        let body = state
+            .store
+            .message_body(message_id)
+            .expect("message")
+            .expect("body");
+        (account, body.parts[0].blob_hash.clone().expect("blob id"))
+    }
+
+    #[tokio::test]
+    async fn download_requires_a_token_and_serves_only_known_blobs() {
+        let state = state();
+        let (account, blob_id) = seed_blob(&state);
+
+        let anonymous = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/download/{account}/{blob_id}/file.txt"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let token = paired_token(&state).await;
+        let missing = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/download/{account}/{}/file.txt", "0".repeat(64)))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/download/{account}/{blob_id}/file.txt"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&bytes[..], b"hello blob");
+    }
+
+    #[tokio::test]
+    async fn eventsource_streams_state_until_closeafter() {
+        let state = state();
+        let anonymous = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri("/eventsource/?closeafter=1&ping=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let token = paired_token(&state).await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/eventsource/?types=Email&closeafter=1&ping=1")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")));
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("stream closed")
+        .expect("body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("ping") || text.contains("StateChange"));
     }
 }

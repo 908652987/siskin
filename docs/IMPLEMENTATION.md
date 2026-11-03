@@ -157,12 +157,27 @@ flowchart LR
 
 - 分层：`mail-api` 只做 JMAP 语义（Session、请求/响应、错误映射），不依赖 HTTP；`mail-hub` 是 axum 二进制，负责配对、鉴权、路由与按需拉正文。依赖方向保持 `mail-hub → mail-api, mail-core`，`mail-api → mail-store`。
 - 认证：配对码（`EYRIE_HUB_PAIRING_CODE`，未设置则每进程随机生成并打印一次）换 32 字节随机令牌；库中 `hub_devices` 只存 SHA-256 哈希与 `last_seen_at`，令牌只在配对响应里出现一次。
-- 端点：`GET /.well-known/jmap`（Session）、`POST /jmap`、`POST /pair`；`/eventsource/`、`/upload/{accountId}/`、`/download/...` 明确返回 501，不假装支持。
-- 已实现 method：`Mailbox/get`（角色映射、`totalEmails`/`unreadEmails`、`myRights` 全为只读）、`Email/query`（`inMailbox`、`text`、`hasKeyword`/`notKeyword` 的 `$seen`/`$flagged`、`before`/`after`、position/limit，`total` 与分页一致）、`Email/get`（`mailboxIds` 为全部在线位置并集、keywords 为位置并集、附件元数据、`bodyValues`）、`Email/changes`（`created`/`updated`/`destroyed`）。
+- 端点：`GET /.well-known/jmap`（Session）、`POST /jmap`、`POST /pair`、`GET /eventsource/`（SSE）、`GET /download/{accountId}/{blobId}/{name}`；`/upload/{accountId}/` 仍返回 501。
+- 已实现 method：`Mailbox/get`（角色映射、`totalEmails`/`unreadEmails`、`myRights` 随写入能力切换）、`Mailbox/changes`、`Email/query`（`inMailbox`、`text`、`hasKeyword`/`notKeyword` 的 `$seen`/`$flagged`、`before`/`after`、position/limit，`total` 与分页一致）、`Email/get`（`mailboxIds` 为全部在线位置并集、keywords 为位置并集、附件元数据与 `blobId`、`bodyValues`）、`Email/changes`、`Email/set`（只更新 `keywords` 与 `mailboxIds`；`create`/`destroy` 按对象返回 `notSupported`）。
+- 写路径：`mail-api::WriteSink` 由 Hub 用 `mail-core` 实现，保持 `mail-api → mail-store` 依赖方向。`$seen`/`$flagged`/`$answered`/`$draft`/`$forwarded` 映射为 IMAP 标志；先对每个在线位置 `STORE`，全部成功后才更新本地 flags 并写 `message updated`。移动只接受单副本消息，走 `MOVE` 或 `COPY+EXPUNGE`，随后同步目标邮箱取得新 UID、再删源位置；多副本返回 `notSupported`。
 - 不支持的条件显式失败：其他 filter/sort 返回 `unsupportedFilter`/`unsupportedSort`，未知 method 返回 `unknownMethod`，不静默忽略。排序固定为 `receivedAt` 降序 + id 降序，单次查询上限 1,000 条。
-- 变更语义：`apply_fetch` 现在写 `message created/updated/removed`；同一窗口内创建后又删除的 id 不出现在任何列表，创建后又更新的 id 只出现在 `created`。游标早于快照水位或早于最旧 `changes` 行时返回 `cannotCalculateChanges`。
-- 正文：`Email/get` 只在客户端请求 `fetchTextBodyValues`/`fetchHTMLBodyValues` 时返回 `bodyValues`；未缓存时通过 `mail_api::BodySource`（Hub 用 `mail-core::fetch_body`）按需拉取，失败返回 `serverFail` 而不是空正文。单部件消息的空 section 在 JMAP 层映射为 `text`/`html`。
-- 新增存储查询：`mailbox_counts`（含 `\Seen` 未读数，json_each 检查 flags）、`query_messages`（邮箱/正文/关键词/日期过滤 + 总数）、`messages_with_locations`（全部在线位置）；schema v7 增加 `hub_devices`。
+- 变更语义：`apply_fetch` 写 `message created/updated/removed`，`ensure_mailbox` 写 `mailbox created/restored`；`Email/changes` 与 `Mailbox/changes` 共用游标规则但按 `entity_type` 过滤。同一窗口内创建后又删除的 id 不出现在任何列表，创建后又更新的 id 只出现在 `created`。游标早于快照水位或早于最旧 `changes` 行时返回 `cannotCalculateChanges`。
+- 正文：`Email/get` 只在客户端请求 `fetchTextBodyValues`/`fetchHTMLBodyValues` 时返回 `bodyValues`；未缓存时通过 `mail_api::BodySource`（Hub 用 `mail-core::fetch_body`）按需拉取，失败返回 `serverFail` 而不是空正文。单部件消息的空 section 在 JMAP 层映射为 `text`/`html`。缓存后的正文/附件在 `blobId` 中暴露散列 hex，`/download` 只在 blob 属于该账户时返回字节。
+- SSE：`types` 选 `Email`/`Mailbox`，`closeafter`/`ping` 接受秒数或 `PTxxS`；连接建立即发一次 `state`，之后状态变化发 `state`、空闲发 `ping`。Hub 不持有推送通道，APNs/FCM 未接。
+- 新增存储查询：`mailbox_counts`、`query_messages`、`messages_with_locations`、`message_location_targets`、`update_flags`、`remove_location`、`blob_for_account`、`changes_since_type`、`list_devices`/`revoke_device`；schema v7 增加 `hub_devices`。
+
+---
+
+## 5.3 macOS SwiftUI 壳
+
+- 分层：`mail-ffi` 用 UniFFI 暴露 `MailClient`（`open`、`accounts`、`add_account`、`mailboxes`、`messages`、`body`、`set_seen`、`set_flagged`、`attachment`、`move_message`、`sync`），只依赖 `mail-core`/`mail-parse`；`apps/macos` 是 SwiftPM 可执行文件，`main.swift` 用 AppKit 创建窗口并挂 `NSHostingView`，不依赖 Xcode 工程或 `.app` 包。
+- 数据路径：`AppModel` 用 `async/await` 调 UniFFI；列表走 `Store::query_messages`（统一收件箱去重、正文 FTS、分页），正文走 `Core::fetch_body`（命中缓存时纯本地），标已读走 `Core::set_keywords`（服务器成功后才改本地）。打开未读邮件会自动标已读并刷新计数。
+- 绑定生成：`apps/macos/build.sh` 编译 `mail-ffi`，用 `uniffi-bindgen generate --library target/debug/libmail_ffi.dylib --language swift` 生成 Swift/头/modulemap，把静态库复制到 `apps/macos/libs/` 后 `swift build`。生成物全部 gitignored，改 FFI 公开类型后必须重跑脚本。
+- 当前范围：账户选择与新增（Gmail/QQ/88/自定义预设）、邮箱/邮件列表、HTML（WKWebView，JS 禁用）+ 纯文本阅读、搜索、同步、标已读/未读、标星、移动、分页加载、附件保存、zh-Hans/en 国际化；撰写、通知、`.app` 打包未做。
+- 预设来源：`mail-ffi::provider_presets` 调用 `mail_core::presets`，返回主机/端口/TLS；88 的 IMAP 主机按邮箱域名（88.com / 111.com / email.cn）推导，无邮箱时回退 `imap.88.com`。切换传输安全时端口在 993/143 之间联动。
+- 布局：为避开 `NSHostingView` 下 `List(selection:)` 的 NSTableView 重入告警，侧栏与消息列表都用 `ScrollView + LazyVStack`；根视图显式画 `windowBackgroundColor`，分栏显式填满高度。HTML/纯文本切换单独占一行，避免英文长按钮把详情头部撑宽裁切。
+- 国际化：`L10n` 不依赖 `Bundle.preferredLocalizations`（本机会错误返回 `en`），按 `Locale.preferredLanguages`/`SISKIN_LANG` 直接读取 `.lproj/Localizable.strings`；RFC 2047 主题与发件人在 `mail-sync` 入库时解码，`mail-ffi` 再兜底解码旧数据。
+- 验证：`SiskinSmoke` 对 Dovecot 10,016 封库返回 1 账户 / 8 邮箱 / total=10,016，完成正文、附件、`$seen`/`$flagged` 往返；`Siskin` 窗口 1120×760，中英文快照分别渲染；`SISKIN_SNAPSHOT` 在应用内输出 PNG，绕过本机 TCC 屏幕录制限制。
 
 ---
 
@@ -272,7 +287,7 @@ cargo test --workspace
 11. **主密钥无轮换与自动备份**。`export-key`/`import-key` 支持人工备份到密码管理器，但主密钥仍只有钥匙串一份，且库密钥不能在线轮换。
 12. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应已进入服务器 Trash 并同步到本地）；回收站不提供手工恢复，同名单重建时旧数据以 `(local trash <id>)` 行保留至保留期。
 13. **多邮箱会让 `list/search` 去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选的 UI 需要新的查询接口。
-14. **JMAP 子集未覆盖写操作与推送**。`Mailbox/changes`、`Email/set|import`、`Thread/get`、SSE、上传/下载均未实现（明确返回 501 或 `unknownMethod`）；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序。设备配对后没有吊销命令，需直接删 `hub_devices` 行。
+14. **JMAP 写操作只覆盖已读/标志与单副本移动**。`Email/import`、`Thread/get`、上传、APNs/FCM 未实现；`Email/set` 不支持创建/销毁，多副本邮件移动与自定义关键字返回 `notSupported`；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序。设备吊销已提供 `mail-cli revoke-device`。
 15. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。
 16. **Hub 正文拉取是串行且同步的**。一次 `Email/get` 请求内逐封拉取，未做并发限流；多封大邮件会让单次请求变慢。
 
@@ -282,7 +297,7 @@ cargo test --workspace
 
 按依赖顺序：
 
-1. Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动）、SSE 推送、附件下载
+1. ~~Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动）、SSE 推送、附件下载~~（完成；APNs/FCM 仍缺凭据）
 2. 移动端薄客户端（依赖 Hub 推送与 APNs/FCM 凭据）
 3. 发信补齐：HTML、附件、草稿与 Sent 去重
 4. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）

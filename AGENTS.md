@@ -40,10 +40,10 @@ cargo test --workspace
 ## 目录边界（违反即回退）
 
 ```
-mail-core → mail-sync → mail-proto
+mail-core → mail-sync → mail-proto / mail-parse（仅 RFC 2047 头部解码）
          → mail-store → (sqlite)
          → mail-parse / mail-crypto / mail-translate
-mail-ffi  → mail-core
+mail-ffi  → mail-core / mail-parse
 mail-api  → mail-store
 mail-hub  → mail-api, mail-core
 ```

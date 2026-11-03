@@ -79,6 +79,7 @@ flowchart TB
   CAL <--> PROTO
   PROTO <--> SYNC <--> STORE
   PARSE <--> STORE
+  PARSE <--> SYNC
   STORE <--> XLATE
   FFI <--> STORE
   FFI <--> MAC & WIN & IOS & AND
@@ -126,12 +127,12 @@ flowchart TB
 依赖方向（单向，禁止反向）：
 
 ```
-mail-core → mail-sync → mail-proto
+mail-core → mail-sync → mail-proto, mail-parse（仅头部解码）
          → mail-store → (sqlite)
          → mail-parse
          → mail-crypto
          → mail-translate
-mail-ffi → mail-core
+mail-ffi → mail-core, mail-parse
 apps/linux → mail-core
 mail-api → mail-store
 mail-hub → mail-api, mail-core
@@ -394,14 +395,16 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 | GET | `/.well-known/jmap` | Session 对象（需 Bearer 设备令牌） |
 | POST | `/jmap` | JMAP 请求体：`{using, methodCalls}` |
 | POST | `/pair` | 用配对码换取设备令牌（只返回一次） |
-| GET | `/eventsource/` | SSE 推送状态变更（未实现，返回 501） |
+| GET | `/eventsource/` | SSE 状态变更（`types`、`closeafter`、`ping`） |
 | POST | `/upload/{accountId}/` | 附件上传（未实现，返回 501） |
-| GET | `/download/{accountId}/{blobId}/{name}` | 附件下载（未实现，返回 501） |
+| GET | `/download/{accountId}/{blobId}/{name}` | 正文/附件下载（blobId 为缓存散列 hex） |
 
-已实现的 method：`Mailbox/get`、`Email/query`、`Email/get`、`Email/changes`；
-其余（`Mailbox/changes`、`Email/set|import`、`Thread/get`、`Core/echo`、日历与身份）
-返回 `unknownMethod`。客户端不在支持范围内的筛选/排序条件返回
-`unsupportedFilter` / `unsupportedSort`，不做静默忽略。
+已实现的 method：`Mailbox/get`、`Mailbox/changes`、`Email/query`、`Email/get`、
+`Email/changes`、`Email/set`（仅更新 `keywords` 与 `mailboxIds`）；
+其余（`Email/import`、`Thread/get`、`Core/echo`、日历与身份）返回
+`unknownMethod`。`Email/set` 的 `create`/`destroy` 按对象返回 `notSupported`。
+客户端不在支持范围内的筛选/排序条件返回 `unsupportedFilter` /
+`unsupportedSort`，不做静默忽略。
 
 认证：配对码换 32 字节随机令牌，库中只存 SHA-256 哈希；每次请求校验
 `Authorization: Bearer <token>` 并更新 `last_seen_at`。
@@ -414,7 +417,8 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 
 本地库的变更日志有界：超过 `change_log_max_rows`（默认 20,000）后，`compact_changes` 在当前水位写一份全量快照并删除被覆盖的 `changes` 行。水位（`latest_change_seq`）取快照 seq 与剩余 `changes` 最大 seq 的较大值，因此压缩不会让状态字符串倒退；早于最旧保留行的游标由 `change_window` 识别并要求重载快照。
 
-推送：SSE 事件只携带 `{type, state}`，不含正文；手机端由 Hub 转 APNs/FCM 静默推送，载荷只含"有新变更"。
+推送：SSE 事件只携带 `{type, state}`，不含正文。Hub 侧已实现 SSE；手机端由 Hub 转
+APNs/FCM 静默推送（载荷只含"有新变更"）尚未实现，等待推送凭据。
 
 ---
 

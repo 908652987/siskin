@@ -8,6 +8,7 @@ members = [
   "crates/mail-sync",
   "crates/mail-core",
   "crates/mail-cli",
+  "crates/mail-ffi",
   "crates/mail-api",
   "crates/mail-hub",
   "spike/imap-probe",

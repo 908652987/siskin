@@ -1,10 +1,11 @@
 //! JMAP subset (RFC 8620 / RFC 8621) over the local store.
 //!
 //! Transport-agnostic: the Hub owns HTTP, authentication and network access.
-//! Implemented methods are `Mailbox/get`, `Email/query`, `Email/get` and
-//! `Email/changes`; everything else returns a JMAP `unknownMethod` error.
-//! Bodies are read from the store and fetched through [`BodySource`] when the
-//! client asks for values that are not cached yet.
+//! Implemented methods are `Mailbox/get`, `Mailbox/changes`, `Email/query`,
+//! `Email/get`, `Email/changes` and `Email/set`; everything else returns a JMAP
+//! `unknownMethod` error. Bodies are read from the store and fetched through
+//! [`BodySource`]; writes go through [`WriteSink`] so this crate keeps the
+//! `mail-api -> mail-store` dependency edge.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -25,8 +26,13 @@ pub const MAIL_CAPABILITY: &str = "urn:ietf:params:jmap:mail";
 /// Upper bounds advertised in the Session object and enforced here.
 pub const MAX_CALLS_IN_REQUEST: usize = 32;
 pub const MAX_OBJECTS_IN_GET: usize = 256;
+pub const MAX_OBJECTS_IN_SET: usize = 64;
 pub const MAX_MESSAGES_PER_QUERY: i64 = 1_000;
 pub const MAX_CHANGES: i64 = 1_000;
+
+/// Keywords the store can round-trip to IMAP flags.
+pub const SUPPORTED_KEYWORDS: [&str; 5] =
+    ["$seen", "$flagged", "$answered", "$draft", "$forwarded"];
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -44,6 +50,8 @@ pub enum ApiError {
     UnsupportedSort,
     #[error("cannot calculate changes")]
     CannotCalculateChanges,
+    #[error("state mismatch")]
+    StateMismatch,
     #[error("body fetch failed: {0}")]
     BodyFetch(String),
 }
@@ -59,6 +67,7 @@ impl ApiError {
             ApiError::UnsupportedFilter => "unsupportedFilter",
             ApiError::UnsupportedSort => "unsupportedSort",
             ApiError::CannotCalculateChanges => "cannotCalculateChanges",
+            ApiError::StateMismatch => "stateMismatch",
             ApiError::BodyFetch(_) => "serverFail",
         }
     }
@@ -105,9 +114,37 @@ pub trait BodySource: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<FetchedBody, String>> + Send + 'a>>;
 }
 
+/// Failure of one write, mapped to a JMAP per-object error type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    NotFound(String),
+    NotSupported(String),
+    Server(String),
+}
+
+/// Write access to the mail server. Implemented by the Hub with `mail-core`;
+/// the trait keeps IMAP types and credentials out of this crate.
+pub trait WriteSink: Send + Sync {
+    fn set_keywords<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+        add: Vec<String>,
+        remove: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>>;
+
+    fn move_message<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+        mailbox_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>>;
+}
+
 pub struct Jmap {
     store: Arc<Store>,
     bodies: Option<Arc<dyn BodySource>>,
+    writes: Option<Arc<dyn WriteSink>>,
 }
 
 impl Jmap {
@@ -115,11 +152,17 @@ impl Jmap {
         Self {
             store,
             bodies: None,
+            writes: None,
         }
     }
 
     pub fn with_bodies(mut self, bodies: Arc<dyn BodySource>) -> Self {
         self.bodies = Some(bodies);
+        self
+    }
+
+    pub fn with_writes(mut self, writes: Arc<dyn WriteSink>) -> Self {
+        self.writes = Some(writes);
         self
     }
 
@@ -159,7 +202,7 @@ impl Jmap {
                     "maxConcurrentRequests": 4,
                     "maxCallsInRequest": MAX_CALLS_IN_REQUEST,
                     "maxObjectsInGet": MAX_OBJECTS_IN_GET,
-                    "maxObjectsInSet": 0,
+                    "maxObjectsInSet": if self.writes.is_some() { MAX_OBJECTS_IN_SET } else { 0 },
                     "collationAlgorithms": ["i;ascii-casemap"],
                 },
                 MAIL_CAPABILITY: {},
@@ -235,9 +278,11 @@ impl Jmap {
     async fn dispatch(&self, name: &str, args: &Map<String, Value>) -> Result<Value, ApiError> {
         match name {
             "Mailbox/get" => self.mailbox_get(args),
+            "Mailbox/changes" => self.changes(args, "mailbox"),
             "Email/query" => self.email_query(args),
             "Email/get" => self.email_get(args).await,
-            "Email/changes" => self.email_changes(args),
+            "Email/changes" => self.changes(args, "message"),
+            "Email/set" => self.email_set(args).await,
             other => Err(ApiError::UnknownMethod(other.to_string())),
         }
     }
@@ -300,14 +345,15 @@ impl Jmap {
             object.insert("totalThreads".into(), json!(total));
             object.insert("unreadThreads".into(), json!(unread));
             object.insert("isSubscribed".into(), json!(true));
+            let can_write = self.writes.is_some();
             object.insert(
                 "myRights".into(),
                 json!({
                     "mayReadItems": true,
                     "mayAddItems": false,
-                    "mayRemoveItems": false,
-                    "maySetSeen": false,
-                    "maySetKeywords": false,
+                    "mayRemoveItems": can_write,
+                    "maySetSeen": can_write,
+                    "maySetKeywords": can_write,
                     "mayCreateChild": false,
                     "mayRename": false,
                     "mayDelete": false,
@@ -415,7 +461,9 @@ impl Jmap {
         }))
     }
 
-    fn email_changes(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+    /// `Email/changes` and `Mailbox/changes` share cursor rules; only the
+    /// entity type and operation names differ.
+    fn changes(&self, args: &Map<String, Value>, entity_type: &str) -> Result<Value, ApiError> {
         let account_id = self.account_id(args)?;
         let since: i64 = args
             .get("sinceState")
@@ -438,7 +486,9 @@ impl Jmap {
             return Err(ApiError::CannotCalculateChanges);
         }
 
-        let rows = self.store.changes_since(account_id, since, limit + 1)?;
+        let rows = self
+            .store
+            .changes_since_type(account_id, entity_type, since, limit + 1)?;
         let has_more = rows.len() as i64 > limit;
         let rows = &rows[..rows.len().min(limit as usize)];
 
@@ -452,15 +502,15 @@ impl Jmap {
         let mut last: HashMap<String, Last> = HashMap::new();
         let mut created_since: HashSet<String> = HashSet::new();
         for row in rows {
-            if row.entity_type != "message" {
-                continue;
-            }
-            let op = match row.op.as_str() {
-                "created" => Last::Created,
-                "removed" => Last::Removed,
+            let op = match (entity_type, row.op.as_str()) {
+                ("message", "created") => Last::Created,
+                ("message", "removed") => Last::Removed,
                 // `upsert` is what builds written before the created/updated
                 // split recorded; treat it as an update.
-                "updated" | "upsert" => Last::Updated,
+                ("message", "updated" | "upsert") => Last::Updated,
+                ("mailbox", "created") => Last::Created,
+                ("mailbox", "removed" | "retired") => Last::Removed,
+                ("mailbox", "updated" | "restored") => Last::Updated,
                 _ => continue,
             };
             if op == Last::Created {
@@ -479,7 +529,7 @@ impl Jmap {
             let was_created = created_since.contains(&id);
             match op {
                 Some(Last::Created) => created.push(id),
-                // A message created after `sinceState` is reported as created
+                // An object created after `sinceState` is reported as created
                 // even if it was modified again in the same window.
                 Some(Last::Updated) if was_created => created.push(id),
                 Some(Last::Updated) => updated.push(id),
@@ -503,6 +553,194 @@ impl Jmap {
             "updated": updated,
             "destroyed": destroyed,
         }))
+    }
+
+    /// `Email/set` supports keyword and mailbox updates. Creating or destroying
+    /// emails is reported per object instead of failing the whole method.
+    async fn email_set(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let old_state = self.store.latest_change_seq(account_id)?.to_string();
+        if let Some(value) = args.get("ifInState") {
+            if !value.is_null() && value.as_str() != Some(old_state.as_str()) {
+                return Err(ApiError::StateMismatch);
+            }
+        }
+
+        let create = optional_object(args, "create")?;
+        let destroy = optional_array(args, "destroy")?;
+        let update = optional_object(args, "update")?;
+        let total =
+            create.map_or(0, Map::len) + destroy.map_or(0, Vec::len) + update.map_or(0, Map::len);
+        if total > MAX_OBJECTS_IN_SET {
+            return Err(ApiError::InvalidArguments);
+        }
+
+        let mut updated = Map::new();
+        let mut not_updated = Map::new();
+        let mut not_created = Map::new();
+        let mut not_destroyed = Map::new();
+
+        if let Some(create) = create {
+            for id in create.keys() {
+                not_created.insert(
+                    id.clone(),
+                    json!({"type": "notSupported", "description": "creating emails is not supported"}),
+                );
+            }
+        }
+        if let Some(destroy) = destroy {
+            for id in destroy {
+                let id = id.as_str().ok_or(ApiError::InvalidArguments)?;
+                not_destroyed.insert(
+                    id.to_string(),
+                    json!({"type": "notSupported", "description": "destroying emails is not supported"}),
+                );
+            }
+        }
+        if let Some(update) = update {
+            for (raw_id, patch) in update {
+                let message_id: i64 = raw_id.parse().map_err(|_| ApiError::InvalidArguments)?;
+                let patch = patch.as_object().ok_or(ApiError::InvalidArguments)?;
+                match self.email_update(account_id, message_id, patch).await {
+                    Ok(()) => {
+                        updated.insert(raw_id.clone(), json!({}));
+                    }
+                    Err(err) => {
+                        not_updated.insert(raw_id.clone(), write_error_object(&err));
+                    }
+                }
+            }
+        }
+
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "oldState": old_state,
+            "newState": self.store.latest_change_seq(account_id)?.to_string(),
+            "created": {},
+            "updated": updated,
+            "destroyed": [],
+            "notCreated": not_created,
+            "notUpdated": not_updated,
+            "notDestroyed": not_destroyed,
+        }))
+    }
+
+    async fn email_update(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        patch: &Map<String, Value>,
+    ) -> Result<(), WriteError> {
+        let existing = self
+            .store
+            .messages_with_locations(account_id, &[message_id])
+            .map_err(|err| WriteError::Server(err.to_string()))?;
+        if existing.is_empty() {
+            return Err(WriteError::NotFound(format!(
+                "email {message_id} not found"
+            )));
+        }
+
+        let mut add = Vec::new();
+        let mut remove = Vec::new();
+        let mut destination = None;
+        for (key, value) in patch {
+            match key.as_str() {
+                "keywords" => match value {
+                    Value::Null => remove.extend(SUPPORTED_KEYWORDS.map(str::to_string)),
+                    Value::Object(map) if map.is_empty() => {
+                        remove.extend(SUPPORTED_KEYWORDS.map(str::to_string));
+                    }
+                    Value::Object(map) => {
+                        for (keyword, present) in map {
+                            match present {
+                                Value::Bool(true) => add.push(keyword.clone()),
+                                Value::Bool(false) | Value::Null => remove.push(keyword.clone()),
+                                _ => {
+                                    return Err(WriteError::NotSupported(
+                                        "keyword values must be booleans".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(WriteError::NotSupported(
+                            "keywords must be an object or null".to_string(),
+                        ))
+                    }
+                },
+                "mailboxIds" => {
+                    let map = value.as_object().ok_or_else(|| {
+                        WriteError::NotSupported("mailboxIds must be an object".to_string())
+                    })?;
+                    let mut ids = Vec::new();
+                    for (raw, present) in map {
+                        if present.as_bool() == Some(true) {
+                            ids.push(raw.parse::<i64>().map_err(|_| {
+                                WriteError::NotSupported(format!("bad mailbox id {raw}"))
+                            })?);
+                        }
+                    }
+                    if ids.len() != 1 {
+                        return Err(WriteError::NotSupported(
+                            "mailboxIds must name exactly one mailbox".to_string(),
+                        ));
+                    }
+                    destination = Some(ids[0]);
+                }
+                other if other.starts_with("keywords/") => {
+                    let keyword = &other["keywords/".len()..];
+                    match value {
+                        Value::Bool(true) => add.push(keyword.to_string()),
+                        Value::Bool(false) | Value::Null => remove.push(keyword.to_string()),
+                        _ => {
+                            return Err(WriteError::NotSupported(format!(
+                                "{other} must be a boolean"
+                            )))
+                        }
+                    }
+                }
+                other => {
+                    return Err(WriteError::NotSupported(format!(
+                        "property {other} is not writable"
+                    )))
+                }
+            }
+        }
+
+        // A patch may name the same keyword through `keywords` and
+        // `keywords/<name>`; removal wins and duplicates are dropped.
+        remove.sort();
+        remove.dedup();
+        add.retain(|keyword| !remove.contains(keyword));
+        add.sort();
+        add.dedup();
+
+        for keyword in add.iter().chain(remove.iter()) {
+            if !SUPPORTED_KEYWORDS.contains(&keyword.as_str()) {
+                return Err(WriteError::NotSupported(format!(
+                    "keyword {keyword} is not supported"
+                )));
+            }
+        }
+        if add.is_empty() && remove.is_empty() && destination.is_none() {
+            return Ok(());
+        }
+
+        let sink = self
+            .writes
+            .as_ref()
+            .ok_or_else(|| WriteError::NotSupported("writing is disabled".to_string()))?;
+        if !add.is_empty() || !remove.is_empty() {
+            sink.set_keywords(account_id, message_id, add, remove)
+                .await?;
+        }
+        if let Some(mailbox_id) = destination {
+            sink.move_message(account_id, message_id, mailbox_id)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Store body first, then fetch from the server only when the client asked
@@ -651,6 +889,42 @@ fn flag(args: &Map<String, Value>, name: &str) -> bool {
     args.get(name).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn optional_object<'a>(
+    args: &'a Map<String, Value>,
+    name: &str,
+) -> Result<Option<&'a Map<String, Value>>, ApiError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(map)),
+        _ => Err(ApiError::InvalidArguments),
+    }
+}
+
+fn optional_array<'a>(
+    args: &'a Map<String, Value>,
+    name: &str,
+) -> Result<Option<&'a Vec<Value>>, ApiError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(values)) => Ok(Some(values)),
+        _ => Err(ApiError::InvalidArguments),
+    }
+}
+
+fn write_error_object(err: &WriteError) -> Value {
+    match err {
+        WriteError::NotFound(detail) => {
+            json!({"type": "notFound", "description": detail})
+        }
+        WriteError::NotSupported(detail) => {
+            json!({"type": "notSupported", "description": detail})
+        }
+        WriteError::Server(detail) => {
+            json!({"type": "serverFail", "description": detail})
+        }
+    }
+}
+
 fn properties(args: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
     match args.get("properties") {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -792,30 +1066,48 @@ fn email_object(
 
     // Single-part messages are cached under the empty section id; JMAP needs a
     // non-empty partId, so those become "text" / "html".
-    let text_part = body
+    let text_entry = body
         .parts
         .iter()
         .find(|part| !part.is_html && !part.part.is_empty())
-        .map(|part| part.part.clone());
-    let html_part = body
+        .or_else(|| body.parts.iter().find(|part| !part.is_html));
+    let html_entry = body
         .parts
         .iter()
         .find(|part| part.is_html && !part.part.is_empty())
-        .map(|part| part.part.clone());
-    let text_id = text_part.clone().unwrap_or_else(|| "text".to_string());
-    let html_id = html_part.clone().unwrap_or_else(|| "html".to_string());
+        .or_else(|| body.parts.iter().find(|part| part.is_html));
+    let text_id = text_entry
+        .map(|part| part.part.clone())
+        .unwrap_or_else(|| "text".to_string());
+    let html_id = html_entry
+        .map(|part| part.part.clone())
+        .unwrap_or_else(|| "html".to_string());
+    let text_blob = text_entry.and_then(|part| part.blob_hash.clone());
+    let html_blob = html_entry.and_then(|part| part.blob_hash.clone());
 
     let mut text_body = Vec::new();
     let mut html_body = Vec::new();
     let mut body_values = Map::new();
     if let Some(text) = &body.text {
-        text_body.push(body_part(&text_id, "text/plain", text.len(), None));
+        text_body.push(body_part(
+            &text_id,
+            text_blob.as_deref(),
+            "text/plain",
+            text.len(),
+            None,
+        ));
         if fetch_text && !text.is_empty() {
             body_values.insert(text_id.clone(), body_value(text, max_body_bytes));
         }
     }
     if let Some(html) = &body.html {
-        html_body.push(body_part(&html_id, "text/html", html.len(), None));
+        html_body.push(body_part(
+            &html_id,
+            html_blob.as_deref(),
+            "text/html",
+            html.len(),
+            None,
+        ));
         if fetch_html && !html.is_empty() {
             body_values.insert(html_id.clone(), body_value(html, max_body_bytes));
         }
@@ -830,6 +1122,7 @@ fn email_object(
         .map(|attachment| {
             body_part(
                 &attachment.part,
+                attachment.blob_hash.as_deref(),
                 &attachment.content_type,
                 attachment.size as usize,
                 attachment.filename.as_deref(),
@@ -841,11 +1134,17 @@ fn email_object(
 }
 
 /// One `EmailBodyPart` (RFC 8621 §4.1.4) with the properties the client needs
-/// to render or list it. `blobId` stays null until blob download is served.
-fn body_part(part_id: &str, content_type: &str, size: usize, name: Option<&str>) -> Value {
+/// to render or list it. `blobId` is null until the bytes are cached.
+fn body_part(
+    part_id: &str,
+    blob_id: Option<&str>,
+    content_type: &str,
+    size: usize,
+    name: Option<&str>,
+) -> Value {
     json!({
         "partId": part_id,
-        "blobId": Value::Null,
+        "blobId": blob_id,
         "size": size,
         "name": name,
         "type": content_type,

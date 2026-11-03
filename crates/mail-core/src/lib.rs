@@ -15,7 +15,8 @@ use mail_proto::smtp::{SmtpConfig, SmtpSession};
 use mail_proto::{IdleEvent, ImapConfig, ImapSession, ProtoError, Security, Tier};
 use mail_store::{
     Account, AttachmentMetaInput, BodyPartInput, BodyState, ChangeWindow, Compaction, DbKey,
-    MessageBody, MessageContext, PartMetaInput, PurgeStats, Store, StoreError,
+    LocationTarget, Mailbox, MessageBody, MessageContext, PartMetaInput, PurgeStats, Store,
+    StoreError,
 };
 use mail_sync::{plan_mailboxes, pop3_uid, MailboxTarget, Pop3SyncEngine, SyncEngine, SyncError};
 pub use mail_sync::{AccountSyncReport, SyncOutcome};
@@ -53,6 +54,14 @@ pub enum CoreError {
     MessageGone(i64),
     #[error("message {message_id} has no attachment part {part}")]
     AttachmentNotFound { message_id: i64, part: String },
+    #[error("operation not supported: {0}")]
+    Unsupported(&'static str),
+    #[error("message {0} is stored in more than one mailbox; this write needs a single copy")]
+    MultipleLocations(i64),
+    #[error("unknown keyword: {0}")]
+    UnknownKeyword(String),
+    #[error("unknown mailbox: {0}")]
+    MailboxNotFound(i64),
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;
@@ -978,6 +987,169 @@ impl Core {
         Ok(data)
     }
 
+    /// Adds and removes JMAP keywords on every live copy of a message. The
+    /// server is updated first; local flags change only after every STORE
+    /// succeeded, so a failed write never fakes success.
+    pub async fn set_keywords(
+        &self,
+        email: &str,
+        message_id: i64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()> {
+        let account = self.account(email)?;
+        let context = self
+            .store
+            .message_context(message_id)?
+            .ok_or(CoreError::MessageNotFound(message_id))?;
+        if context.account_id != account.id {
+            return Err(CoreError::MessageNotFound(message_id));
+        }
+        let targets = self
+            .store
+            .message_location_targets(account.id, message_id)?;
+        if targets.is_empty() {
+            return Err(CoreError::Unsupported("message is only in the local trash"));
+        }
+        let settings = settings_of(&account)?;
+        if !matches!(settings.protocol, ReceiveProtocol::Imap) {
+            return Err(CoreError::Unsupported("keywords on a POP3 account"));
+        }
+        let remove_flags: Vec<&str> = remove
+            .iter()
+            .map(|keyword| keyword_flag(keyword))
+            .collect::<Result<_>>()?;
+        let add_flags: Vec<&str> = add
+            .iter()
+            .map(|keyword| keyword_flag(keyword))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|flag| {
+                !remove_flags
+                    .iter()
+                    .any(|other| other.eq_ignore_ascii_case(flag))
+            })
+            .collect();
+
+        let mut session = self.connect_imap(&account).await?;
+        let outcome = self
+            .apply_flags_imap(&mut session, &targets, &add_flags, &remove_flags)
+            .await;
+        session.logout().await;
+        outcome?;
+
+        let added: Vec<String> = add_flags.iter().map(|flag| flag.to_string()).collect();
+        let removed: Vec<String> = remove_flags.iter().map(|flag| flag.to_string()).collect();
+        self.store
+            .update_flags(account.id, message_id, &added, &removed)?;
+        Ok(())
+    }
+
+    async fn apply_flags_imap(
+        &self,
+        session: &mut ImapSession,
+        targets: &[LocationTarget],
+        add: &[&str],
+        remove: &[&str],
+    ) -> Result<()> {
+        let mut selected: Option<&str> = None;
+        for target in targets {
+            if selected != Some(target.mailbox_name.as_str()) {
+                session.select(&target.mailbox_name).await?;
+                selected = Some(target.mailbox_name.as_str());
+            }
+            let uid = uid_of(target.uid)?;
+            for flag in add {
+                session.add_flag(uid, flag).await?;
+            }
+            for flag in remove {
+                session.remove_flag(uid, flag).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves a message to another mailbox. Only messages with a single live
+    /// copy are accepted, because an IMAP move affects one copy.
+    pub async fn move_message(&self, email: &str, message_id: i64, mailbox_id: i64) -> Result<()> {
+        let account = self.account(email)?;
+        let context = self
+            .store
+            .message_context(message_id)?
+            .ok_or(CoreError::MessageNotFound(message_id))?;
+        if context.account_id != account.id {
+            return Err(CoreError::MessageNotFound(message_id));
+        }
+        let settings = settings_of(&account)?;
+        if !matches!(settings.protocol, ReceiveProtocol::Imap) {
+            return Err(CoreError::Unsupported("move on a POP3 account"));
+        }
+        let targets = self
+            .store
+            .message_location_targets(account.id, message_id)?;
+        if targets.is_empty() {
+            return Err(CoreError::Unsupported("message is only in the local trash"));
+        }
+        if targets.len() > 1 {
+            return Err(CoreError::MultipleLocations(message_id));
+        }
+        let source = &targets[0];
+        let destination = self
+            .store
+            .mailbox_by_id(mailbox_id)?
+            .ok_or(CoreError::MailboxNotFound(mailbox_id))?;
+        if destination.account_id != account.id || destination.missing_at.is_some() {
+            return Err(CoreError::MailboxNotFound(mailbox_id));
+        }
+        if destination.id == source.mailbox_id {
+            return Ok(());
+        }
+
+        let mut session = self.connect_imap(&account).await?;
+        let outcome = self
+            .move_message_imap(&mut session, &account, message_id, source, &destination)
+            .await;
+        session.logout().await;
+        outcome
+    }
+
+    async fn move_message_imap(
+        &self,
+        session: &mut ImapSession,
+        account: &Account,
+        message_id: i64,
+        source: &LocationTarget,
+        destination: &Mailbox,
+    ) -> Result<()> {
+        session.select(&source.mailbox_name).await?;
+        let method = session
+            .move_message(uid_of(source.uid)?, &destination.remote_name)
+            .await?;
+        tracing::info!(
+            message_id,
+            method,
+            from = source.mailbox_name.as_str(),
+            to = destination.remote_name.as_str(),
+            "message moved"
+        );
+
+        // Syncing the destination discovers the new UID, which the store
+        // cannot know without UIDPLUS response codes. The source location is
+        // dropped only after the message is visible in the destination.
+        let engine = SyncEngine::new(Arc::clone(&self.store));
+        let report = engine
+            .sync_mailbox(account.id, session, &destination.remote_name)
+            .await?;
+        if report.applied == 0 && report.inserted == 0 {
+            return Err(CoreError::Unsupported(
+                "the server did not report the moved message yet",
+            ));
+        }
+        self.store
+            .remove_location(account.id, message_id, source.mailbox_id)?;
+        Ok(())
+    }
+
     /// Cached content, but only once every body alternative is present.
     fn cached_content(&self, message_id: i64) -> Result<Option<MessageContent>> {
         let Some(body) = self.store.message_body(message_id)? else {
@@ -1366,6 +1538,19 @@ fn content_of(message_id: i64, body: MessageBody) -> MessageContent {
 fn uid_of(uid: i64) -> Result<u32> {
     u32::try_from(uid)
         .map_err(|_| CoreError::Settings(format!("uid {uid} is outside the IMAP range")))
+}
+
+/// JMAP keyword to IMAP flag. Custom keywords are rejected until the store can
+/// round-trip them consistently.
+fn keyword_flag(keyword: &str) -> Result<&'static str> {
+    match keyword {
+        "$seen" => Ok("\\Seen"),
+        "$flagged" => Ok("\\Flagged"),
+        "$answered" => Ok("\\Answered"),
+        "$draft" => Ok("\\Draft"),
+        "$forwarded" => Ok("\\Forwarded"),
+        other => Err(CoreError::UnknownKeyword(other.to_string())),
+    }
 }
 
 /// Reduces a server-supplied attachment name to a safe basename.

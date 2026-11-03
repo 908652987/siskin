@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub 只读 JMAP 子集已落地**（`mail-api` + `mail-hub`：Session、`Mailbox/get`、`Email/query|get|changes`、配对与 Bearer 鉴权，正文按需拉取；写操作、SSE、上传/下载未做）；Linux 桌面 UI 技术栈定为 Slint（D12），**图形界面、日历、手机客户端尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM、`Email/import`、上传未做）；Linux 桌面 UI 技术栈定为 Slint（D12），**图形界面、日历、手机客户端尚未开始**。
 
 ---
 
@@ -58,12 +58,18 @@
 | 本地回收站与保留期 | 完成 | `mail-store::missing_at`/`purge_trash`/`settings`；删除邮箱进回收站，默认 90 天，`sync` 自动清理；同名单重建保留旧数据 |
 | 变更日志压缩与快照 | 完成 | `mail-store::compact_changes` + `change_snapshots`；默认 20,000 行阈值，`sync`/`sync_account`/`watch` 每轮同步后自动执行；Dovecot 10,010 条压缩后日志归零、水位不倒退 |
 | HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
-| JMAP 子集（只读） | 完成 | `mail-api`：Session、`Mailbox/get`、`Email/query|get|changes`、`BodySource` 按需正文；8 个 API 测试；Dovecot 10,009 封实跑 |
-| Hub 服务端与设备配对 | 完成 | `mail-hub`（axum）：配对码换令牌、库中只存哈希、Bearer 鉴权；3 个路由测试 + 实跑 |
-| Hub 写操作与推送 | 未开始 | `Email/set`、`Mailbox/changes`、SSE、上传/下载分别返回 `unknownMethod` / 501 |
+| JMAP 子集（读写） | 完成 | `mail-api`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`、`BodySource` 按需正文、`WriteSink` 写路径；14 个 API 测试；Dovecot 实跑 |
+| Hub 服务端与设备配对 | 完成 | `mail-hub`（axum）：配对码换令牌、库中只存哈希、Bearer 鉴权、`/eventsource`、`/download`；`mail-cli devices`/`revoke-device`；5 个路由测试 + 实跑 |
+| Hub 写操作与 SSE | 完成 | `Email/set` 已读/标志/单副本移动、`Mailbox/changes`、SSE 状态事件、blob 下载；Dovecot 实跑（`\Seen` 置/清、移动、计数、下载、token 吊销后 401） |
+| Hub APNs/FCM 推送 | 未开始 | 依赖推送凭据；SSE 已可替代桌面/局域网客户端 |
 | 日历 | 未开始 | |
 | 翻译 | 未开始 | |
-| 桌面/移动 UI | 未开始 | Linux 栈已定 Slint（D12）；macOS/Windows/iOS/Android 仍按 D2 |
+| UniFFI 门面 | 完成 | `mail-ffi`：账户/邮箱/列表/正文/关键字/移动/同步；Swift 绑定生成、`SiskinSmoke` 实跑 |
+| macOS UI（列表/阅读/搜索） | 完成（主路径） | `apps/macos` SwiftUI：账户选择/新增、邮箱/邮件列表、HTML+纯文本阅读、搜索、同步、标已读/未读、标星、移动、分页加载、附件保存；SwiftPM 构建 + 10,016 封库实跑 |
+| macOS 国际化 | 完成 | zh-Hans / en `Localizable.strings`；系统语言自动选择，`SISKIN_LANG` 可强制；中英文快照各一张 |
+| 账户预设 | 完成 | Gmail / QQ / 88 / 自定义快捷按钮；主机、端口、TLS 由 `mail-ffi::provider_presets` 提供，88 按邮箱域名推导 |
+| macOS 撰写/通知/打包 | 未开始 | 无 compose、无通知与 `.app` 打包 |
+| Windows / Linux / 移动 UI | 未开始 | Linux 栈已定 Slint（D12）；Windows/iOS/Android 仍按 D2 |
 | Windows / 移动端验证 | 未开始 | 本机无 Windows、无 .NET SDK |
 | 代码规范与风格固化 | 完成 | `AGENTS.md` + `docs/CONVENTIONS.md` + rustfmt/clippy/CI |
 
@@ -88,9 +94,9 @@ crates/
                            changes_since/latest_change_seq/change_window、
                            account_state/latest_snapshot/compact_changes、
                            change_log_max_rows
-  mail-store/tests/        29 个存储测试（含错密钥、明文库、落盘无明文、blob 回收、
+  mail-store/tests/        34 个存储测试（含错密钥、明文库、落盘无明文、blob 回收、
                            回收站与保留期、变更日志快照与压缩、正文索引与截断、
-                           v5→v6 迁移）
+                           v5→v6 迁移、标志位/位置移动、blob 账户隔离、设备吊销）
   mail-store/src/lib.rs    migration_tests：v5 库（四列 FTS、无 body_text）升级后
                            主题索引保留、正文从 blob 回填
   mail-proto/src/lib.rs    Stream（TLS/明文/STARTTLS）、ImapSession、CapabilitySet、
@@ -113,19 +119,33 @@ crates/
                            watch（单邮箱）/ watch_account（全邮箱：IDLE 池 + 扫尾，
                            只推送真实变更）、check、send（SMTP + Sent 归档）、
                            fetch_body（缓存优先，命中时补写正文索引）、fetch_attachment（按需）、
+                           set_keywords（JMAP 关键字 → IMAP STORE）、
+                           move_message（MOVE 或 COPY+EXPUNGE；同步目标取新 UID）、
                            purge_expired_trash / trash_retention_days
   mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
-  mail-api/src/lib.rs      JMAP 子集：Session、Mailbox/get、Email/query|get|changes、
-                           BodySource 按需正文、filter/sort 的显式拒绝
-  mail-api/tests/          8 个 API 测试（邮箱计数、筛选分页、正文、变更语义、错误）
-  mail-hub/src/main.rs     axum 服务：/.well-known/jmap、/jmap、/pair、
-                           eventsource/upload/download 返回 501、CoreBodies
-                           同文件 tests：3 个路由测试（配对只存哈希、鉴权、JMAP 调用）
+  mail-api/src/lib.rs      JMAP 子集：Session、Mailbox/get|changes、
+                           Email/query|get|changes|set、BodySource 按需正文、
+                           WriteSink 写路径、filter/sort 的显式拒绝
+  mail-api/tests/          14 个 API 测试（邮箱计数、筛选分页、正文、变更语义、
+                           关键字写入、移动、state 冲突、blobId、错误）
+  mail-hub/src/main.rs     axum 服务：/.well-known/jmap、/jmap、/pair、/eventsource、
+                           /download、/upload（501）；CoreBodies/CoreWrites
+                           同文件 tests：5 个路由测试（配对、鉴权、JMAP、下载、SSE）
+  mail-ffi/src/lib.rs      UniFFI 门面：provider_presets + MailClient（open/accounts/add_account/mailboxes/
+                           messages/body/set_seen/move_message/sync）、FfiError
+  mail-ffi/src/bin/        uniffi-bindgen
   mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch（省略
                            --mailbox 即全邮箱，--idle-sessions/--sweep-seconds 可调）/
                            mailboxes / list / search / trash / trash-purge / body /
-                           attachment / stats / retention / set-retention / changes /
-                           changes-compact / set-change-max-rows / export-key / import-key
+                           attachment / keywords / move / stats / retention /
+                           set-retention / changes / changes-compact /
+                           set-change-max-rows / devices / revoke-device /
+                           export-key / import-key
+apps/
+  macos/Package.swift     SwiftPM：SiskinApp（SwiftUI）+ SiskinSmoke + MailFFI + mail_ffiFFI
+  macos/Sources/SiskinApp main.swift（AppKit 引导）、AppModel、Views
+  macos/Sources/SiskinSmoke 无界面冒烟：账户/邮箱/列表/正文/关键字往返
+  macos/build.sh          编译 mail-ffi → 生成 Swift 绑定 → swift build
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -150,7 +170,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 103 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 119 个测试全过
 ~/.cargo/bin/cargo build --release
 export EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets   # 开发期绕开钥匙串；发布验证不要设置
 
@@ -215,7 +235,41 @@ curl -s http://127.0.0.1:8080/.well-known/jmap -H "Authorization: Bearer $TOKEN"
 curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":"1"},"c0"]]}'
+# 写：标已读（id 取 Email/get）、移动（mailboxId 取 Mailbox/get）
+curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":"1","update":{"<id>":{"keywords":{"$seen":true}}}},"c0"]]}'
+curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":"1","update":{"<id>":{"mailboxIds":{"<mailboxId>":true}}}},"c0"]]}'
+# 增量与 SSE：closeafter/ping 接受秒数或 PTxxS
+curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/changes",{"accountId":"1","sinceState":"<seq>"},"c0"]]}'
+curl -sN "http://127.0.0.1:8080/eventsource/?types=Email,Mailbox&closeafter=5&ping=2" \
+  -H "Authorization: Bearer $TOKEN"
+# 下载：blobId 取 Email/get 的 textBody/attachments；只在 blob 属于该账户时返回
+curl -s "http://127.0.0.1:8080/download/1/<blobId>/file.bin" \
+  -H "Authorization: Bearer $TOKEN" -o /tmp/download.bin
+# 设备管理（与 Hub 共用库）
+cargo run -p mail-cli -- --db /tmp/smoke.db devices
+cargo run -p mail-cli -- --db /tmp/smoke.db revoke-device --id <deviceId>
+# CLI 直连同一条写路径
+cargo run -p mail-cli -- --db /tmp/smoke.db keywords --email vmail@example.com --id <id> --add '$seen'
+cargo run -p mail-cli -- --db /tmp/smoke.db move --email vmail@example.com --id <id> --mailbox 归档
 # 未设置 EYRIE_HUB_PAIRING_CODE 时，配对码每进程随机生成并打印一次；令牌只在配对响应里返回
+
+# 4.2) macOS SwiftUI 壳（与 CLI 共用库与密钥存储）
+./apps/macos/build.sh
+SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
+  apps/macos/.build/debug/Siskin
+# 无界面冒烟：账户/邮箱/列表/正文/关键字往返
+SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
+  apps/macos/.build/debug/SiskinSmoke
+# 应用内渲染窗口快照（无需屏幕录制权限）；SISKIN_SNAPSHOT_MESSAGE 可预选邮件
+SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
+  SISKIN_SNAPSHOT=/tmp/ui.png SISKIN_SNAPSHOT_MESSAGE=711 \
+  apps/macos/.build/debug/Siskin
 
 # 5) 选下一项：见 §9
 ```
@@ -287,6 +341,17 @@ curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
 | Hub `Email/changes` 增量 | 正文缓存写入后 3 条 `updated`，`hasMoreChanges=false` |
 | Hub `Email/changes` 分页 | `sinceState=0, maxChanges=2` → `created=2`、`hasMoreChanges=true`、`newState=2` |
 | Hub 断点续用 | Hub 重启后旧设备令牌仍有效，`last_seen_at` 更新 |
+| Hub `Email/set` 置 `$seen`（Dovecot） | `updated` 返回、`oldState=10027`→`newState=10028`；服务器 `doveadm fetch` 显示 `\Seen` |
+| Hub `Email/set` 清 `$seen` | 服务器 flags 为空；本地 keywords 同步清空 |
+| Hub `Email/set` 移动（INBOX→归档） | 源 UID 消失、目标 `messages=1`、`Email/get` 的 `mailboxIds` 变为目标 id；INBOX 计数 10009→10008 |
+| Hub `Mailbox/changes` | 同步后返回新建邮箱 `created`，`updated` 含新邮件邮箱 |
+| Hub SSE | 连接即发 `state`（Email/Mailbox 同一 seq），空闲按 `ping` 发 `ping`，`closeafter=2` 后关闭 |
+| Hub `/download` | 正文 blob 下载 200、`text/plain`、38 字节与 `bodyValues` 一致；未认证 401、未知 blob 404 |
+| Hub 设备吊销 | `revoke-device` 后原令牌请求 Session 返回 401 |
+| Swift FFI 冒烟（Dovecot 10,016 封） | 1 账户 / 8 邮箱 / total=10,016；首封正文 27 字；`$seen` 置清往返成功 |
+| macOS 壳加载（同一库） | 窗口 1120×760；模型打印 `mailboxes=8 messages=200 total=10016`；中英文状态分别为“就绪”/“Ready” |
+| macOS 阅读（id=711） | HTML 正文与附件 `note.txt` 正确渲染；附件经 FFI 下载 17 字节；操作按钮显示“标为未读 / 加星标 / 移动到” |
+| macOS 快照 | `SISKIN_SNAPSHOT` 应用内渲染 2240×1520 PNG；修复前发现工具栏不可见、文字白底白字、HSplitView 底对齐、头部被英文按钮挤裁，均已修复 |
 | RRULE | 22 例 21 通过，失败项为夏令时空洞时间，需归一化 |
 
 完整方法与命令见 `docs/SPIKE-REPORT.md`。
@@ -309,8 +374,9 @@ curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
 12. **主密钥无轮换与自动备份**。已提供 `export-key`/`import-key` 做人工备份（可存 Bitwarden 等），但主密钥仍只有钥匙串一份，丢失且无备份即数据不可恢复；库密钥无法在线轮换。**验收**：轮换后旧库可迁移；备份丢失时给出明确提示。
 13. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应先进入服务器 Trash 并同步到本地 Trash）；回收站不提供手工恢复。**验收**：UI 可按邮箱/时间浏览回收站；恢复操作有明确语义。
 14. **多邮箱列表已去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选、跨邮箱计数需要新的查询接口。**验收**：列表可按邮箱过滤且不重复，计数与筛选一致。
-15. **Hub 只覆盖只读 JMAP 子集**。`Mailbox/changes`、`Email/set|import`、`Thread/get`、SSE、上传/下载未实现；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序；配对后没有吊销命令（需直接删 `hub_devices` 行）；一次 `Email/get` 内正文串行拉取。**验收**：客户端可标已读/移动邮件并按 state 增量刷新，推送走 SSE。
-16. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。**验收**：重建后客户端能收到 `cannotCalculateChanges` 或完整 destroyed 列表。
+15. **macOS 壳缺撰写与系统集成**。列表/阅读/搜索/同步/标已读/标星/移动/HTML/附件/分页/i18n 已接通；撰写、通知、签名 `.app` 打包、真实多账户切换未做。**验收**：可撰写并发送、可收到通知。**未验证**：本机无 Xcode 工程模板，当前用 SwiftPM 可执行文件启动。
+16. **Hub 写操作只覆盖已读/标志与单副本移动**。`Email/set` 支持 `keywords` 与 `mailboxIds`，不支持 `create`/`destroy`/`Email/import`；多副本邮件移动、自定义关键字返回 `notSupported`；`Thread/get`、上传、APNs/FCM 未做；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序；一次 `Email/get` 内正文串行拉取。**验收**：客户端可标已读/移动邮件并按 state 增量刷新，推送走 SSE（已完成）。
+17. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。**验收**：重建后客户端能收到 `cannotCalculateChanges` 或完整 destroyed 列表。
 
 ---
 
@@ -329,7 +395,7 @@ curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
 
 ### 第 4 段：服务端与移动（进行中）
 
-6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**只读子集与配对完成**（2026-11-02）；剩余：写操作（`Email/set` 已读/移动）、`Mailbox/changes`、SSE、附件下载、设备吊销、APNs/FCM。
+6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**读写子集、SSE、附件下载、设备吊销完成**（2026-11-03）；剩余：APNs/FCM 推送（缺凭据）、`Email/import`、上传、`Thread/get`、多副本移动。
 7. iOS/Android 薄客户端（依赖 Hub 推送凭据）。
 
 ### 第 5 段：日历与翻译
@@ -339,7 +405,7 @@ curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
 
 ### 第 6 段：桌面 UI
 
-10. macOS SwiftUI（列表/阅读/撰写/搜索）。
+10. macOS SwiftUI：列表/阅读/搜索/同步/标已读完成（最小壳，纯文本）；剩余撰写、HTML 渲染、附件保存、通知、`.app` 打包。
 11. Windows WinUI 3（复用 Rust 核心）。
 12. Linux Slint（`apps/linux`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定，实现未开始。
 
@@ -417,7 +483,26 @@ curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
 - 单部件邮件的正文 section 是空字符串（`BODY[TEXT]`）；JMAP 的 `partId` 不能为空，映射为 `text`/`html`，`bodyValues` 也用同一键，否则客户端按 `partId` 取不到值。
 - `messages_with_locations` 只返回 `missing_at IS NULL` 的位置；回收站里的邮箱不能出现在 JMAP `mailboxIds` 或 `Mailbox/get` 里。
 - Hub 设备令牌明文只在 `/pair` 响应里出现一次；库里只有 SHA-256 哈希。配对码未配置时每进程随机生成并打印到 stdout，不要把它写进日志或提交。
+- macOS 的 `Bundle.module.preferredLocalizations` 在本机返回 `["en"]`（系统却是 zh-Hans-CN），不能靠 `NSLocalizedString(key, bundle: .module)` 自动选语言；`L10n` 直接按 `Locale.preferredLanguages`/`SISKIN_LANG` 读取 `.lproj/Localizable.strings`。
+- RFC 2047 编码主题/发件人必须在 `mail-sync::to_new_message` 解码（新数据）并在 `mail-ffi::message_view` 再解一次（旧库已存原始串）；不要在 Swift 里另写一套解码。
+- SwiftUI `List(selection:)` 在 `NSHostingView` 里会触发 “reentrant operation in its NSTableView delegate”，消息列表与侧栏改为 `ScrollView + LazyVStack` 后消失；不要再把两侧改回 `List(selection:)`。
+- `NSHostingView` 根视图不自动画窗口背景：深色模式下文字是白色、背景是白色，必须给根视图 `.background(Color(nsColor: .windowBackgroundColor))` 并设置 `window.backgroundColor`。
+- `HSplitView` 子视图要显式 `.frame(maxHeight: .infinity)`，否则列会按内容高度贴底，顶部留大片空白。
+- 详情页操作行比面板宽时，整个 `VStack` 会被撑宽并左右裁切（中英文都出现过）：把 HTML/纯文本切换移到独立一行，并给头部 `.frame(maxWidth: .infinity, alignment: .leading)`。
+- `NSHostingView` 会在首次布局时把窗口缩到根视图最小尺寸；设置 `window.setContentSize` 要在启动后延迟一次再设，或同时设置根视图目标尺寸。
+- `mail-ffi` 的公开类型一改，`apps/macos/Generated` 与 `Sources/mail_ffiFFI` 就是旧签名：必须重跑 `apps/macos/build.sh`，不要手工改生成文件。
+- SwiftPM 的 system library 必须叫 `module.modulemap`（生成文件叫 `mail_ffiFFI.modulemap`），且 C 头与 modulemap 要放在 `Sources/mail_ffiFFI/`；`Generated/` 只放 Swift 绑定，否则 `import mail_ffiFFI` 找不到模块。
+- 静态链接 Rust 产物会出现 “built for newer macOS version (27.0)” 警告：Rust 按本机 SDK 编译，SwiftPM 目标写 macOS 14；只影响链接告警，不影响运行，别用 `-w` 掩盖真正错误。
+- `Siskin` 是用 SwiftPM 可执行文件 + AppKit 引导启动的，没有 `.app` 包：`EYRIE_DEV_SECRET_DIR` 未设置时会走钥匙串，ad-hoc 签名每次重建都会弹授权；开发与冒烟一律显式设置该变量。
 - 只跑 `cargo clippy` 不会更新 `target/debug/mail-hub`；改完 `mail-api` 后要 `cargo build -p mail-hub` 再重启，否则冒烟仍在跑旧逻辑（本次实测踩过）。
+- IMAP 标志位按副本存：JMAP keyword 更新必须遍历 `message_location_targets` 的每个在线位置，全部 `STORE` 成功后才写本地 flags；中间失败就让本地保持旧值，等下一次同步收敛（`update_flags` 只更新本地，不碰服务器）。
+- `WriteSink::set_keywords` 的入参是 JMAP keyword（`$seen`），映射成 IMAP flag（`\Seen`）是 `mail-core::keyword_flag` 的职责；测试里的假 sink 也要映射，否则会存进 `$seen` 这种非 IMAP 标志。
+- 移动只接受单副本消息：多个位置意味着服务器上有多份，IMAP `MOVE` 只能动一份，直接返回 `notSupported`。目标 UID 不靠 `COPYUID`（async-imap 丢弃响应码），而是移动后同步目标邮箱取得新位置，再删源位置；目标同步没看到新邮件时不要删源位置。
+- `message_location_targets` 只返回 `missing_at IS NULL` 的邮箱；回收站里的副本不参与写操作，否则会 SELECT 一个服务器上已不存在的邮箱。
+- `blob_for_account` 必须是账户作用域：只按 `blobId` 取字节会让任意已配对设备读到别的账户缓存；`blobId` 是 32 字节散列的 hex，解码失败按 404 处理。
+- SSE 的 `state` 事件每个账户一条，`Email` 与 `Mailbox` 共用同一个账户水位（seq）；`closeafter`/`ping` 同时接受纯秒数与 `PTxxS`，不要只解析一种。
+- `ensure_mailbox` 现在会写 `mailbox created/restored`，所以变更日志计数比旧版本多一条（新库首次建 INBOX 即有）；按实体类型取增量必须用 `changes_since_type`，不能用 `changes_since` 再在内存过滤，否则分页 `hasMoreChanges` 会被其他类型的行干扰。
+- `record_change` 接收 `&Connection`，`Transaction` 通过 Deref 直接传入；不要在事务里另开连接写日志，否则会与 SQLite 单写者锁冲突。
 
 ---
 

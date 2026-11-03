@@ -300,9 +300,17 @@ fn to_new_message(msg: &FetchedMessage) -> NewMessage {
     NewMessage {
         uid: i64::from(msg.uid),
         message_id: msg.message_id.clone(),
-        subject: msg.subject.clone(),
-        from: msg.from.clone(),
-        to: msg.to.clone(),
+        subject: msg.subject.as_deref().map(mail_parse::decode_encoded_words),
+        from: msg
+            .from
+            .iter()
+            .map(|from| mail_parse::decode_encoded_words(from))
+            .collect(),
+        to: msg
+            .to
+            .iter()
+            .map(|to| mail_parse::decode_encoded_words(to))
+            .collect(),
         sent_at: msg.sent_at.or(msg.internal_date),
         size: msg.size.map(i64::from),
         flags: msg.flags.clone(),

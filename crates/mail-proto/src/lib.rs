@@ -461,9 +461,17 @@ impl ImapSession {
     }
 
     pub async fn add_flag(&mut self, uid: u32, flag: &str) -> Result<()> {
+        self.store_flag(uid, "+", flag).await
+    }
+
+    pub async fn remove_flag(&mut self, uid: u32, flag: &str) -> Result<()> {
+        self.store_flag(uid, "-", flag).await
+    }
+
+    async fn store_flag(&mut self, uid: u32, operation: &str, flag: &str) -> Result<()> {
         let mut stream = self
             .session()
-            .uid_store(uid.to_string(), format!("+FLAGS.SILENT ({flag})"))
+            .uid_store(uid.to_string(), format!("{operation}FLAGS.SILENT ({flag})"))
             .await?;
         while stream.try_next().await?.is_some() {}
         Ok(())

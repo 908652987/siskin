@@ -303,6 +303,8 @@ pub struct StoredPart {
     pub charset: Option<String>,
     pub is_html: bool,
     pub cached: bool,
+    /// Hex id of the cached bytes; JMAP exposes it as `blobId`.
+    pub blob_hash: Option<String>,
 }
 
 /// Attachment metadata; `downloaded` is false until its blob is stored.
@@ -313,6 +315,8 @@ pub struct StoredAttachment {
     pub content_type: String,
     pub size: i64,
     pub downloaded: bool,
+    /// Hex id of the cached bytes; JMAP exposes it as `blobId`.
+    pub blob_hash: Option<String>,
 }
 
 /// Download information for one attachment.
@@ -343,6 +347,25 @@ pub struct MessageContext {
     pub mailbox_name: String,
     pub uid: i64,
     pub state: BodyState,
+}
+
+/// One live server copy of a message, used by write operations.
+#[derive(Debug, Clone)]
+pub struct LocationTarget {
+    pub mailbox_id: i64,
+    pub mailbox_name: String,
+    pub uid: i64,
+}
+
+/// Bytes of one blob, scoped to an account so a device cannot read another
+/// account's cached content.
+#[derive(Debug, Clone)]
+pub struct BlobData {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    pub filename: Option<String>,
+    /// True when the blob belongs to an attachment rather than a body part.
+    pub attachment: bool,
 }
 
 /// Body alternative to cache; `data` is the decoded UTF-8 payload.
@@ -573,6 +596,13 @@ impl Store {
         role: Option<&str>,
     ) -> Result<Mailbox> {
         let conn = self.conn.lock().expect("poisoned");
+        let existing: Option<(i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT id, missing_at FROM mailboxes WHERE account_id = ?1 AND remote_name = ?2",
+                params![account_id, remote_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         conn.execute(
             "INSERT INTO mailboxes (account_id, remote_name, role) VALUES (?1, ?2, ?3)
              ON CONFLICT(account_id, remote_name) DO UPDATE SET
@@ -585,6 +615,13 @@ impl Store {
             params![account_id, remote_name],
             |row| row.get(0),
         )?;
+        match existing {
+            None => record_change(&conn, account_id, "mailbox", &id.to_string(), "created")?,
+            Some((_, Some(_))) => {
+                record_change(&conn, account_id, "mailbox", &id.to_string(), "restored")?
+            }
+            Some((_, None)) => {}
+        }
         Self::load_mailbox(&conn, id)?
             .ok_or_else(|| StoreError::MailboxNotFound(remote_name.into()))
     }
@@ -748,6 +785,11 @@ impl Store {
             Some(id) => Self::load_mailbox(&conn, id),
             None => Ok(None),
         }
+    }
+
+    pub fn mailbox_by_id(&self, mailbox_id: i64) -> Result<Option<Mailbox>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Self::load_mailbox(&conn, mailbox_id)
     }
 
     pub fn update_sync_state(&self, mailbox_id: i64, state: &SyncState) -> Result<()> {
@@ -1217,6 +1259,28 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_devices(&self) -> Result<Vec<Device>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt =
+            conn.prepare("SELECT id, name, created_at, last_seen_at FROM hub_devices ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Device {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                last_seen_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Removes a paired device; its bearer token stops authenticating at once.
+    pub fn revoke_device(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn.execute("DELETE FROM hub_devices WHERE id = ?1", [id])? > 0)
+    }
+
     /// Messages whose only copies live in mailboxes the server no longer
     /// lists; they are purged once retention expires.
     pub fn list_trash(
@@ -1358,6 +1422,119 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Live server copies of one message, used by write operations that must
+    /// touch every mailbox holding it. Trash mailboxes are excluded.
+    pub fn message_location_targets(
+        &self,
+        account_id: i64,
+        message_id: i64,
+    ) -> Result<Vec<LocationTarget>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT l.mailbox_id, b.remote_name, l.uid
+             FROM message_locations l
+             JOIN mailboxes b ON b.id = l.mailbox_id
+             WHERE l.message_id = ?1 AND b.account_id = ?2 AND b.missing_at IS NULL
+             ORDER BY l.mailbox_id",
+        )?;
+        let rows = stmt.query_map(params![message_id, account_id], |row| {
+            Ok(LocationTarget {
+                mailbox_id: row.get(0)?,
+                mailbox_name: row.get(1)?,
+                uid: row.get(2)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Drops one local location after the server accepted a move. Records the
+    /// message change and removes the message row when no copy is left.
+    pub fn remove_location(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        mailbox_id: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM message_locations WHERE message_id = ?1 AND mailbox_id = ?2",
+            params![message_id, mailbox_id],
+        )?;
+        if removed == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM message_locations WHERE message_id = ?1",
+            [message_id],
+            |row| row.get(0),
+        )?;
+        record_change(
+            &tx,
+            account_id,
+            "message",
+            &message_id.to_string(),
+            if remaining == 0 { "removed" } else { "updated" },
+        )?;
+        if remaining == 0 {
+            purge_orphan_messages(&tx)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Applies keyword changes to every live copy of a message. Flags are
+    /// compared case-insensitively, matching IMAP semantics.
+    pub fn update_flags(
+        &self,
+        account_id: i64,
+        message_id: i64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<usize> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT l.mailbox_id, l.flags
+                 FROM message_locations l
+                 JOIN mailboxes b ON b.id = l.mailbox_id
+                 WHERE l.message_id = ?1 AND b.account_id = ?2 AND b.missing_at IS NULL",
+            )?;
+            let rows = stmt.query_map(params![message_id, account_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+
+        let mut changed = 0usize;
+        for (mailbox_id, flags_json) in rows {
+            let mut flags: Vec<String> = serde_json::from_str(&flags_json).unwrap_or_default();
+            if !apply_flags(&mut flags, add, remove) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE message_locations SET flags = ?3
+                 WHERE message_id = ?1 AND mailbox_id = ?2",
+                params![message_id, mailbox_id, serde_json::to_string(&flags)?],
+            )?;
+            changed += 1;
+        }
+        if changed > 0 {
+            record_change(
+                &tx,
+                account_id,
+                "message",
+                &message_id.to_string(),
+                "updated",
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Records what a server says a message contains, without fetching bytes.
@@ -1600,7 +1777,7 @@ impl Store {
         };
         {
             let mut stmt = conn.prepare(
-                "SELECT p.part, p.content_type, p.charset, p.is_html, b.data
+                "SELECT p.part, p.content_type, p.charset, p.is_html, b.data, p.blob_hash
                  FROM message_parts p
                  LEFT JOIN blobs b ON b.hash = p.blob_hash
                  WHERE p.message_id = ?1
@@ -1613,10 +1790,11 @@ impl Store {
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, i64>(3)? != 0,
                     row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             })?;
             for row in rows {
-                let (part, content_type, charset, is_html, data) = row?;
+                let (part, content_type, charset, is_html, data, hash) = row?;
                 if let Some(bytes) = data.as_deref() {
                     let text = String::from_utf8_lossy(bytes).to_string();
                     if is_html {
@@ -1631,21 +1809,24 @@ impl Store {
                     charset,
                     is_html,
                     cached: data.is_some(),
+                    blob_hash: hash.as_deref().map(hex_encode),
                 });
             }
         }
         {
             let mut stmt = conn.prepare(
-                "SELECT part, filename, content_type, size, blob_hash IS NOT NULL
+                "SELECT part, filename, content_type, size, blob_hash
                  FROM attachments WHERE message_id = ?1 ORDER BY part",
             )?;
             let rows = stmt.query_map([message_id], |row| {
+                let hash: Option<Vec<u8>> = row.get(4)?;
                 Ok(StoredAttachment {
                     part: row.get(0)?,
                     filename: row.get(1)?,
                     content_type: row.get(2)?,
                     size: row.get(3)?,
-                    downloaded: row.get::<_, i64>(4)? != 0,
+                    downloaded: hash.is_some(),
+                    blob_hash: hash.as_deref().map(hex_encode),
                 })
             })?;
             for row in rows {
@@ -1699,6 +1880,56 @@ impl Store {
         )
     }
 
+    /// Cached bytes of one blob, but only when a message of `account_id`
+    /// references it. `blob_id` is the hex form exposed to JMAP clients.
+    pub fn blob_for_account(&self, account_id: i64, blob_id: &str) -> Result<Option<BlobData>> {
+        let Some(hash) = hex_decode(blob_id) else {
+            return Ok(None);
+        };
+        let conn = self.conn.lock().expect("poisoned");
+
+        let attachment: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT a.content_type, a.filename
+                 FROM attachments a JOIN messages m ON m.id = a.message_id
+                 WHERE m.account_id = ?1 AND a.blob_hash = ?2
+                 LIMIT 1",
+                params![account_id, hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (content_type, filename, attachment) = match attachment {
+            Some((content_type, filename)) => (Some(content_type), filename, true),
+            None => {
+                let part: Option<String> = conn
+                    .query_row(
+                        "SELECT p.content_type
+                         FROM message_parts p JOIN messages m ON m.id = p.message_id
+                         WHERE m.account_id = ?1 AND p.blob_hash = ?2
+                         LIMIT 1",
+                        params![account_id, hash],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                (part, None, false)
+            }
+        };
+        if content_type.is_none() {
+            return Ok(None);
+        }
+        let bytes: Option<Vec<u8>> = conn
+            .query_row("SELECT data FROM blobs WHERE hash = ?1", [&hash], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(bytes.map(|bytes| BlobData {
+            bytes,
+            content_type,
+            filename,
+            attachment,
+        }))
+    }
+
     pub fn local_uids(&self, mailbox_id: i64) -> Result<std::collections::HashSet<i64>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare("SELECT uid FROM message_locations WHERE mailbox_id = ?1")?;
@@ -1725,12 +1956,36 @@ impl Store {
         seq: i64,
         limit: i64,
     ) -> Result<Vec<ChangeRecord>> {
+        self.changes_since_inner(account_id, None, seq, limit)
+    }
+
+    /// Same as [`Store::changes_since`], restricted to one entity type so a
+    /// JMAP data type only advances on its own changes.
+    pub fn changes_since_type(
+        &self,
+        account_id: i64,
+        entity_type: &str,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeRecord>> {
+        self.changes_since_inner(account_id, Some(entity_type), seq, limit)
+    }
+
+    fn changes_since_inner(
+        &self,
+        account_id: i64,
+        entity_type: Option<&str>,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeRecord>> {
         let conn = self.conn.lock().expect("poisoned");
         let mut stmt = conn.prepare(
             "SELECT seq, account_id, entity_type, entity_id, op, at
-             FROM changes WHERE account_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+             FROM changes
+             WHERE account_id = ?1 AND seq > ?3 AND (?2 IS NULL OR entity_type = ?2)
+             ORDER BY seq LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![account_id, seq, limit], |row| {
+        let rows = stmt.query_map(params![account_id, entity_type, seq, limit], |row| {
             Ok(ChangeRecord {
                 seq: row.get(0)?,
                 account_id: row.get(1)?,
@@ -2089,6 +2344,43 @@ fn hash_bytes(data: &[u8]) -> Vec<u8> {
     Sha256::digest(data).to_vec()
 }
 
+/// Adds and removes flags in place; returns whether anything changed. IMAP
+/// flags are case-insensitive, so existing spellings are matched that way.
+fn apply_flags(flags: &mut Vec<String>, add: &[String], remove: &[String]) -> bool {
+    let before = flags.len();
+    flags.retain(|flag| !remove.iter().any(|name| flag.eq_ignore_ascii_case(name)));
+    let mut changed = flags.len() != before;
+    for name in add {
+        if !flags.iter().any(|flag| flag.eq_ignore_ascii_case(name)) {
+            flags.push(name.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        out.push((high * 16 + low) as u8);
+    }
+    Some(out)
+}
+
 /// Inserts a blob or bumps its refcount when the same bytes already exist.
 fn store_blob(tx: &Transaction<'_>, hash: &[u8], data: &[u8]) -> Result<()> {
     tx.execute(
@@ -2282,13 +2574,13 @@ fn read_account_state(conn: &Connection, account_id: i64) -> Result<AccountState
 }
 
 fn record_change(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     account_id: i64,
     entity_type: &str,
     entity_id: &str,
     op: &str,
 ) -> Result<()> {
-    tx.execute(
+    conn.execute(
         "INSERT INTO changes (account_id, entity_type, entity_id, op, at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![

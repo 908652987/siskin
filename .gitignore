@@ -10,3 +10,8 @@
 *.db-wal
 *.db-shm
 /mail.db
+/apps/macos/.build
+/apps/macos/Generated
+/apps/macos/libs
+/apps/macos/Sources/mail_ffiFFI
+/apps/macos/.swiftpm

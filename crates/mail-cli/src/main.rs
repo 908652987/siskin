@@ -43,7 +43,7 @@ fn parse() -> Result<Args, String> {
     Ok(Args {
         db,
         command: command.ok_or(
-            "missing command: add-account | check | send | accounts | sync | watch | mailboxes | list | search | trash | trash-purge | body | attachment | stats | retention | set-retention | changes | changes-compact | set-change-max-rows | export-key | import-key",
+            "missing command: add-account | check | send | accounts | sync | watch | mailboxes | list | search | trash | trash-purge | body | attachment | keywords | move | stats | retention | set-retention | changes | changes-compact | set-change-max-rows | devices | revoke-device | export-key | import-key",
         )?,
         flags,
     })
@@ -633,6 +633,72 @@ async fn run() -> Result<(), String> {
                         .write_all(&data)
                         .map_err(|e| format!("writing attachment to stdout: {e}"))?;
                 }
+            }
+        }
+        "keywords" => {
+            let email = required(&args.flags, "email")?;
+            let id = message_id_from(&args.flags)?;
+            let split = |name: &str| -> Vec<String> {
+                args.flags
+                    .get(name)
+                    .map(|raw| {
+                        raw.split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let add = split("add");
+            let remove = split("remove");
+            core.set_keywords(&email, id, &add, &remove)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("keywords updated: add={add:?} remove={remove:?}");
+        }
+        "move" => {
+            let email = required(&args.flags, "email")?;
+            let id = message_id_from(&args.flags)?;
+            let mailbox = required(&args.flags, "mailbox")?;
+            let store = core.store();
+            let account = account_id(&store, &email)?;
+            let target = store
+                .mailbox_by_name(account, &mailbox)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("unknown mailbox {mailbox}"))?;
+            core.move_message(&email, id, target.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("moved message {id} to {mailbox}");
+        }
+        "devices" => {
+            let store = core.store();
+            let devices = store.list_devices().map_err(|e| e.to_string())?;
+            if devices.is_empty() {
+                println!("no paired devices");
+            }
+            for device in devices {
+                println!(
+                    "id={} name={} created_at={} last_seen_at={}",
+                    device.id,
+                    device.name,
+                    device.created_at,
+                    device
+                        .last_seen_at
+                        .map_or_else(|| "-".to_string(), |at| at.to_string())
+                );
+            }
+        }
+        "revoke-device" => {
+            let id: i64 = required(&args.flags, "id")?
+                .parse()
+                .map_err(|_| "--id expects a numeric device id from `devices`".to_string())?;
+            let removed = core.store().revoke_device(id).map_err(|e| e.to_string())?;
+            if removed {
+                println!("device {id} revoked");
+            } else {
+                return Err(format!("device {id} not found"));
             }
         }
         "stats" => {
