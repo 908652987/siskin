@@ -163,6 +163,8 @@ flowchart LR
 ## 5.2 Hub 与 JMAP 子集
 
 - 分层：`mail-api` 只做 JMAP 语义（Session、请求/响应、错误映射），不依赖 HTTP；`mail-hub` 是 axum 二进制，负责配对、鉴权、路由与按需拉正文。依赖方向保持 `mail-hub → mail-api, mail-core`，`mail-api → mail-store`。
+- 进程形态：`mail-hub` 是**单进程**二进制，HTTP 路由、`mail-core` 内核与同一个 SQLCipher 库都在同一进程；**没有 Web 页面/静态资源**，也没有可单独执行的内核进程。仓库暂无 Hub 的 Dockerfile，目前只能直接运行二进制或自行构建镜像。
+- **Hub 没有后台同步**：启动后不跑 `sync`/`watch`，只读库并在正文请求时按需访问远端；库的更新依赖外部 `mail-cli sync`/`watch` 或后续内置同步任务。远程模式上线前必须补内置同步，否则数据不会自行刷新。
 - 认证：配对码（`EYRIE_HUB_PAIRING_CODE`，未设置则每进程随机生成并打印一次）换 32 字节随机令牌；库中 `hub_devices` 只存 SHA-256 哈希与 `last_seen_at`，令牌只在配对响应里出现一次。
 - 端点：`GET /.well-known/jmap`（Session）、`POST /jmap`、`POST /pair`、`GET /eventsource/`（SSE）、`GET /download/{accountId}/{blobId}/{name}`、`POST /upload/{accountId}`（带不带尾斜杠都路由）。上传按内容寻址写入 `blobs` + `uploads`，`maxSizeUpload` 50 MiB，`uploads` 行 24 小时未使用即回收（引用它的消息仍可读）。
 - 已实现 method：`Mailbox/get`（角色映射、`totalEmails`/`unreadEmails`、`myRights` 随写入能力切换）、`Mailbox/changes`、`Email/query`（`inMailbox`、`text`、`hasKeyword`/`notKeyword` 的 `$seen`/`$flagged`、`before`/`after`、position/limit，`total` 与分页一致）、`Email/get`（`mailboxIds` 为全部在线位置并集、keywords 为位置并集、附件元数据与 `blobId`、`bodyValues`）、`Email/changes`、`Email/set`（`create` 从上传 blob 建信、`destroy` 永久删除、`keywords`/`mailboxIds` 更新）、`Email/import`、`Thread/get`、`Thread/changes`。
@@ -276,23 +278,24 @@ cargo run -p mail-cli -- --db /tmp/mail.db import-key --value '<base64>' --force
 # import-key 会用 --db 指向的库验证密钥：打不开就失败，不覆盖钥匙串
 
 # 9) Hub（JMAP 子集）：与 mail-cli 共用同一个库与密钥存储
+# 示例端口 18080；Hub 默认 8080，可用 EYRIE_HUB_BIND 覆盖，起服务前用 lsof 检查
 EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
-EYRIE_HUB_DB=/tmp/mail.db EYRIE_HUB_BIND=127.0.0.1:8080 \
+EYRIE_HUB_DB=/tmp/mail.db EYRIE_HUB_BIND=127.0.0.1:18080 \
 EYRIE_HUB_PAIRING_CODE=dev-code cargo run -p mail-hub
 # 配对 → 拿 token → 带 Authorization: Bearer <token> 访问
-curl -s -X POST http://127.0.0.1:8080/pair -H 'Content-Type: application/json' \
+curl -s -X POST http://127.0.0.1:18080/pair -H 'Content-Type: application/json' \
   -d '{"code":"dev-code","name":"phone"}'
-curl -s http://127.0.0.1:8080/.well-known/jmap -H 'Authorization: Bearer <token>'
-curl -s -X POST http://127.0.0.1:8080/jmap -H 'Authorization: Bearer <token>' \
+curl -s http://127.0.0.1:18080/.well-known/jmap -H 'Authorization: Bearer <token>'
+curl -s -X POST http://127.0.0.1:18080/jmap -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":"1"},"c0"]]}'
 # 上传 → 导入 → 线程：blobId 来自 /upload，mailboxId 取 Mailbox/get，尾斜杠可带可不带
-curl -s -X POST http://127.0.0.1:8080/upload/1 -H 'Authorization: Bearer <token>' \
+curl -s -X POST http://127.0.0.1:18080/upload/1 -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: message/rfc822' --data-binary @message.eml
-curl -s -X POST http://127.0.0.1:8080/jmap -H 'Authorization: Bearer <token>' \
+curl -s -X POST http://127.0.0.1:18080/jmap -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/import",{"accountId":"1","emails":{"k1":{"blobId":"<blob>","mailboxIds":{"1":true}}}},"c0"]]}'
-curl -s -X POST http://127.0.0.1:8080/jmap -H 'Authorization: Bearer <token>' \
+curl -s -X POST http://127.0.0.1:18080/jmap -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Thread/get",{"accountId":"1"},"c0"]]}'
 
@@ -320,6 +323,7 @@ cargo test --workspace
 14. **JMAP 写操作覆盖面**。已实现已读/标志、多副本移动、上传、`Email/import`、`Email/set create/destroy`、`Thread/get|changes`；未做自定义关键字、`Email/query` 的 `operator`/`conditions` 组合过滤与升序排序、`Email/set create` 的多邮箱落库、APNs/FCM。导入/创建只走 IMAP 账户。`Thread/changes` 只覆盖本次构建之后写入的线程变更，升级前的历史消息不会补发（客户端先 `Thread/get`）。设备吊销已提供 `mail-cli revoke-device`。
 15. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。
 16. **Hub 正文拉取是串行且同步的**。一次 `Email/get` 请求内逐封拉取，未做并发限流；多封大邮件会让单次请求变慢。
+17. **远程模式（D13）前置未完成**。Hub 只有明文 HTTP、无发送提交端点、配对令牌可访问库内全部账户；客户端侧也还没有模式选择、JMAP 适配层与可清除的独立缓存。远程模式在此之前只能本机回环演示。
 
 ---
 
@@ -328,8 +332,10 @@ cargo test --workspace
 按依赖顺序：
 
 1. ~~Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动/创建/销毁）、多副本移动、SSE 推送、附件下载、上传与 `Email/import`、`Thread/get|changes`~~（完成；APNs/FCM 仍缺凭据）
-2. 移动端薄客户端（依赖 Hub 推送与 APNs/FCM 凭据）
-3. 发信补齐：~~附件~~（完成；To/Cc/Bcc + multipart/mixed）、HTML 正文、草稿、Sent 去重（Gmail 会自动归档）
-4. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）
-5. ~~多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）~~（完成；IDLE 池 + 扫尾）
-6. 主密钥导出/恢复与库密钥轮换
+2. Hub 远程模式前置：HTTPS、发送提交端点、令牌按账户授权（D13 的远程模式依赖这三项）
+3. 客户端双模式（D13）：首次运行选择本地/远程、远程地址 + 令牌配置、JMAP 适配层、独立缓存与清缓存
+4. 移动端薄客户端（依赖 Hub 推送与 APNs/FCM 凭据）
+5. 发信补齐：~~附件~~（完成；To/Cc/Bcc + multipart/mixed）、HTML 正文、草稿、Sent 去重（Gmail 会自动归档）
+6. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）
+7. ~~多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）~~（完成；IDLE 池 + 扫尾）
+8. 主密钥导出/恢复与库密钥轮换

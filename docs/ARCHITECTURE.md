@@ -40,6 +40,7 @@
 | D10 | 首发平台 macOS + Windows（同一里程碑，先后实现） | 覆盖主要桌面用户 | 移动端与 Linux 延后 |
 | D11 | Windows 内存路线：先 WinUI 3（目标 110–130 MB），不满意再评估 C++/WinRT 或 Slint | 先用最省事的原生栈验证内存目标 | 未在 Windows 上验证 |
 | D12 | Linux 桌面 UI 用 Slint（纯 Rust，单进程直连 `mail-core`） | 无 WebView、无 GTK/Qt 运行时依赖，内存与启动开销可控；macOS 上即可编译运行同一份代码，验证不受 Linux 机器限制 | 第四套 UI 代码；Slint DSL 与三端原生 UI 不共享布局 |
+| D13 | 客户端首次运行选择"本地模式"或"远程模式"；远程模式只填服务端地址 + 设备令牌，邮箱凭据只留在服务端；客户端缓存列表元数据与已打开的正文/附件，可随时清除；服务端地址必须 HTTPS（回环例外） | 把 D4 落成可操作的产品形态：远程模式不接触邮箱密码，缓存可丢弃重建；正文不全量落客户端 | 客户端需要 JMAP 适配层与独立缓存；远程发送需服务端新增提交端点；令牌需按账户授权 |
 
 ---
 
@@ -89,10 +90,93 @@ flowchart TB
   VAULT <--> PROTO
 ```
 
-两种运行形态：
+### 3.1 两种运行形态（D4 / D13）
 
-- **本地模式（桌面默认）**：UI 通过 UniFFI 调用进程内核心，核心直连 IMAP/CalDAV。
-- **Hub 模式**：核心在服务器上运行，客户端通过 JMAP 子集同步；手机只支持此模式。
+- **本地模式（桌面默认）**：UI 通过 UniFFI 调用进程内核心，核心直连 IMAP/CalDAV；邮箱凭据存客户端钥匙串。首次运行的默认选项。
+- **远程模式（Hub）**：核心在服务端运行，客户端通过 JMAP 子集读写；客户端只保存 Hub 地址与设备令牌，不保存邮箱密码，也不直连 IMAP/SMTP。手机只支持此模式。
+
+远程模式的客户端约定：
+
+- 首次运行必须选择模式；设置中可切换，但两种模式使用不同数据目录，切换不迁移缓存。
+- 本地缓存只保存列表所需的元数据（id、邮箱、标志、主题、发件人、时间、大小、线程）与用户打开过的正文/附件；不主动拉取全量正文。**列表可全量缓存，正文/附件按需。**
+- 提供"清除缓存"：删除本地缓存并重新从 Hub 拉取，服务端数据与凭据不受影响；清缓存后首次列表允许有加载态。
+- 写操作（已读/标志/移动/导入/删除）走 JMAP；撰写与发送由服务端提交端点承担，端点落地前远程模式隐藏撰写入口。
+- 服务端地址只接受 `https://`（本机回环 `http://127.0.0.1` 例外）；设备令牌存系统钥匙串。
+- 令牌按账户授权：Session 与所有 method 只返回该设备可见的账户，不暴露同库其他账户。
+- 远程模式不提供"添加邮箱账户"入口；账户的新增、删除与凭据维护属于服务端。
+
+### 3.2 远程模式部署分布（推荐）
+
+最小可靠分布是"每用户一份 Hub 实例 + 独立加密库"，HTTP 与内核同进程，TLS 由前置代理终止：
+
+```mermaid
+flowchart LR
+  subgraph EXT[外部]
+    MAIL[IMAP / POP3 / SMTP]
+  end
+  subgraph SRV[服务端主机]
+    PROXY[TLS 反向代理<br/>示例 18443]
+    HUB[mail-hub 单进程<br/>JMAP/SSE + 内核<br/>示例 18080]
+    SYNC[同步任务<br/>待补]
+    DB[(SQLCipher 库<br/>持久卷)]
+    KEY[主密钥 / 邮箱凭据<br/>KMS 或 0600 文件]
+  end
+  subgraph CL[客户端]
+    MAC[macOS / Windows]
+    MOB[iOS / Android]
+  end
+  MAC -->|HTTPS + Bearer| PROXY
+  MOB -->|HTTPS + Bearer| PROXY
+  PROXY --> HUB
+  HUB <--> DB
+  HUB <--> KEY
+  SYNC <--> DB
+  HUB <--> MAIL
+  SYNC <--> MAIL
+```
+
+分布原则：
+
+- **客户端**只保存服务端地址与设备令牌；地址含端口（示例 `https://host:18443`），远程模式不直连 IMAP/SMTP。
+- **Hub 单进程**：HTTP API、内核、后台同步任务在同一进程；不要拆成两个进程共享一个 SQLite 文件。当前 Hub **没有后台同步**，必须补同步任务（IDLE 池 + 扫尾），否则库只会在手动 `mail-cli sync` 时更新。
+- **每用户一份**：一个 Hub 实例、一个 SQLCipher 库、一个持久卷。多用户不共用一个库 + 全权令牌；中期再做库内账户与令牌绑定。
+- **主密钥与库分开放**：库放持久卷，主密钥/邮箱凭据放 KMS 或 0600 文件；分开备份，主密钥丢失则数据不可恢复。
+- **容器密钥后端**：无头容器通常没有系统钥匙串；服务端使用 KMS/文件后端，不把开发用 `FileStore` 直接当生产。
+- **网络**：Hub 只绑定回环或容器网络，对外只暴露 TLS 入口；SSE 需关闭代理缓冲，读超时大于 `ping` 间隔。
+- **推送**：桌面用 SSE；手机后续由 Hub 转 APNs/FCM，载荷只含"有新变更"。
+
+| 场景 | 分布 | 说明 |
+|---|---|---|
+| 个人自用 | 1 台主机：1 个 Hub 容器 + TLS 反代 + 1 个卷 | 最小可用；补同步任务后即可 |
+| 家庭/小团队 | 每用户 1 个 Hub 容器 + 独立库；反代按子域名/端口路由 | 隔离最干净 |
+| 不建议 | 单库多用户 + 所有设备同一全权令牌 | 任意设备可读全部账户 |
+| 不要做 | 远端模式下客户端同时直连 IMAP/SMTP | 绕过服务端，凭据边界失效 |
+
+端口约定（默认标准端口，全部可覆盖）：
+
+| 用途 | 默认端口 | 覆盖方式 |
+|---|---|---|
+| TLS 入口（反向代理） | `443` | 反代站点配置（`listen`/`TLS_PORT`）；Hub 若内置 TLS，使用 `EYRIE_HUB_TLS_BIND` |
+| Hub 内部 HTTP | `8080` | `EYRIE_HUB_BIND=host:port`（当前实现） |
+| 客户端连接地址 | 随服务端 | 首次运行/设置中的"服务端地址"自带端口（如 `https://host:18443`） |
+| 邮箱接入（IMAP/POP3/SMTP） | 993/995/465（TLS）或 143/110/587 | 账户设置、CLI `--port`/`--smtp-port`；预设只提供默认值 |
+| 开发用 SMTP sink | `1025` | sink 启动参数或环境变量（如 `SMTP_SINK_PORT`） |
+| Dovecot 测试容器 | 容器内 `143` | `docker run -p ${DOVECOT_PORT:-31143}:143`，应用侧 `--port` 同步修改 |
+| 可选指标端点 | `9090` | 指标服务配置（如 `METRICS_PORT`） |
+
+- 任何新增监听端口都必须提供环境变量或配置项覆盖，代码只给默认值，不能把端口写死。
+- 默认端口被占用时用覆盖值（例如 Hub `18080`、TLS `18443`），不改代码常量。
+- 部署前用 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 现查占用。
+
+远程模式上线前置（缺一不可）：
+
+1. Hub 内置同步任务（当前缺失）。
+2. TLS 终止（反代或 Hub 内置 rustls）。
+3. 服务端密钥后端（KMS/文件）与备份说明。
+4. 令牌绑定账户，Session 只返回该设备可见账户。
+5. 发送提交端点（远程模式客户端没有 SMTP 凭据）。
+6. `/healthz`、DB 快照备份、日志脱敏。
+7. Hub 镜像与部署脚本（当前没有 Dockerfile，只有直接运行二进制）。
 
 ---
 
@@ -411,10 +495,9 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 | GET | `/download/{accountId}/{blobId}/{name}` | 正文/附件下载（blobId 为缓存散列 hex） |
 
 已实现的 method：`Mailbox/get`、`Mailbox/changes`、`Email/query`、`Email/get`、
-`Email/changes`、`Email/set`（仅更新 `keywords` 与 `mailboxIds`）、
-`Email/import`、`Thread/get`；
+`Email/changes`、`Email/set`（`keywords`/`mailboxIds` 更新、`create`、`destroy`）、
+`Email/import`、`Thread/get`、`Thread/changes`；
 其余（`Core/echo`、日历与身份）返回 `unknownMethod`。
-`Email/set` 的 `create`/`destroy` 按对象返回 `notSupported`。
 客户端不在支持范围内的筛选/排序条件返回 `unsupportedFilter` /
 `unsupportedSort`，不做静默忽略。
 
@@ -427,7 +510,14 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 客户端请求 `fetchTextBodyValues`/`fetchHTMLBodyValues` 时返回；未缓存的部分
 由 Hub 经 `mail-core` 按需拉取，不返回空正文冒充成功。
 
-本地库的变更日志有界：超过 `change_log_max_rows`（默认 20,000）后，`compact_changes` 在当前水位写一份全量快照并删除被覆盖的 `changes` 行。水位（`latest_change_seq`）取快照 seq 与剩余 `changes` 最大 seq 的较大值，因此压缩不会让状态字符串倒退；早于最旧保留行的游标由 `change_window` 识别并要求重载快照。
+本地库的变更日志有界：超过 `change_log_max_rows`（默认 20,000）后，`compact_changes` 在当前水位写一份全量快照并删除被覆盖的 `changes` 行。水位（`latest_change_seq`）取快照 seq 与剩余 `changes` 最大 seq 的较大值，因此压缩不会让状态字符串倒退；早于最旧保留行的游标由 `change_window` 识别并要求重载快照。state 按实体类型区分（mailbox/message/thread），`Email/set` 的 `ifInState` 只与 message 类型水位比较。
+
+客户端缓存（远程模式）：
+
+- 列表页只读本地缓存：元数据来自 `Email/query` + `Email/get` 的精简字段，按邮箱/时间窗口缓存，允许全量元数据。
+- 每类对象单独保存 state；收到 `cannotCalculateChanges` 时清空该类型的缓存并全量重载，不阻塞其他类型。
+- 正文/附件只在用户打开或导出时拉取并缓存；"清除缓存"删除缓存目录并清空 state，下次进入重新拉取，服务端数据不变。
+- 缓存大小与时间窗口由客户端设置；达上限时先淘汰未打开过的正文/附件，再淘汰旧元数据。
 
 推送：SSE 事件只携带 `{type, state}`，不含正文。Hub 侧已实现 SSE；手机端由 Hub 转
 APNs/FCM 静默推送（载荷只含"有新变更"）尚未实现，等待推送凭据。
@@ -441,6 +531,8 @@ APNs/FCM 静默推送（载荷只含"有新变更"）尚未实现，等待推送
 | 传输 | TLS 1.2+（rustls），自建 Hub 可选 SPKI pinning |
 | 认证 | OAuth2 + PKCE；SMTP/IMAP 用 SASL；Hub 设备令牌 32 字节随机，只存哈希 |
 | 凭据 | 系统钥匙串（Keychain / Credential Manager / Keystore）；内存 `zeroize` |
+| 客户端凭据边界 | 本地模式：邮箱密码只进客户端钥匙串；远程模式：客户端只存 Hub 地址与设备令牌，邮箱密码只在服务端保险箱，客户端不落盘、不写日志 |
+| 客户端缓存 | 仅元数据与已打开内容；与服务端库分离；一键清除；清除只影响本地，不触发服务端删除 |
 | 服务端保险箱 | 每账户 DEK，KEK 来自 KMS/env；XChaCha20-Poly1305；轮换流程写入 runbook |
 | 本地库 | SQLCipher（`bundled-sqlcipher-vendored-openssl`）；主密钥存钥匙串，库密钥由它经 HKDF-SHA256 派生；FTS 索引随库加密；明文旧库拒绝打开；主密钥可导出/导入做人工恢复 |
 | 邮件 HTML | 核心侧 `ammonia` 白名单净化；图片默认全阻断，仅放行 `cid:` 与光栅 data URI（含相对路径与 `srcset`）；UI 侧禁用 JS 的沙箱 WebView；CSP `default-src 'none'` |
@@ -560,8 +652,9 @@ CI 门禁：`fmt`、`clippy -D warnings`、`test`、`deny`、`bench`、产物体
 2. 同步：IMAP/SMTP 适配 + 变更日志 + 冲突处理
 3. 桌面壳：macOS 接通（列表/阅读/写信/搜索），Windows 复用同一核心
 4. 日历：系统桥 + CalDAV/Google/Graph + 邀请函
-5. Hub：JMAP 子集 + 设备配对 + 推送 + 部署
-6. 移动：iOS/Android 薄客户端 + 后台同步 + 推送
+5. Hub：JMAP 子集 + 设备配对 + 推送 + 部署；远程模式前置：HTTPS、发送提交端点、令牌按账户授权
+6. 客户端双模式：首次运行选择、远程 JMAP 适配层、独立缓存与清除
+7. 移动：iOS/Android 薄客户端 + 后台同步 + 推送
 
 顺序只表示依赖关系：前一项的接口稳定后才能并行下一项。任何一项都必须自带压测与故障注入，禁止"先堆功能后补质量"。
 

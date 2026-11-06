@@ -28,6 +28,7 @@
 | D10 | 首发平台 | macOS + Windows（同一里程碑，先后实现） | |
 | D11 | Windows 内存路线 | 先 WinUI 3（目标 110–130 MB），若不接受再评估 C++/WinRT 或 Slint | 未在 Windows 上验证 |
 | D12 | Linux 桌面 UI 技术栈 | Slint（纯 Rust，单进程直连 `mail-core`） | 无 WebView / GTK / Qt 运行时依赖；macOS 上即可编译运行验证。代价：第四套 UI，Windows 若也转 Slint 需重评 D11 |
+| D13 | 客户端双模式形态 | 首次运行选择本地模式或远程模式；远程模式只填服务端地址 + 设备令牌，邮箱凭据只在服务端；客户端缓存列表元数据与已打开正文/附件，可一键清除；服务端地址必须 HTTPS（回环例外），令牌按账户授权 | 把 D4 落成可操作产品形态；远程模式客户端不接触邮箱密码；列表可全量缓存，正文/附件按需；远程发送需服务端新增提交端点 |
 
 完整理由与代价见 `docs/ARCHITECTURE.md` §2。
 
@@ -60,6 +61,8 @@
 | HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
 | JMAP 子集（读写） | 完成 | `mail-api`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（create/destroy）、`Email/import`、`Thread/get|changes`、`BodySource` 按需正文、`WriteSink` 写路径；25 个 API 测试；Dovecot 实跑 |
 | Hub 服务端与设备配对 | 完成 | `mail-hub`（axum）：配对码换令牌、库中只存哈希、Bearer 鉴权、`/eventsource`、`/download`；`mail-cli devices`/`revoke-device`；5 个路由测试 + 实跑 |
+| Hub 远程模式前置（HTTPS / 发送 / 账户授权） | 未开始 | 当前 Hub 明文 HTTP、默认 `127.0.0.1:8080`；无发送提交端点；配对令牌可访问库内全部账户 |
+| 客户端双模式（本地 / 远程） | 未开始 | macOS 目前只有本地直连（FFI → `mail-core`）；无 JMAP 客户端、无远程配置入口、无独立缓存与清缓存 |
 | Hub 写操作与 SSE | 完成 | `Email/set` 已读/标志/移动（含多副本）/创建/永久删除、`Mailbox/changes`、SSE 状态事件、blob 下载；Dovecot 实跑（`\Seen` 置/清、移动、计数、下载、token 吊销后 401） |
 | Hub 上传与导入 | 完成 | `/upload`（内容寻址 + 24 h 回收）+ `Email/import`（APPEND → 同步 → 返回本地 id）；Dovecot 实跑 2 封导入、首封带 `\Seen` |
 | 线程（Thread/get\|changes） | 完成 | schema v8 `in_reply_to`；`thread_id` 取父线程根，父后到递归改挂；`Email/get.threadId` 与 `Thread/get` 一致；线程变更由写侧记录（created/updated/removed）；单元 9 项 + Dovecot 实跑「回复并入同一线程」「根 created、回复 updated、销毁后 destroyed」 |
@@ -246,55 +249,56 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 # 换机器时先 import-key 再打开库；库已存在则密钥必须能打开它，否则拒绝写入
 
 # 4.1) Hub：与 mail-cli 共用同一个库与密钥存储
+# 示例用 18080 覆盖默认 8080；端口由 EYRIE_HUB_BIND 决定，起服务前用 lsof 查占用
 EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets EYRIE_HUB_DB=/tmp/smoke.db \
-EYRIE_HUB_BIND=127.0.0.1:8080 EYRIE_HUB_PAIRING_CODE=dev-code \
+EYRIE_HUB_BIND=127.0.0.1:18080 EYRIE_HUB_PAIRING_CODE=dev-code \
 cargo run -p mail-hub --release
-TOKEN=$(curl -s -X POST http://127.0.0.1:8080/pair -H 'Content-Type: application/json' \
+TOKEN=$(curl -s -X POST http://127.0.0.1:18080/pair -H 'Content-Type: application/json' \
   -d '{"code":"dev-code","name":"phone"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-curl -s http://127.0.0.1:8080/.well-known/jmap -H "Authorization: Bearer $TOKEN"
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s http://127.0.0.1:18080/.well-known/jmap -H "Authorization: Bearer $TOKEN"
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":"1"},"c0"]]}'
 # 写：标已读（id 取 Email/get）、移动（mailboxId 取 Mailbox/get）
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":"1","update":{"<id>":{"keywords":{"$seen":true}}}},"c0"]]}'
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":"1","update":{"<id>":{"mailboxIds":{"<mailboxId>":true}}}},"c0"]]}'
 # 增量与 SSE：closeafter/ping 接受秒数或 PTxxS
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/changes",{"accountId":"1","sinceState":"<seq>"},"c0"]]}'
-curl -sN "http://127.0.0.1:8080/eventsource/?types=Email,Mailbox&closeafter=5&ping=2" \
+curl -sN "http://127.0.0.1:18080/eventsource/?types=Email,Mailbox&closeafter=5&ping=2" \
   -H "Authorization: Bearer $TOKEN"
 # 下载：blobId 取 Email/get 的 textBody/attachments；只在 blob 属于该账户时返回
-curl -s "http://127.0.0.1:8080/download/1/<blobId>/file.bin" \
+curl -s "http://127.0.0.1:18080/download/1/<blobId>/file.bin" \
   -H "Authorization: Bearer $TOKEN" -o /tmp/download.bin
 # 上传 → 导入 → 线程（blobId 取 /upload 响应，mailboxId 取 Mailbox/get）
 TOKEN=...  # /pair 返回
-curl -s -X POST http://127.0.0.1:8080/upload/1 -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/upload/1 -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: message/rfc822' --data-binary @/tmp/imp1.eml
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/import",{"accountId":"1","emails":{"a":{"blobId":"<blob>","mailboxIds":{"1":true},"keywords":{"$seen":true}}}},"c0"]]}'
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Thread/get",{"accountId":"1","ids":["<Message-ID>"]},"c0"]]}'
 # Email/set create（返回完整 Email 对象）与 destroy（永久删除所有副本）
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":"1","create":{"k1":{"blobId":"<blob>","mailboxIds":{"3":true},"keywords":{"$seen":true}}}},"c0"]]}'
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":"1","destroy":["<id>"]},"c0"]]}'
 # destroy 后：Email/get 进 notFound，服务器 doveadm search 无结果；多副本会一起删除
 # 多副本移动：目标保留一份，其余副本进 \Trash 角色邮箱（无 Trash 时 notSupported）
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/set",{"accountId":"1","update":{"<id>":{"mailboxIds":{"<mailboxId>":true}}}},"c0"]]}'
 # Thread/changes：新线程 created、回复并入 threaded updated、最后一份副本删除后 destroyed
-curl -s -X POST http://127.0.0.1:8080/jmap -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Thread/changes",{"accountId":"1","sinceState":"<state>"},"c0"]]}'
 # 尾斜杠同样可用；导入后 doveadm fetch 可核对服务器上的 flags 与 In-Reply-To
@@ -360,6 +364,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | 开发密钥存储 | 默认钥匙串（生产唯一路径）。cargo 产物是 ad-hoc 签名，钥匙串 ACL 的 partition 按 **cdhash** 记录，每次重建都重新弹窗（见 §11；自签名证书实测无效）。开发用 `--dev-secret-dir <dir>` 或 `EYRIE_DEV_SECRET_DIR` 切到 `FileStore`（目录 0700、文件 0600），主密钥与账户密码都是该目录下的文件，完全不碰钥匙串，重建后无需授权。**发布验证必须走钥匙串** |
 | 网络 | 2026-10-29 实测 `imap.gmail.com:993` 直连可用（TLS 1.3 握手成功），尚未用账户登录验证；其余源码镜像可达 |
 | UI 工具链 | Slint 为纯 Rust 依赖，本机可编译运行；**无 pkg-config、GTK、Qt 开发库**，GTK4/Tauri 方案在本机无法编译验证（D12 据此选定 Slint） |
+| Hub 端口 | 默认标准端口，全部可覆盖：Hub API 用 `EYRIE_HUB_BIND`（代码默认 `127.0.0.1:8080`）、TLS 反代用站点配置、客户端地址自带端口；Dovecot 用 `docker -p ${DOVECOT_PORT:-31143}:143`；起服务前 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 现查 |
 
 ---
 
@@ -457,6 +462,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 15. **macOS 通知、草稿与多账户切换未做**。列表/阅读/搜索/同步/标已读/标星/移动/HTML/附件/分页/i18n/撰写（To/Cc/Bcc + 附件）/`.app` 打包已接通。剩余：新邮件通知（需 FFI 事件流 + `UNUserNotificationCenter`）、草稿保存、真实多账户切换。**验收**：新邮件可触发系统通知；**未验证**：真实 Gmail/QQ/88 账户投递（§10），通知权限与签名分发。
 16. **Hub 写操作覆盖面**。已完成 `keywords`/`mailboxIds` 更新、多副本移动、`/upload`、`Email/import`、`Email/set` 的 `create`/`destroy`、`Thread/get|changes`；自定义关键字、APNs/FCM、`Email/query` 的 `operator`/`conditions` 组合过滤与升序排序未做；导入/创建只支持 IMAP 账户与单邮箱；一次 `Email/get` 内正文串行拉取；`Thread/changes` 只覆盖本构建之后的变更（升级前历史线程不补发，客户端先 `Thread/get`）。**验收**：客户端可导入、按线程展示并永久删除（已完成）；APNs/FCM 待凭据。
 17. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。**验收**：重建后客户端能收到 `cannotCalculateChanges` 或完整 destroyed 列表。
+18. **客户端双模式未实现（D13，下一项）**。macOS 目前只有本地直连；远程模式需要的 Hub 前置（HTTPS、发送提交端点、令牌按账户授权）与客户端适配层（模式选择、地址 + 令牌配置、JMAP 客户端、独立缓存与清除）都未开始。**验收**：同一 `.app` 首次运行可选两种模式；远程模式在断网时仍能打开上次缓存的列表，清缓存后可重新加载；客户端不保存邮箱密码。
 
 ---
 
@@ -475,7 +481,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 ### 第 4 段：服务端与移动（进行中）
 
-6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**读写子集、SSE、附件下载、设备吊销、上传、`Email/import`、`Email/set create/destroy`、多副本移动、`Thread/get|changes` 完成**（2026-11-06）；剩余：APNs/FCM 推送（缺凭据）。
+6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**读写子集、SSE、附件下载、设备吊销、上传、`Email/import`、`Email/set create/destroy`、多副本移动、`Thread/get|changes` 完成**（2026-11-06）；剩余：APNs/FCM 推送（缺凭据）、远程模式前置（HTTPS、发送提交端点、令牌按账户授权）。
 7. iOS/Android 薄客户端（依赖 Hub 推送凭据）。
 
 ### 第 5 段：日历与翻译
@@ -485,9 +491,19 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 ### 第 6 段：桌面 UI
 
-10. macOS SwiftUI：列表/阅读/搜索/同步/标已读/撰写（To/Cc/Bcc + 附件）/`.app` 打包完成；剩余通知、草稿、真实多账户切换。
-11. Windows WinUI 3（复用 Rust 核心）。
-12. Linux Slint（`apps/linux`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定，实现未开始。
+10. 客户端双模式（D13）：首次运行选择本地/远程；远程填服务端地址 + 设备令牌；抽象 UI 数据源（FFI 本地 / JMAP 远程）；独立缓存与清缓存；远程模式隐藏撰写直到服务端发送端点就绪。
+11. macOS SwiftUI：列表/阅读/搜索/同步/标已读/撰写（To/Cc/Bcc + 附件）/`.app` 打包完成；剩余通知、草稿、真实多账户切换。
+12. Windows WinUI 3（复用 Rust 核心）。
+13. Linux Slint（`apps/linux`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定，实现未开始。
+
+### 远程模式部署分布（D13，推荐）
+
+- 拓扑：客户端 → TLS 反代 → Hub 单进程（JMAP/SSE + 内核 + 同步任务）→ SQLCipher 库；Hub 出站连 IMAP/POP3/SMTP。
+- 每用户一个 Hub 实例、一个库、一个持久卷；主密钥与库分开放、分开备份；容器内用 KMS/文件密钥后端，不依赖系统钥匙串。
+- 桌面用 SSE；手机后续由 Hub 转 APNs/FCM（载荷只含"有新变更"）。
+- 端口：默认使用标准端口，且全部可通过变量/配置覆盖——Hub API `EYRIE_HUB_BIND`、TLS 反代站点配置、客户端地址自带端口、Dovecot `-p`、开发 SMTP sink 环境变量；默认端口被占用时用覆盖值（如 18080/18443），不改代码常量，部署前用 `lsof` 现查。
+- 上线前置：Hub 内置同步任务（当前缺失）、TLS、服务端密钥后端、令牌绑定账户、发送提交端点、`/healthz` 与备份、Hub 镜像/部署脚本（当前没有 Dockerfile）。
+- 详细原则、场景表与上线清单见 `docs/ARCHITECTURE.md` §3.2。
 
 ---
 
@@ -500,6 +516,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | 一个 iCloud 账户（应用专用密码） | C 档与 COPY+删除路径实测 | 阻塞 §8-5 的 C 档验证 |
 | 一台 Windows 11 机器 + .NET SDK | WinUI 3 + UniFFI 内存验证 | 阻塞 Windows UI 段 |
 | APNs / FCM 凭据 | 手机推送 | 阻塞移动端 |
+| 自建 Hub 的域名与 TLS 证书（或明确只在内网/回环使用） | 远程模式连通与安全验收 | 未提供则远程模式只能本机回环验证 |
 | ~~是否先做 Hub 还是先做桌面 UI~~ | 排序 | 已定：先做 Hub（第 4 段），桌面 UI 顺延 |
 
 ---
@@ -603,6 +620,10 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 - JMAP state 按实体类型取水位（`latest_change_seq_type`）：mailbox/thread 行会推进账户级序列，若 `Email/set` 用 `latest_change_seq` 校验 `ifInState`，客户端刚拿到的 `Email/changes` state 会被误判成 `stateMismatch`。
 - `Thread/changes` 只记录本构建之后的线程变更；旧库升级后历史线程没有 `changes` 行，客户端应先用 `Thread/get`。压缩会同时删掉 thread 行，早于快照的游标一律 `cannotCalculateChanges`。
 - 删除最后一份副本时 `remove_all_locations` 必须先删 `message_locations` 再 `purge_orphan_messages`；顺序反了会留下没有位置的消息行（`Email/get` 看不到但线程仍把它算进 `emailIds`）。
+- 远程模式客户端只能持有 Hub 地址与设备令牌，**不得保存邮箱密码**，否则等于绕开服务端、破坏“凭据只在服务端”的边界；本地模式的账号与钥匙串也不能被远程模式复用。
+- Hub 当前是明文 HTTP、默认绑定 `127.0.0.1:8080`（仅兼容/开发），且没有发送端点与账户级授权。远程模式对外开放前必须先补 HTTPS、`Email/submission`（或等价发送端点）与令牌绑定账户，否则只能做本机回环演示；端口默认用标准值，但必须能通过 `EYRIE_HUB_BIND`、反代配置或客户端地址覆盖，不要在代码里改常量。
+- 远程模式的“清除缓存”只清客户端缓存与对应 state，绝不调用服务端删除；清完后从 `state=0` 重新拉当前窗口，不能把 `cannotCalculateChanges` 当成清缓存。
+- 列表允许全量元数据缓存，正文/附件按需；不要为了“列表本地”在客户端预先拉全量正文，也不要为了“不全量”把列表改成每次都走网络。
 
 ---
 

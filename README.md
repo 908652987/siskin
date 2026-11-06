@@ -26,13 +26,15 @@ cargo build --release
 # 测试服务器（生成 1 万封测试邮件）
 python3 spike/scripts/gen_mail.py --root spike/data/Maildir --count 10000
 docker build -t mail-spike-dovecot spike/dovecot
-docker run -d --name mail-spike-dovecot -p 31143:143 \
+# 默认端口被占用时可覆盖；示例固定用 31143（容器内仍为 143）
+DOVECOT_PORT="${DOVECOT_PORT:-31143}"
+docker run -d --name mail-spike-dovecot -p "$DOVECOT_PORT:143" \
   -v "$PWD/spike/data/Maildir:/home/vmail/Maildir" mail-spike-dovecot
 docker exec mail-spike-dovecot doveadm index -u vmail INBOX
 
 # 添加账户并同步
 cargo run -p mail-cli -- --db /tmp/mail.db add-account \
-  --email vmail@example.com --host 127.0.0.1 --port 31143 \
+  --email vmail@example.com --host 127.0.0.1 --port "$DOVECOT_PORT" \
   --security plaintext --insecure-plaintext true \
   --username vmail --password testpass
 cargo run -p mail-cli -- --db /tmp/mail.db sync --email vmail@example.com

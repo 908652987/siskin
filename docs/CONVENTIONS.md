@@ -214,3 +214,13 @@ through SecretStore and refreshed on 401.
 - 必须跑的命令：cargo fmt / clippy / test（以及 Dovecot 冒烟，若涉及协议）
 - 不得出现：新增 warning、未使用代码、TODO 占位
 ```
+
+---
+
+## 15. 配置与端口
+
+- 所有监听端口必须可通过环境变量或配置文件覆盖；代码只提供默认值，禁止把端口写死。
+- 默认值使用协议或工具的惯用端口：HTTPS 443、HTTP 8080、IMAP 143/993、POP3 110/995、SMTP 25/465/587、指标 9090、开发 SMTP sink 1025、Dovecot 容器内 143。
+- 已有覆盖方式：Hub API `EYRIE_HUB_BIND`；账户端口 `--port`/`--smtp-port` 与客户端账户设置；Dovecot 用 `docker -p ${DOVECOT_PORT:-31143}:143`；客户端连接的服务端地址本身包含端口。
+- 默认端口被占用时使用覆盖值（例如 Hub `18080`、TLS `18443`），不要修改代码常量；文档示例可以展示覆盖后的值，但要注明默认值。
+- 起服务前用 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 确认端口空闲。
