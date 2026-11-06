@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use chrono::Utc;
 use mail_crypto::{CryptoError, MasterKey, SecretStore};
 use mail_proto::pop3::{Pop3Config, Pop3Session};
@@ -22,9 +20,10 @@ use mail_sync::{plan_mailboxes, pop3_uid, MailboxTarget, Pop3SyncEngine, SyncEng
 pub use mail_sync::{AccountSyncReport, SyncOutcome};
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinSet};
-use uuid::Uuid;
 
+pub mod compose;
 pub mod presets;
+pub use compose::{ComposeError, ComposedMessage, OutgoingAttachment, OutgoingMessage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -38,6 +37,8 @@ pub enum CoreError {
     Proto(#[from] ProtoError),
     #[error("sync: {0}")]
     Sync(#[from] SyncError),
+    #[error("compose: {0}")]
+    Compose(#[from] ComposeError),
     #[error("account not found: {0}")]
     AccountNotFound(String),
     #[error("account has no stored secret: {0}")]
@@ -542,7 +543,7 @@ impl Core {
             protocol: spec.protocol,
             security: Some(spec.security),
             tls: None,
-            smtp: spec.smtp.clone(),
+            smtp: spec.smtp.clone().or_else(|| default_smtp(spec)),
             sent_mailbox: spec.sent_mailbox.clone(),
         };
         let id = self.store.create_account(
@@ -1419,16 +1420,10 @@ impl Core {
         Ok(())
     }
 
-    /// Sends a plain-text UTF-8 message over SMTP, then files it in the Sent
-    /// mailbox for IMAP accounts. A filing failure does not hide a successful
-    /// SMTP submission; it is reported in the outcome.
-    pub async fn send(
-        &self,
-        email: &str,
-        recipients: &[String],
-        subject: &str,
-        body: &str,
-    ) -> Result<SendOutcome> {
+    /// Sends a message over SMTP, then files it in the Sent mailbox for IMAP
+    /// accounts. A filing failure does not hide a successful SMTP submission;
+    /// it is reported in the outcome.
+    pub async fn send(&self, email: &str, message: &OutgoingMessage) -> Result<SendOutcome> {
         let account = self.account(email)?;
         let settings = settings_of(&account)?;
         let smtp = settings
@@ -1436,7 +1431,7 @@ impl Core {
             .as_ref()
             .ok_or_else(|| CoreError::Settings("no SMTP settings for this account".into()))?;
         let password = self.password(&account)?;
-        let message = build_message(&account.email, recipients, subject, body);
+        let composed = compose::compose(&account.email, message)?;
 
         let mut session = SmtpSession::connect(&SmtpConfig {
             host: smtp.host.clone(),
@@ -1451,7 +1446,7 @@ impl Core {
         })
         .await?;
         session
-            .send(&account.email, recipients, message.as_bytes())
+            .send(&account.email, &composed.envelope, &composed.bytes)
             .await?;
         session.quit().await;
 
@@ -1464,10 +1459,7 @@ impl Core {
                 .unwrap_or_else(|| "Sent".to_string());
             match self.connect_imap(&account).await {
                 Ok(mut imap) => {
-                    match imap
-                        .append(&mailbox, Some("\\Seen"), message.as_bytes())
-                        .await
-                    {
+                    match imap.append(&mailbox, Some("\\Seen"), &composed.bytes).await {
                         Ok(()) => saved_to = Some(mailbox),
                         Err(err) => save_error = Some(err.to_string()),
                     }
@@ -1478,7 +1470,7 @@ impl Core {
         }
 
         Ok(SendOutcome {
-            recipients: recipients.len(),
+            recipients: composed.envelope.len(),
             saved_to,
             save_error,
         })
@@ -1495,6 +1487,19 @@ impl Core {
 
 fn secret_key(email: &str) -> String {
     format!("account:{email}:password")
+}
+
+/// Known providers get SMTP defaults so a new account can send without
+/// repeating the host; custom accounts must supply SMTP explicitly.
+fn default_smtp(spec: &AccountSpec) -> Option<SmtpSettings> {
+    let hosts = presets::hosts(&spec.provider, &spec.email).ok()?;
+    let security = SecurityMode::Tls;
+    Some(SmtpSettings {
+        host: hosts.smtp,
+        port: presets::default_smtp_port(security),
+        security: Some(security),
+        username: Some(spec.username.clone()),
+    })
 }
 
 fn settings_of(account: &Account) -> Result<ServerSettings> {
@@ -1566,36 +1571,6 @@ fn clean_attachment_name(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-/// Builds a minimal RFC 5322 message. The body is base64 so any UTF-8 content
-/// survives SMTP line rules without quoted-printable edge cases.
-fn build_message(from: &str, recipients: &[String], subject: &str, body: &str) -> String {
-    let domain = from.rsplit_once('@').map(|(_, d)| d).unwrap_or("localhost");
-    let subject = if subject.is_ascii() {
-        subject.to_string()
-    } else {
-        format!("=?UTF-8?B?{}?=", STANDARD.encode(subject))
-    };
-    let encoded_body = wrap_base64(&STANDARD.encode(body));
-    format!(
-        "From: {from}\r\nTo: {}\r\nSubject: {subject}\r\nDate: {}\r\nMessage-ID: <{}@{}>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded_body}\r\n",
-        recipients.join(", "),
-        Utc::now().to_rfc2822(),
-        Uuid::new_v4(),
-        domain,
-    )
-}
-
-fn wrap_base64(encoded: &str) -> String {
-    let mut out = String::with_capacity(encoded.len() + encoded.len() / 76 * 2);
-    for (index, chunk) in encoded.as_bytes().chunks(76).enumerate() {
-        if index > 0 {
-            out.push_str("\r\n");
-        }
-        out.push_str(&String::from_utf8_lossy(chunk));
-    }
-    out
 }
 
 /// Master key lives in the keychain; the database key is derived from it, so
@@ -1856,21 +1831,5 @@ mod transport_tests {
         assert_eq!(settings.protocol, ReceiveProtocol::Imap);
         assert_eq!(settings.security(), SecurityMode::Plaintext);
         assert!(settings.smtp.is_none());
-    }
-
-    #[test]
-    fn built_message_encodes_subject_and_body() {
-        let message = build_message(
-            "sender@example.com",
-            &["peer@example.com".to_string()],
-            "你好",
-            "hello",
-        );
-        assert!(message.contains("To: peer@example.com\r\n"));
-        assert!(message.contains("Subject: =?UTF-8?B?"));
-        assert!(message.contains("Message-ID: <"));
-        assert!(message.contains("@example.com>"));
-        assert!(message.contains("aGVsbG8="));
-        assert!(message.ends_with("\r\n"));
     }
 }

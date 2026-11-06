@@ -88,3 +88,22 @@
 "account.hint.88" = "Use an app password for 88 / 111 / email.cn; the server follows the email domain.";
 "account.hint.custom" = "Enter the IMAP server, port, and transport security manually.";
 "account.useEmail" = "Use email address";
+
+"action.compose" = "New Message";
+"menu.file" = "File";
+"status.sent" = "Sent to %d recipient(s)";
+"compose.title" = "New Message";
+"compose.to" = "To";
+"compose.cc" = "Cc";
+"compose.bcc" = "Bcc";
+"compose.subject" = "Subject";
+"compose.addCcBcc" = "Cc/Bcc";
+"compose.attach" = "Attach";
+"compose.send" = "Send";
+"compose.noAccount" = "Choose an account first.";
+"compose.noDatabase" = "The database is not open yet.";
+"compose.notSaved" = "Sent, but not filed to %@: %@";
+"account.section.smtp" = "Sending (SMTP)";
+"account.smtpHost" = "SMTP host";
+"account.smtpHost.placeholder" = "smtp.example.com";
+"account.smtpHelp" = "Presets fill this in. Custom accounts must provide an SMTP host to send mail.";

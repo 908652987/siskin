@@ -1,8 +1,8 @@
-# 实现说明（同步内核 + 加密库 + 多协议 + 正文索引 + 多邮箱实时监听 + Hub）
+# 实现说明（同步内核 + 加密库 + 多协议 + 正文索引 + 多邮箱实时监听 + Hub + 桌面撰写）
 
-日期：2026-11-02
-范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP/POP3 接收、SMTP 发送、提供商预设、正文/附件按需拉取与 HTML 净化、正文全文索引（schema v6）、全账户多邮箱遍历与实时监听、本地回收站与保留期、开发 CLI
-状态：协议路径已实测（Dovecot + 88 服务器 STARTTLS）；正文与附件、多邮箱、回收站、实时监听、正文搜索对 Dovecot 实跑；真实账号收发未验收
+日期：2026-11-06
+范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP/POP3 接收、SMTP 发送（To/Cc/Bcc 与附件）、提供商预设、正文/附件按需拉取与 HTML 净化、正文全文索引（schema v6）、全账户多邮箱遍历与实时监听、本地回收站与保留期、Hub JMAP 子集、macOS 撰写与 `.app` 打包、开发 CLI
+状态：协议路径已实测（Dovecot + 88 服务器 STARTTLS）；正文与附件、多邮箱、回收站、实时监听、正文搜索、撰写发送（Dovecot + 本地 SMTP sink）已实跑；真实账号收发未验收
 
 ---
 
@@ -83,7 +83,10 @@ flowchart LR
 - 默认端口由协议与安全方式推导（IMAP 993/143、POP3 995/110、SMTP 465/587）。
 - 明文必须显式开启：`--security plaintext` 或 `--smtp-security plaintext` 需要同时提供 `--insecure-plaintext true`，否则拒绝写入账户。
 - QQ 的 143/110 不提供 STARTTLS/STLS，使用这两个端口即明文传授权码；文档与错误信息会提示改用 993/995。
-- 发信为纯文本 UTF-8（base64 正文）；IMAP 账户发送成功后尝试追加到 `Sent`（`--sent-mailbox` 可改），失败只报告 `save_error`，不回滚投递；POP3 无 Sent 归档。
+- 发信：To/Cc/Bcc 三组收件人，Bcc 只写入 SMTP 信封、绝不写入报文头；正文为 UTF-8 base64；附件用 `multipart/mixed`（每封合计上限 25 MiB，超限直接失败不截断）。
+- 头字段校验：主题/地址/附件名含控制字符即拒绝（防头注入）；地址只接受 `local@domain` 形式（不支持显示名与 SMTPUTF8）；非 ASCII 主题按 45 字节切成折叠的 RFC 2047 encoded-word，非 ASCII 附件名用单段 encoded-word（`mail-parse` 能解回）。
+- SMTP 缺省：预设 provider 在 `Core::add_account` 时自动补 SMTP（465 隐式 TLS，用户名取接收用户名）；`custom` 必须显式给 SMTP，否则发送时报 `no SMTP settings`。
+- 归档：IMAP 账户发送成功后尝试 `APPEND` 到 `Sent`（`--sent-mailbox` 可改），失败只报告 `save_error`，不回滚投递；POP3 无 Sent 归档。`APPEND` 的标志位必须以括号列表传入（`(\Seen)`），缺括号会让服务器拒绝并让客户端挂起。
 
 ---
 
@@ -105,6 +108,10 @@ flowchart LR
 | STARTTLS（88：IMAP 143 / POP3 110 / SMTP 587） | 升级后进入 AUTH，错误口令被拒 |
 | POP3 同步（mock） | 2 封入库；UIDL 消失后 removed=1 |
 | SMTP（mock） | AUTH PLAIN、MAIL/RCPT/DATA、点填充校验通过 |
+| 撰写发送（Dovecot IMAP + 本地 SMTP sink，CLI） | `to/cc/bcc` 三个 RCPT；报文头只有 `To`/`Cc`，无 `Bcc`；`Sent` 3→4；附件 32 字节往返一致 |
+| 撰写发送（`mail-ffi` 冒烟） | `sendRecipients=3 savedTo=Sent`；正文与附件在 Sent 中可回读 |
+| IMAP `APPEND` 标志（mock） | 断言命令为 `APPEND "Sent" (\Seen) {n}`；修复前缺括号导致连接挂起 |
+| 撰写校验 | 非法地址、含 `\r\n` 的主题均被拒绝；附件 25 MiB 上限单测覆盖 |
 | 正文拉取（multipart/alternative + 附件，Dovecot） | 首次取正文 1 次连接，`state=partial`；附件下载后 `state=full` |
 | 正文二次打开（服务器已停） | **39 ms** 进程整体，纯本地缓存命中 |
 | 单部件消息（`BODY.PEEK[TEXT]`） | 正常取回，`state=full` |
@@ -123,7 +130,7 @@ flowchart LR
 | 正文索引查询（10k 封） | 命中全表的 3 字词 ~55 ms；中文 2 字 LIKE 52 ms（1,000 字/封）/ 137 ms（4,000 字/封）；选择性短语 0.1–0.3 ms |
 | 正文搜索（Dovecot 端到端） | 拉取前搜 `zebraqilin` 无结果，`body` 后命中；中文 2 字 `营收` 经 LIKE 命中 |
 | schema v5→v6 迁移 | 主题索引保留、正文从 blob 回填、`user_version=6`（单测） |
-| 单测 | 92 个全绿（crypto/store/sync/proto/parse/core） |
+| 单测 | 127 个全绿（crypto/store/sync/proto/parse/core/api/hub/ffi/cli 组件） |
 
 首次同步后进程启动有一次钥匙串授权检查（新二进制），之后的同步都在 40 ms 内。
 
@@ -170,14 +177,16 @@ flowchart LR
 
 ## 5.3 macOS SwiftUI 壳
 
-- 分层：`mail-ffi` 用 UniFFI 暴露 `MailClient`（`open`、`accounts`、`add_account`、`mailboxes`、`messages`、`body`、`set_seen`、`set_flagged`、`attachment`、`move_message`、`sync`），只依赖 `mail-core`/`mail-parse`；`apps/macos` 是 SwiftPM 可执行文件，`main.swift` 用 AppKit 创建窗口并挂 `NSHostingView`，不依赖 Xcode 工程或 `.app` 包。
+- 分层：`mail-ffi` 用 UniFFI 暴露 `MailClient`（`open`、`accounts`、`add_account`、`mailboxes`、`messages`、`body`、`set_seen`、`set_flagged`、`attachment`、`move_message`、`sync`、`send`），只依赖 `mail-core`/`mail-parse`；`apps/macos` 是 SwiftPM 可执行文件，`main.swift` 用 AppKit 创建窗口并挂 `NSHostingView`，`package.sh` 再组装成 `dist/Siskin.app`。
 - 数据路径：`AppModel` 用 `async/await` 调 UniFFI；列表走 `Store::query_messages`（统一收件箱去重、正文 FTS、分页），正文走 `Core::fetch_body`（命中缓存时纯本地），标已读走 `Core::set_keywords`（服务器成功后才改本地）。打开未读邮件会自动标已读并刷新计数。
 - 绑定生成：`apps/macos/build.sh` 编译 `mail-ffi`，用 `uniffi-bindgen generate --library target/debug/libmail_ffi.dylib --language swift` 生成 Swift/头/modulemap，把静态库复制到 `apps/macos/libs/` 后 `swift build`。生成物全部 gitignored，改 FFI 公开类型后必须重跑脚本。
-- 当前范围：账户选择与新增（Gmail/QQ/88/自定义预设）、邮箱/邮件列表、HTML（WKWebView，JS 禁用）+ 纯文本阅读、搜索、同步、标已读/未读、标星、移动、分页加载、附件保存、zh-Hans/en 国际化；撰写、通知、`.app` 打包未做。
-- 预设来源：`mail-ffi::provider_presets` 调用 `mail_core::presets`，返回主机/端口/TLS；88 的 IMAP 主机按邮箱域名（88.com / 111.com / email.cn）推导，无邮箱时回退 `imap.88.com`。切换传输安全时端口在 993/143 之间联动。
+- 当前范围：账户选择与新增（Gmail/QQ/88/自定义预设、SMTP 字段）、邮箱/邮件列表、HTML（WKWebView，JS 禁用）+ 纯文本阅读、搜索、同步、标已读/未读、标星、移动、分页加载、附件保存、撰写（To/Cc/Bcc + 多附件）、`.app` 打包、zh-Hans/en 国际化；通知与草稿未做。
+- 撰写：`ComposeView` 是挂在 `RootView` 上的 sheet，⌘N（文件菜单）或工具栏入口打开；附件用 `NSOpenPanel` 多选，MIME 类型取 `UTType(filenameExtension:)?.preferredMIMEType`，读成 `Data` 经 FFI 传入；发送失败留在 sheet 内显示错误并保留正文/附件，成功后关闭并刷新列表与 Sent 计数。`SISKIN_COMPOSE_TO/CC/BCC/SUBJECT/BODY/ATTACH` 可在启动时预填，供快照与冒烟使用。
+- 打包：`apps/macos/package.sh` 先 release 构建 `mail-ffi` 并重新生成绑定，再 `swift build -c release`，最后组装 `Contents/{MacOS/Siskin,Resources/Siskin_SiskinApp.bundle,Info.plist}` 并 ad-hoc 签名。`Info.plist` 固定 `com.eyrie.siskin`、最低 macOS 14；没有 Xcode 工程，也没有公证与 Developer ID。
+- 预设来源：`mail-ffi::provider_presets` 调用 `mail_core::presets`，返回 IMAP/SMTP 主机、端口与 TLS；88 的主机按邮箱域名（88.com / 111.com / email.cn）推导，无邮箱时回退 `imap.88.com`/`smtp.88.com`。切换传输安全时 IMAP 端口在 993/143、SMTP 端口在 465/587 之间联动。
 - 布局：为避开 `NSHostingView` 下 `List(selection:)` 的 NSTableView 重入告警，侧栏与消息列表都用 `ScrollView + LazyVStack`；根视图显式画 `windowBackgroundColor`，分栏显式填满高度。HTML/纯文本切换单独占一行，避免英文长按钮把详情头部撑宽裁切。
 - 国际化：`L10n` 不依赖 `Bundle.preferredLocalizations`（本机会错误返回 `en`），按 `Locale.preferredLanguages`/`SISKIN_LANG` 直接读取 `.lproj/Localizable.strings`；RFC 2047 主题与发件人在 `mail-sync` 入库时解码，`mail-ffi` 再兜底解码旧数据。
-- 验证：`SiskinSmoke` 对 Dovecot 10,016 封库返回 1 账户 / 8 邮箱 / total=10,016，完成正文、附件、`$seen`/`$flagged` 往返；`Siskin` 窗口 1120×760，中英文快照分别渲染；`SISKIN_SNAPSHOT` 在应用内输出 PNG，绕过本机 TCC 屏幕录制限制。
+- 验证：`SiskinSmoke` 对 Dovecot 10,000+ 封库返回 1 账户 / 8 邮箱，完成正文、附件、`$seen`/`$flagged` 往返，并可经 `SISKIN_SEND_TO` 走 FFI 发送；`Siskin` 窗口 1120×760，撰写 sheet 680×560 快照已渲染，中英文分别验证；`SISKIN_SNAPSHOT`（含 `SISKIN_SNAPSHOT_COMPOSE`）在应用内输出 PNG，绕过本机 TCC 屏幕录制限制。`dist/Siskin.app` 启动后同样加载资源 bundle 并渲染撰写 sheet。
 
 ---
 
@@ -211,10 +220,18 @@ unset APP_PW
 # QQ：授权码；88：专用密码；自定义：显式 --host/--smtp-host
 # 接收协议可选 imap/pop3；安全方式 tls/starttls/plaintext
 
-# 4) 验证登录与发信
+# 4) 验证登录与发信（撰写支持 To/Cc/Bcc 与多附件）
 cargo run -p mail-cli -- --db /tmp/mail.db check --email you@gmail.com
 cargo run -p mail-cli -- --db /tmp/mail.db send --email you@gmail.com \
-  --to peer@example.com --subject hello --body 'plain text body'
+  --to peer@example.com --cc copy@example.com --bcc secret@example.com \
+  --subject hello --body 'plain text body' --attach /tmp/note.txt
+# 本地验证时把 --smtp-host 指向自建 sink（需 AUTH PLAIN），IMAP 账户会尝试 APPEND 到 Sent
+
+# 4.1) macOS 壳与 .app（与 CLI 共用库与密钥存储）
+./apps/macos/build.sh
+SISKIN_DB=/tmp/mail.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
+  apps/macos/.build/debug/Siskin
+./apps/macos/package.sh          # 产出 apps/macos/dist/Siskin.app（ad-hoc 签名）
 
 # 5) 同步与查看（不带 --mailbox 同步该账户全部可选邮箱）
 cargo run -p mail-cli -- --db /tmp/mail.db sync --email vmail@example.com
@@ -282,7 +299,7 @@ cargo test --workspace
 6. **中文 1–2 字搜索走 LIKE 扫描**，现在也扫 `body_text`。10k 封实测 137 ms；10 万封按线性外推 ~1.4 s（未验证），更大规模需要专门的分词索引。
 7. ~~**重连退避未做故障注入**~~。`watch_account` 下实测 Dovecot 重启：IDLE 会话同时断线并按退避重连，恢复后正常入库。未覆盖网络分区（连接挂起）等更隐蔽的故障。
 8. **POP3 语义受限**。无文件夹/标志位/IDLE；UIDL 以 63 位哈希映射为数字 uid；服务器删除通过 UIDL 消失检测。
-9. **发信能力窄**。仅纯文本；无附件、HTML、草稿；Sent 归档只在 IMAP 尝试，失败仅告警。
+9. **发信仍缺 HTML 与草稿**。已支持 To/Cc/Bcc、多附件（25 MiB 上限）与 Sent 归档（失败仅告警）；HTML 正文、草稿保存、Sent 去重未做（Gmail/QQ 服务端会自动归档，可能产生重复副本）。
 10. **真实账号未验收**。QQ/88/Gmail 的同步与发信需要授权码/专用密码。
 11. **主密钥无轮换与自动备份**。`export-key`/`import-key` 支持人工备份到密码管理器，但主密钥仍只有钥匙串一份，且库密钥不能在线轮换。
 12. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应已进入服务器 Trash 并同步到本地）；回收站不提供手工恢复，同名单重建时旧数据以 `(local trash <id>)` 行保留至保留期。
@@ -299,7 +316,7 @@ cargo test --workspace
 
 1. ~~Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动）、SSE 推送、附件下载~~（完成；APNs/FCM 仍缺凭据）
 2. 移动端薄客户端（依赖 Hub 推送与 APNs/FCM 凭据）
-3. 发信补齐：HTML、附件、草稿与 Sent 去重
+3. 发信补齐：~~附件~~（完成；To/Cc/Bcc + multipart/mixed）、HTML 正文、草稿、Sent 去重（Gmail 会自动归档）
 4. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）
 5. ~~多邮箱实时监听（每邮箱一个 IDLE 会话或轮询调度）~~（完成；IDLE 池 + 扫尾）
 6. 主密钥导出/恢复与库密钥轮换

@@ -6,6 +6,7 @@ extension Notification.Name {
     static let siskinSync = Notification.Name("siskin.sync")
     static let siskinReload = Notification.Name("siskin.reload")
     static let siskinFocusSearch = Notification.Name("siskin.focusSearch")
+    static let siskinCompose = Notification.Name("siskin.compose")
 }
 
 enum BodyMode: Hashable {
@@ -17,6 +18,7 @@ struct RootView: View {
     let dbPath: String
     @StateObject private var model = AppModel()
     @State private var showAddAccount = false
+    @State private var showCompose = false
 
     var body: some View {
         Group {
@@ -44,9 +46,15 @@ struct RootView: View {
             if ProcessInfo.processInfo.environment["SISKIN_SNAPSHOT_ADD_ACCOUNT"] != nil {
                 showAddAccount = true
             }
+            if ProcessInfo.processInfo.environment["SISKIN_SNAPSHOT_COMPOSE"] != nil {
+                showCompose = true
+            }
         }
         .sheet(isPresented: $showAddAccount) {
             AccountSetupView(model: model, isInitial: false)
+        }
+        .sheet(isPresented: $showCompose) {
+            ComposeView(model: model)
         }
         .alert(
             L10n.t("error.title"),
@@ -67,6 +75,9 @@ struct RootView: View {
                 await model.refreshMailboxes()
                 await model.refreshMessages()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .siskinCompose)) { _ in
+            showCompose = true
         }
     }
 }
@@ -140,6 +151,14 @@ private struct MailBrowserView: View {
             .padding(.vertical, 5)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
             .frame(width: 300)
+
+            Button {
+                NotificationCenter.default.post(name: .siskinCompose, object: nil)
+            } label: {
+                Label(L10n.t("action.compose"), systemImage: "square.and.pencil")
+            }
+            .keyboardShortcut("n", modifiers: [.command])
+            .disabled(model.selectedEmail == nil)
 
             Button {
                 Task { await model.syncNow() }
@@ -539,15 +558,22 @@ private struct AccountSetupView: View {
     @State private var security: SecurityFfi = .tls
     @State private var provider = "custom"
     @State private var usernameEdited = false
+    @State private var smtpHost = ""
+    @State private var smtpPort = "465"
+    @State private var smtpSecurity: SecurityFfi = .tls
     @FocusState private var emailFocused: Bool
 
     private var validPort: UInt16? { UInt16(port) }
     private var portInvalid: Bool { !port.isEmpty && validPort == nil }
+    private var validSmtpPort: UInt16? { UInt16(smtpPort) }
+    private var smtpPortInvalid: Bool { !smtpHost.isEmpty && validSmtpPort == nil }
     private var canSubmit: Bool {
         !email.trimmingCharacters(in: .whitespaces).isEmpty
             && !host.trimmingCharacters(in: .whitespaces).isEmpty
             && !password.isEmpty
             && validPort != nil
+            && !smtpPortInvalid
+            && (provider != "custom" || !smtpHost.trimmingCharacters(in: .whitespaces).isEmpty)
             && !model.busy
     }
 
@@ -560,6 +586,7 @@ private struct AccountSetupView: View {
                     presetSection
                     accountSection
                     serverSection
+                    smtpSection
                 }
                 .padding(24)
             }
@@ -630,6 +657,9 @@ private struct AccountSetupView: View {
                     host = ""
                     port = "993"
                     security = .tls
+                    smtpHost = ""
+                    smtpPort = "465"
+                    smtpSecurity = .tls
                 } label: {
                     HStack(spacing: 5) {
                         Text(L10n.t("provider.custom"))
@@ -679,6 +709,9 @@ private struct AccountSetupView: View {
         host = preset.host
         port = String(preset.port)
         security = preset.security
+        smtpHost = preset.smtpHost
+        smtpPort = String(preset.smtpPort)
+        smtpSecurity = .tls
     }
 
     private var accountSection: some View {
@@ -779,6 +812,57 @@ private struct AccountSetupView: View {
         }
     }
 
+    private var smtpSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(L10n.t("account.section.smtp"))
+                .font(.headline)
+            HStack(alignment: .top, spacing: 12) {
+                labeledField(
+                    L10n.t("account.smtpHost"),
+                    text: $smtpHost,
+                    placeholder: L10n.t("account.smtpHost.placeholder")
+                )
+                .frame(maxWidth: .infinity)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(L10n.t("account.port"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("465", text: $smtpPort)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.large)
+                        .frame(width: 96)
+                    if smtpPortInvalid {
+                        Text(L10n.t("account.port.invalid"))
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L10n.t("account.security"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("", selection: $smtpSecurity) {
+                    Text(L10n.t("account.security.tls")).tag(SecurityFfi.tls)
+                    Text(L10n.t("account.security.starttls")).tag(SecurityFfi.startTls)
+                    Text(L10n.t("account.security.plaintext")).tag(SecurityFfi.plaintext)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text(L10n.t("account.smtpHelp"))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .onChange(of: smtpSecurity) { old, new in
+            if old != new, smtpPort == "465" || smtpPort == "587" {
+                smtpPort = new == .tls ? "465" : "587"
+            }
+        }
+    }
+
     private func labeledField(
         _ label: String,
         text: Binding<String>,
@@ -818,6 +902,11 @@ private struct AccountSetupView: View {
 
     private func submit() {
         guard let portNumber = validPort else { return }
+        let trimmedSmtpHost = smtpHost.trimmingCharacters(in: .whitespaces)
+        let smtpHostValue: String? = trimmedSmtpHost.isEmpty ? nil : trimmedSmtpHost
+        let smtpPortValue: UInt16? = smtpHostValue == nil
+            ? nil
+            : (validSmtpPort ?? UInt16(465))
         Task {
             await model.addAccount(
                 provider: provider,
@@ -831,7 +920,11 @@ private struct AccountSetupView: View {
                     ? email.trimmingCharacters(in: .whitespaces)
                     : username.trimmingCharacters(in: .whitespaces),
                 password: password,
-                security: security
+                security: security,
+                smtpHost: smtpHostValue,
+                smtpPort: smtpPortValue,
+                smtpSecurity: smtpHostValue == nil ? nil : smtpSecurity,
+                smtpUsername: nil
             )
             if model.error == nil && !isInitial {
                 dismiss()

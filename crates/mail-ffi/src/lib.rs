@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mail_core::{AccountSpec, Core, ReceiveProtocol, SecurityMode, SyncOutcome};
+use mail_core::{
+    presets, AccountSpec, Core, OutgoingAttachment, OutgoingMessage, ReceiveProtocol, SecurityMode,
+    SmtpSettings, SyncOutcome,
+};
 use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Account, Mailbox, MessageQuery, StoredMessage};
 use thiserror::Error;
@@ -126,6 +129,8 @@ pub struct ProviderPresetView {
     pub host: String,
     pub port: u16,
     pub security: SecurityFfi,
+    pub smtp_host: String,
+    pub smtp_port: u16,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -139,6 +144,38 @@ pub struct NewAccountView {
     pub password: String,
     pub protocol: ReceiveProtocolFfi,
     pub security: SecurityFfi,
+    /// Required for `custom` providers; preset providers fall back to the
+    /// provider's SMTP host on port 465 with implicit TLS.
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_security: Option<SecurityFfi>,
+    pub smtp_username: Option<String>,
+    pub sent_mailbox: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OutgoingAttachmentView {
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SendRequestView {
+    pub email: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body_text: String,
+    pub attachments: Vec<OutgoingAttachmentView>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SendResultView {
+    pub recipients: u32,
+    pub saved_to: Option<String>,
+    pub save_error: Option<String>,
 }
 
 /// Quick presets for the account sheet. The 88 host follows the address domain
@@ -148,9 +185,9 @@ pub fn provider_presets(email: Option<String>) -> Vec<ProviderPresetView> {
     let address = email.as_deref().unwrap_or_default();
     let mut out = Vec::new();
     for (id, label) in [("gmail", "Gmail"), ("qq", "QQ"), ("88", "88")] {
-        let host = match mail_core::presets::hosts(id, address) {
-            Ok(hosts) => hosts.imap,
-            Err(_) if id == "88" => "imap.88.com".to_string(),
+        let (host, smtp_host) = match presets::hosts(id, address) {
+            Ok(hosts) => (hosts.imap, hosts.smtp),
+            Err(_) if id == "88" => ("imap.88.com".to_string(), "smtp.88.com".to_string()),
             Err(_) => continue,
         };
         out.push(ProviderPresetView {
@@ -159,6 +196,8 @@ pub fn provider_presets(email: Option<String>) -> Vec<ProviderPresetView> {
             host,
             port: 993,
             security: SecurityFfi::Tls,
+            smtp_host,
+            smtp_port: presets::default_smtp_port(SecurityMode::Tls),
         });
     }
     out
@@ -198,6 +237,25 @@ impl MailClient {
     }
 
     pub async fn add_account(&self, account: NewAccountView) -> Result<i64, FfiError> {
+        let smtp = account.smtp_host.clone().map(|host| {
+            let security = account
+                .smtp_security
+                .map(SecurityMode::from)
+                .unwrap_or(SecurityMode::Tls);
+            SmtpSettings {
+                host,
+                port: account
+                    .smtp_port
+                    .unwrap_or_else(|| presets::default_smtp_port(security)),
+                security: Some(security),
+                username: Some(
+                    account
+                        .smtp_username
+                        .clone()
+                        .unwrap_or_else(|| account.username.clone()),
+                ),
+            }
+        });
         let spec = AccountSpec {
             email: account.email,
             display_name: account.display_name,
@@ -208,8 +266,8 @@ impl MailClient {
             password: account.password,
             protocol: account.protocol.into(),
             security: account.security.into(),
-            smtp: None,
-            sent_mailbox: None,
+            smtp,
+            sent_mailbox: account.sent_mailbox,
         };
         self.core.add_account(&spec).map_err(failure)
     }
@@ -356,6 +414,35 @@ impl MailClient {
                 .collect(),
         })
     }
+
+    pub async fn send(&self, request: SendRequestView) -> Result<SendResultView, FfiError> {
+        let message = OutgoingMessage {
+            to: request.to,
+            cc: request.cc,
+            bcc: request.bcc,
+            subject: request.subject,
+            body_text: request.body_text,
+            attachments: request
+                .attachments
+                .into_iter()
+                .map(|attachment| OutgoingAttachment {
+                    filename: attachment.filename,
+                    content_type: attachment.content_type,
+                    data: attachment.data,
+                })
+                .collect(),
+        };
+        let outcome = self
+            .core
+            .send(&request.email, &message)
+            .await
+            .map_err(failure)?;
+        Ok(SendResultView {
+            recipients: outcome.recipients as u32,
+            saved_to: outcome.saved_to,
+            save_error: outcome.save_error,
+        })
+    }
 }
 
 impl MailClient {
@@ -480,6 +567,8 @@ mod tests {
         let gmail = presets.iter().find(|preset| preset.id == "gmail").unwrap();
         assert_eq!(gmail.port, 993);
         assert_eq!(gmail.security, SecurityFfi::Tls);
+        assert_eq!(gmail.smtp_host, "smtp.gmail.com");
+        assert_eq!(gmail.smtp_port, 465);
 
         let fallback = provider_presets(None);
         assert_eq!(
@@ -488,6 +577,13 @@ mod tests {
                 .find(|preset| preset.id == "88")
                 .map(|preset| preset.host.as_str()),
             Some("imap.88.com")
+        );
+        assert_eq!(
+            fallback
+                .iter()
+                .find(|preset| preset.id == "88")
+                .map(|preset| preset.smtp_host.as_str()),
+            Some("smtp.88.com")
         );
     }
 

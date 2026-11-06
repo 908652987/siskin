@@ -15,6 +15,10 @@ final class AppCommands: NSObject {
     @objc func focusSearch(_ sender: Any?) {
         NotificationCenter.default.post(name: .siskinFocusSearch, object: nil)
     }
+
+    @objc func compose(_ sender: Any?) {
+        NotificationCenter.default.post(name: .siskinCompose, object: nil)
+    }
 }
 
 func buildMainMenu() -> NSMenu {
@@ -35,6 +39,18 @@ func buildMainMenu() -> NSMenu {
         keyEquivalent: "q"
     )
     appItem.submenu = appMenu
+
+    let fileItem = NSMenuItem()
+    mainMenu.addItem(fileItem)
+    let fileMenu = NSMenu(title: L10n.t("menu.file"))
+    let composeItem = NSMenuItem(
+        title: L10n.t("action.compose"),
+        action: #selector(AppCommands.compose(_:)),
+        keyEquivalent: "n"
+    )
+    composeItem.target = AppCommands.shared
+    fileMenu.addItem(composeItem)
+    fileItem.submenu = fileMenu
 
     let editItem = NSMenuItem()
     mainMenu.addItem(editItem)

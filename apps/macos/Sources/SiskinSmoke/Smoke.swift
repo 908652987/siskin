@@ -53,6 +53,45 @@ struct Smoke {
                     }
                 }
             }
+            if let recipient = ProcessInfo.processInfo.environment["SISKIN_SEND_TO"],
+               !recipient.isEmpty {
+                let environment = ProcessInfo.processInfo.environment
+                let to = recipient.split(separator: ",").map {
+                    $0.trimmingCharacters(in: .whitespaces)
+                }
+                let cc = (environment["SISKIN_SEND_CC"] ?? "")
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                let bcc = (environment["SISKIN_SEND_BCC"] ?? "")
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                var attachments: [OutgoingAttachmentView] = []
+                if let path = environment["SISKIN_SEND_ATTACH"], !path.isEmpty {
+                    let url = URL(fileURLWithPath: path)
+                    let data = try Data(contentsOf: url)
+                    attachments.append(OutgoingAttachmentView(
+                        filename: url.lastPathComponent,
+                        contentType: "text/plain",
+                        data: data
+                    ))
+                }
+                let result = try await client.send(request: SendRequestView(
+                    email: accounts.first?.email ?? "",
+                    to: to,
+                    cc: cc,
+                    bcc: bcc,
+                    subject: environment["SISKIN_SEND_SUBJECT"] ?? "smoke",
+                    bodyText: environment["SISKIN_SEND_BODY"] ?? "smoke body",
+                    attachments: attachments
+                ))
+                print(
+                    "sendRecipients=\(result.recipients) "
+                        + "savedTo=\(result.savedTo ?? "-") "
+                        + "saveError=\(result.saveError ?? "-")"
+                )
+            }
             print("totalMessages=\(totalMessages)")
             exit(0)
         } catch {

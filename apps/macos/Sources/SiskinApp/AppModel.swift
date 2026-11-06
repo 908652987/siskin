@@ -263,6 +263,40 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Sends through the core and refreshes the Sent counts. Returns the error
+    /// message so the compose sheet can stay open with the draft intact.
+    func send(
+        to: [String],
+        cc: [String],
+        bcc: [String],
+        subject: String,
+        bodyText: String,
+        attachments: [OutgoingAttachmentView]
+    ) async -> String? {
+        guard let client else { return L10n.t("compose.noDatabase") }
+        guard let email = selectedEmail else { return L10n.t("compose.noAccount") }
+        do {
+            let result = try await client.send(request: SendRequestView(
+                email: email,
+                to: to,
+                cc: cc,
+                bcc: bcc,
+                subject: subject,
+                bodyText: bodyText,
+                attachments: attachments
+            ))
+            status = L10n.t("status.sent", Int(result.recipients))
+            if let warning = result.saveError {
+                error = L10n.t("compose.notSaved", result.savedTo ?? "Sent", warning)
+            }
+            await refreshMailboxes()
+            await refreshMessages()
+            return nil
+        } catch {
+            return describe(error)
+        }
+    }
+
     func addAccount(
         provider: String,
         email: String,
@@ -271,7 +305,11 @@ final class AppModel: ObservableObject {
         port: UInt16,
         username: String,
         password: String,
-        security: SecurityFfi
+        security: SecurityFfi,
+        smtpHost: String?,
+        smtpPort: UInt16?,
+        smtpSecurity: SecurityFfi?,
+        smtpUsername: String?
     ) async {
         guard let client else { return }
         busy = true
@@ -286,7 +324,12 @@ final class AppModel: ObservableObject {
                     username: username,
                     password: password,
                     protocol: .imap,
-                    security: security
+                    security: security,
+                    smtpHost: smtpHost,
+                    smtpPort: smtpPort,
+                    smtpSecurity: smtpSecurity,
+                    smtpUsername: smtpUsername,
+                    sentMailbox: nil
                 )
             )
             accounts = try await client.accounts()

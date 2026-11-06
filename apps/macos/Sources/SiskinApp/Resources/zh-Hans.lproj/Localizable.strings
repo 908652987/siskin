@@ -88,3 +88,22 @@
 "account.hint.88" = "使用 88 / 111 / email.cn 的专用密码；服务器地址随邮箱域名变化。";
 "account.hint.custom" = "手动填写 IMAP 服务器、端口与传输安全。";
 "account.useEmail" = "与邮箱地址相同";
+
+"action.compose" = "写邮件";
+"menu.file" = "文件";
+"status.sent" = "已发送给 %d 位收件人";
+"compose.title" = "写邮件";
+"compose.to" = "收件人";
+"compose.cc" = "抄送";
+"compose.bcc" = "密送";
+"compose.subject" = "主题";
+"compose.addCcBcc" = "抄送/密送";
+"compose.attach" = "添加附件";
+"compose.send" = "发送";
+"compose.noAccount" = "请先选择账户。";
+"compose.noDatabase" = "数据库尚未打开。";
+"compose.notSaved" = "已发送，但未能归档到 %@：%@";
+"account.section.smtp" = "发信（SMTP）";
+"account.smtpHost" = "SMTP 服务器";
+"account.smtpHost.placeholder" = "smtp.example.com";
+"account.smtpHelp" = "预设会自动填写；自定义账户必须填写 SMTP 服务器才能发信。";

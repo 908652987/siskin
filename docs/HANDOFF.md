@@ -1,6 +1,6 @@
 # 交接存档
 
-更新日期：2026-11-02
+更新日期：2026-11-06
 分支：`main`　许可：AGPL-3.0
 用途：任何人（或下一次会话）读完本文件即可继续开发，无需回溯聊天记录。
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM、`Email/import`、上传未做）；Linux 桌面 UI 技术栈定为 Slint（D12），**图形界面、日历、手机客户端尚未开始**。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM、`Email/import`、上传未做）；**macOS 客户端已可收发**：列表/阅读/搜索、撰写（To/Cc/Bcc + 多附件，`mail-ffi::send`）与 `dist/Siskin.app` 打包完成，通知未做；Linux 桌面 UI 技术栈定为 Slint（D12），Windows UI、日历、手机客户端尚未开始。
 
 ---
 
@@ -67,8 +67,10 @@
 | UniFFI 门面 | 完成 | `mail-ffi`：账户/邮箱/列表/正文/关键字/移动/同步；Swift 绑定生成、`SiskinSmoke` 实跑 |
 | macOS UI（列表/阅读/搜索） | 完成（主路径） | `apps/macos` SwiftUI：账户选择/新增、邮箱/邮件列表、HTML+纯文本阅读、搜索、同步、标已读/未读、标星、移动、分页加载、附件保存；SwiftPM 构建 + 10,016 封库实跑 |
 | macOS 国际化 | 完成 | zh-Hans / en `Localizable.strings`；系统语言自动选择，`SISKIN_LANG` 可强制；中英文快照各一张 |
-| 账户预设 | 完成 | Gmail / QQ / 88 / 自定义快捷按钮；主机、端口、TLS 由 `mail-ffi::provider_presets` 提供，88 按邮箱域名推导 |
-| macOS 撰写/通知/打包 | 未开始 | 无 compose、无通知与 `.app` 打包 |
+| 账户预设 | 完成 | Gmail / QQ / 88 / 自定义快捷按钮；IMAP/SMTP 主机、端口、TLS 由 `mail-ffi::provider_presets` 提供，88 按邮箱域名推导 |
+| macOS 撰写 | 完成 | `ComposeView` + `mail-ffi::send`：To/Cc/Bcc、主题、纯文本正文、多附件（NSOpenPanel + UTType MIME）、发送失败保留草稿；⌘N / 工具栏入口；Dovecot + 本地 SMTP sink 实发，`Sent` 归档 |
+| macOS `.app` 打包 | 完成 | `apps/macos/package.sh`：release 静态链接 + `Info.plist`（`com.eyrie.siskin`）+ 资源 bundle + ad-hoc 签名；`dist/Siskin.app` 直接启动并渲染撰写快照 |
+| macOS 通知 | 未开始 | 需要 FFI 事件流与通知权限，单独一段 |
 | Windows / Linux / 移动 UI | 未开始 | Linux 栈已定 Slint（D12）；Windows/iOS/Android 仍按 D2 |
 | Windows / 移动端验证 | 未开始 | 本机无 Windows、无 .NET SDK |
 | 代码规范与风格固化 | 完成 | `AGENTS.md` + `docs/CONVENTIONS.md` + rustfmt/clippy/CI |
@@ -122,6 +124,8 @@ crates/
                            set_keywords（JMAP 关键字 → IMAP STORE）、
                            move_message（MOVE 或 COPY+EXPUNGE；同步目标取新 UID）、
                            purge_expired_trash / trash_retention_days
+  mail-core/src/compose.rs OutgoingMessage → RFC 5322：To/Cc/Bcc（Bcc 只进信封）、
+                           头注入校验、2047 主题/附件名、multipart/mixed、25 MiB 上限
   mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
   mail-api/src/lib.rs      JMAP 子集：Session、Mailbox/get|changes、
                            Email/query|get|changes|set、BodySource 按需正文、
@@ -132,9 +136,9 @@ crates/
                            /download、/upload（501）；CoreBodies/CoreWrites
                            同文件 tests：5 个路由测试（配对、鉴权、JMAP、下载、SSE）
   mail-ffi/src/lib.rs      UniFFI 门面：provider_presets + MailClient（open/accounts/add_account/mailboxes/
-                           messages/body/set_seen/move_message/sync）、FfiError
+                           messages/body/set_seen/move_message/sync/send）、FfiError
   mail-ffi/src/bin/        uniffi-bindgen
-  mail-cli/src/main.rs     add-account / check / send / accounts / sync / watch（省略
+  mail-cli/src/main.rs     add-account / check / send（--cc/--bcc/--attach）/ accounts / sync / watch（省略
                            --mailbox 即全邮箱，--idle-sessions/--sweep-seconds 可调）/
                            mailboxes / list / search / trash / trash-purge / body /
                            attachment / keywords / move / stats / retention /
@@ -143,9 +147,11 @@ crates/
                            export-key / import-key
 apps/
   macos/Package.swift     SwiftPM：SiskinApp（SwiftUI）+ SiskinSmoke + MailFFI + mail_ffiFFI
-  macos/Sources/SiskinApp main.swift（AppKit 引导）、AppModel、Views
-  macos/Sources/SiskinSmoke 无界面冒烟：账户/邮箱/列表/正文/关键字往返
-  macos/build.sh          编译 mail-ffi → 生成 Swift 绑定 → swift build
+  macos/Sources/SiskinApp main.swift（AppKit 引导、菜单）、AppModel、Views、ComposeView、L10n、MessageWebView
+  macos/Sources/SiskinSmoke 无界面冒烟：账户/邮箱/列表/正文/关键字往返 + 可选 SISKIN_SEND_TO 发送
+  macos/build.sh          编译 mail-ffi → 生成 Swift 绑定 → swift build（debug，开发用）
+  macos/package.sh        同上 + release 构建 → Siskin.app（Info.plist、资源 bundle、ad-hoc 签名）
+  macos/Info.plist        bundle 标识 com.eyrie.siskin、最低 macOS 14
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -170,7 +176,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 119 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 127 个测试全过
 ~/.cargo/bin/cargo build --release
 export EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets   # 开发期绕开钥匙串；发布验证不要设置
 
@@ -271,6 +277,25 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
   SISKIN_SNAPSHOT=/tmp/ui.png SISKIN_SNAPSHOT_MESSAGE=711 \
   apps/macos/.build/debug/Siskin
 
+# 4.3) 撰写：CLI 走同一条 compose/SMTP 路径；本地 SMTP sink 见下
+# sink 需支持 AUTH PLAIN（Python 3.9 自带 smtpd 不支持，写 20 行的 asyncio 版本即可）
+cargo run -p mail-cli -- --db /tmp/smoke.db send --email vmail@example.com \
+  --to peer@example.com --cc copy@example.com --bcc secret@example.com \
+  --subject 撰写测试 --body 'hello' --attach /tmp/note.txt
+# 断言：sink 收到 3 个 RCPT、报文头无 Bcc；sync 后 Sent 计数 +1
+# FFI 冒烟发送（SiskinSmoke）
+SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
+  SISKIN_SEND_TO=peer@example.com SISKIN_SEND_CC=copy@example.com \
+  SISKIN_SEND_BCC=secret@example.com SISKIN_SEND_ATTACH=/tmp/note.txt \
+  apps/macos/.build/debug/SiskinSmoke
+# 撰写 sheet 快照：SISKIN_SNAPSHOT_COMPOSE=1 + SISKIN_COMPOSE_TO/CC/BCC/SUBJECT/BODY/ATTACH 预填
+# 改了 FFI 公开类型后先重跑 build.sh（package.sh 也会重新生成绑定）
+# 4.4) .app 打包（release 静态链接 + Info.plist + ad-hoc 签名）
+./apps/macos/package.sh
+SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
+  apps/macos/dist/Siskin.app/Contents/MacOS/Siskin
+# Finder 启动不带环境变量：会走钥匙串并按 cdhash 再弹一次授权，属预期
+
 # 5) 选下一项：见 §9
 ```
 
@@ -349,6 +374,11 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | Hub `/download` | 正文 blob 下载 200、`text/plain`、38 字节与 `bodyValues` 一致；未认证 401、未知 blob 404 |
 | Hub 设备吊销 | `revoke-device` 后原令牌请求 Session 返回 401 |
 | Swift FFI 冒烟（Dovecot 10,016 封） | 1 账户 / 8 邮箱 / total=10,016；首封正文 27 字；`$seen` 置清往返成功 |
+| 撰写发送（CLI，Dovecot + 本地 SMTP sink） | `to/cc/bcc` → 3 个 `RCPT TO`；报文头只有 `To`/`Cc`（无 `Bcc`）；`Sent` 3→4；附件 32 字节往返一致 |
+| 撰写发送（`mail-ffi` / `SiskinSmoke`） | `sendRecipients=3 savedTo=Sent saveError=-`；Sent 中可搜到主题并回读正文与附件 |
+| 撰写校验 | 非法地址 → `compose: invalid address`；主题含 `\r\n` → `compose: subject contains a control character` |
+| IMAP `APPEND` 标志修复 | 修复前 `APPEND "Sent" \Seen {n}` 让 Dovecot 挂起（连接一直 ESTABLISHED，`Sent` 不增长）；改为 `(\Seen)` 后立即成功，mock 回归测试断言括号形式 |
+| `.app` 打包 | `dist/Siskin.app`：ad-hoc 签名、`com.eyrie.siskin`、资源 bundle 在 `Contents/Resources`；`Contents/MacOS/Siskin` 启动渲染撰写 sheet 680×560 |
 | macOS 壳加载（同一库） | 窗口 1120×760；模型打印 `mailboxes=8 messages=200 total=10016`；中英文状态分别为“就绪”/“Ready” |
 | macOS 阅读（id=711） | HTML 正文与附件 `note.txt` 正确渲染；附件经 FFI 下载 17 字节；操作按钮显示“标为未读 / 加星标 / 移动到” |
 | macOS 快照 | `SISKIN_SNAPSHOT` 应用内渲染 2240×1520 PNG；修复前发现工具栏不可见、文字白底白字、HSplitView 底对齐、头部被英文按钮挤裁，均已修复 |
@@ -374,7 +404,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 12. **主密钥无轮换与自动备份**。已提供 `export-key`/`import-key` 做人工备份（可存 Bitwarden 等），但主密钥仍只有钥匙串一份，丢失且无备份即数据不可恢复；库密钥无法在线轮换。**验收**：轮换后旧库可迁移；备份丢失时给出明确提示。
 13. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应先进入服务器 Trash 并同步到本地 Trash）；回收站不提供手工恢复。**验收**：UI 可按邮箱/时间浏览回收站；恢复操作有明确语义。
 14. **多邮箱列表已去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选、跨邮箱计数需要新的查询接口。**验收**：列表可按邮箱过滤且不重复，计数与筛选一致。
-15. **macOS 壳缺撰写与系统集成**。列表/阅读/搜索/同步/标已读/标星/移动/HTML/附件/分页/i18n 已接通；撰写、通知、签名 `.app` 打包、真实多账户切换未做。**验收**：可撰写并发送、可收到通知。**未验证**：本机无 Xcode 工程模板，当前用 SwiftPM 可执行文件启动。
+15. **macOS 通知、草稿与多账户切换未做**。列表/阅读/搜索/同步/标已读/标星/移动/HTML/附件/分页/i18n/撰写（To/Cc/Bcc + 附件）/`.app` 打包已接通。剩余：新邮件通知（需 FFI 事件流 + `UNUserNotificationCenter`）、草稿保存、真实多账户切换。**验收**：新邮件可触发系统通知；**未验证**：真实 Gmail/QQ/88 账户投递（§10），通知权限与签名分发。
 16. **Hub 写操作只覆盖已读/标志与单副本移动**。`Email/set` 支持 `keywords` 与 `mailboxIds`，不支持 `create`/`destroy`/`Email/import`；多副本邮件移动、自定义关键字返回 `notSupported`；`Thread/get`、上传、APNs/FCM 未做；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序；一次 `Email/get` 内正文串行拉取。**验收**：客户端可标已读/移动邮件并按 state 增量刷新，推送走 SSE（已完成）。
 17. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。**验收**：重建后客户端能收到 `cannotCalculateChanges` 或完整 destroyed 列表。
 
@@ -405,7 +435,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 ### 第 6 段：桌面 UI
 
-10. macOS SwiftUI：列表/阅读/搜索/同步/标已读完成（最小壳，纯文本）；剩余撰写、HTML 渲染、附件保存、通知、`.app` 打包。
+10. macOS SwiftUI：列表/阅读/搜索/同步/标已读/撰写（To/Cc/Bcc + 附件）/`.app` 打包完成；剩余通知、草稿、真实多账户切换。
 11. Windows WinUI 3（复用 Rust 核心）。
 12. Linux Slint（`apps/linux`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定，实现未开始。
 
@@ -442,6 +472,14 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 - 88（Coremail）不广告 IDLE/CONDSTORE，档位为 C（轮询）；`imap/pop/smtp` 主机按域名区分（88.com / 111.com / email.cn）。
 - POP3 无 UIDL 持久化列：UIDL 经 SHA-256 截断为 63 位数字 uid；容器内冲突概率可忽略，但不要把它当协议 UID 展示。
 - SMTP 发送后 IMAP 追加 Sent 失败不回滚投递，只返回 `save_error`；POP3 账户没有 Sent 归档。
+- `async-imap::Session::append` 把 `flags` 原样拼进命令：传 `\Seen` 会发出 `APPEND "Sent" \Seen {n}`，Dovecot 不回 continuation，客户端永久挂起（连接 ESTABLISHED、`Sent` 不增长、没有任何报错）。`mail-proto::ImapSession::append` 已负责包成 `(\Seen)`；改这里别再拆掉括号，回归测试断言命令文本。
+- 撰写报文的 Bcc 只能进 SMTP 信封（`RCPT TO`），绝不能写 `Bcc:` 头；`compose::compose` 返回的 `envelope` 是去重后的 to+cc+bcc，SMTP 与头字段必须用这一份。
+- 地址只接受 `local@domain`：带显示名（`Name <a@b>`）、非 ASCII（SMTPUTF8）与含 `,;:<>` 的串都会被拒绝；主题/附件名中的控制字符同样拒绝（头注入）。UI 侧按 `,`/`;` 拆地址，不要在 core 里放宽。
+- 非 ASCII 主题按 45 字节切成多段 RFC 2047 encoded-word 并折叠；附件名用单段 encoded-word（`mail-parse::clean_filename` 能解回）。不要改用 RFC 2231：解析端还不支持。
+- 附件合计上限 25 MiB，超限返回 `ComposeError::AttachmentsTooLarge`，不做截断；MIME 类型由 Swift `UTType.preferredMIMEType` 提供，非法或缺失回退 `application/octet-stream`。
+- 预设 provider 的 SMTP 缺省由 `Core::add_account` 补（465/TLS），`custom` 必须显式携带；`mail-ffi::NewAccountView` 的 SMTP 字段为空时不要伪造 host。
+- `.app` 里的 SwiftPM 资源必须放在 `Contents/Resources/Siskin_SiskinApp.bundle`：`Bundle.module` 只查 `Bundle.main.resourceURL` 等固定位置，漏拷会让 `L10n` 退回 key 原文。
+- `apps/macos/dist/` 是生成物（gitignored）；`package.sh` 用 release Rust + release Swift，别拿 `build.sh` 的 debug 产物冒充分发包。
 - iCloud 无 IDLE/CONDSTORE/MOVE；每次全量 UID 扫描代价高（10 万封时不可接受），必须保留“数量变化/超时”门槛。
 - `UIDVALIDITY` 变化必须整箱重建，不能复用 UID。
 - 草稿与已发送的去重尚未实现，接入发送功能时先解决。
@@ -493,7 +531,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 - `mail-ffi` 的公开类型一改，`apps/macos/Generated` 与 `Sources/mail_ffiFFI` 就是旧签名：必须重跑 `apps/macos/build.sh`，不要手工改生成文件。
 - SwiftPM 的 system library 必须叫 `module.modulemap`（生成文件叫 `mail_ffiFFI.modulemap`），且 C 头与 modulemap 要放在 `Sources/mail_ffiFFI/`；`Generated/` 只放 Swift 绑定，否则 `import mail_ffiFFI` 找不到模块。
 - 静态链接 Rust 产物会出现 “built for newer macOS version (27.0)” 警告：Rust 按本机 SDK 编译，SwiftPM 目标写 macOS 14；只影响链接告警，不影响运行，别用 `-w` 掩盖真正错误。
-- `Siskin` 是用 SwiftPM 可执行文件 + AppKit 引导启动的，没有 `.app` 包：`EYRIE_DEV_SECRET_DIR` 未设置时会走钥匙串，ad-hoc 签名每次重建都会弹授权；开发与冒烟一律显式设置该变量。
+- `Siskin` 平时用 SwiftPM 可执行文件 + AppKit 引导启动；`package.sh` 才产出 `.app`。两条路径都不带环境变量时都会走钥匙串，ad-hoc 签名每次重建都会弹授权；开发与冒烟一律显式设置 `EYRIE_DEV_SECRET_DIR`。
 - 只跑 `cargo clippy` 不会更新 `target/debug/mail-hub`；改完 `mail-api` 后要 `cargo build -p mail-hub` 再重启，否则冒烟仍在跑旧逻辑（本次实测踩过）。
 - IMAP 标志位按副本存：JMAP keyword 更新必须遍历 `message_location_targets` 的每个在线位置，全部 `STORE` 成功后才写本地 flags；中间失败就让本地保持旧值，等下一次同步收敛（`update_flags` 只更新本地，不碰服务器）。
 - `WriteSink::set_keywords` 的入参是 JMAP keyword（`$seen`），映射成 IMAP flag（`\Seen`）是 `mail-core::keyword_flag` 的职责；测试里的假 sink 也要映射，否则会存进 `$seen` 这种非 IMAP 标志。

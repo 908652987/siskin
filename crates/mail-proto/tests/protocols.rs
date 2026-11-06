@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 
 use mail_proto::pop3::{Pop3Config, Pop3Session};
 use mail_proto::smtp::{SmtpConfig, SmtpSession};
-use mail_proto::Security;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use mail_proto::{ImapConfig, ImapSession, Security};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 struct Mock {
@@ -157,4 +157,89 @@ async fn smtp_authenticates_and_dot_stuffs_the_message() {
         .iter()
         .any(|line| line == "MAIL FROM:<user@example.com>"));
     assert!(seen.iter().any(|line| line == "RCPT TO:<peer@example.com>"));
+}
+
+#[tokio::test]
+async fn imap_append_passes_flags_as_a_parenthesized_list() {
+    let mock = Mock::start(|mut socket| async move {
+        let (read, mut write) = socket.split();
+        let mut reader = BufReader::new(read);
+        let mut seen = Vec::new();
+        write
+            .write_all(b"* OK mock imap\r\n")
+            .await
+            .expect("greeting");
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.expect("read") == 0 {
+                break;
+            }
+            let line = line.trim_end().to_string();
+            seen.push(line.clone());
+            let tag = line.split_whitespace().next().unwrap_or("").to_string();
+            let upper = line.to_ascii_uppercase();
+            if upper.contains("APPEND") {
+                let size: usize = line
+                    .rsplit('{')
+                    .next()
+                    .and_then(|rest| rest.trim_end_matches('}').parse().ok())
+                    .expect("literal size");
+                write.write_all(b"+ ready\r\n").await.expect("continue");
+                let mut body = vec![0u8; size + 2];
+                reader.read_exact(&mut body).await.expect("literal");
+                write
+                    .write_all(format!("{tag} OK [APPENDUID 1 7] APPEND done\r\n").as_bytes())
+                    .await
+                    .expect("append ok");
+            } else if upper.contains("LOGOUT") {
+                write
+                    .write_all(format!("* BYE\r\n{tag} OK logout\r\n").as_bytes())
+                    .await
+                    .expect("logout");
+                break;
+            } else if upper.contains("CAPABILITY") {
+                write
+                    .write_all(
+                        format!("* CAPABILITY IMAP4rev1 UIDPLUS\r\n{tag} OK capability\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .expect("capability");
+            } else {
+                write
+                    .write_all(format!("{tag} OK done\r\n").as_bytes())
+                    .await
+                    .expect("ok");
+            }
+        }
+        seen
+    })
+    .await;
+
+    let (mut session, _) = ImapSession::connect(&ImapConfig {
+        host: mock.addr.ip().to_string(),
+        port: mock.addr.port(),
+        security: Security::Plaintext,
+        username: "user@example.com".into(),
+        password: "secret".into(),
+    })
+    .await
+    .expect("imap login");
+
+    session
+        .append("Sent", Some("\\Seen"), b"Subject: probe\r\n\r\nhi\r\n")
+        .await
+        .expect("append");
+
+    drop(session);
+
+    let seen = mock.handle.await.expect("mock");
+    let append = seen
+        .iter()
+        .find(|line| line.to_ascii_uppercase().contains("APPEND"))
+        .expect("APPEND command");
+    assert!(
+        append.contains("(\\Seen)"),
+        "flags must be parenthesized: {append}"
+    );
 }

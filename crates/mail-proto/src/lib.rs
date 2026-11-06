@@ -456,7 +456,12 @@ impl ImapSession {
 
     pub async fn append(&mut self, mailbox: &str, flags: Option<&str>, body: &[u8]) -> Result<()> {
         let wire = utf7::encode(mailbox);
-        self.session().append(&wire, flags, None, body).await?;
+        // async-imap writes the flag list verbatim, so the parentheses are
+        // part of the argument: `APPEND "Sent" (\Seen) {n}`.
+        let flags = flags.map(|flags| format!("({flags})"));
+        self.session()
+            .append(&wire, flags.as_deref(), None, body)
+            .await?;
         Ok(())
     }
 

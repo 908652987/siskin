@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use mail_core::compose::{OutgoingAttachment, OutgoingMessage};
 use mail_core::{AccountSpec, Core, ReceiveProtocol, SecurityMode, SendOutcome, SmtpSettings};
 use mail_crypto::MemoryStore;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -47,6 +48,19 @@ async fn serve(mut socket: TcpStream) -> Vec<String> {
     seen
 }
 
+fn data_lines(seen: &[String]) -> Vec<String> {
+    let start = seen
+        .iter()
+        .position(|line| line == "DATA")
+        .expect("DATA command");
+    let end = seen[start..]
+        .iter()
+        .position(|line| line == ".")
+        .map(|offset| start + offset)
+        .expect("end of data");
+    seen[start + 1..end].to_vec()
+}
+
 #[tokio::test]
 async fn sending_composes_a_message_and_submits_it_over_smtp() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
@@ -77,23 +91,52 @@ async fn sending_composes_a_message_and_submits_it_over_smtp() {
     })
     .expect("account");
 
-    let outcome: SendOutcome = core
-        .send(
-            "me@example.com",
-            &["peer@example.com".into()],
-            "hello",
-            "body",
-        )
-        .await
-        .expect("send");
-    assert_eq!(outcome.recipients, 1);
+    let message = OutgoingMessage {
+        to: vec!["peer@example.com".into()],
+        cc: vec!["cc@example.com".into()],
+        bcc: vec!["hidden@example.com".into()],
+        subject: "hello".into(),
+        body_text: "body".into(),
+        attachments: vec![OutgoingAttachment {
+            filename: "note.txt".into(),
+            content_type: Some("text/plain".into()),
+            data: b"attachment body".to_vec(),
+        }],
+    };
+    let outcome: SendOutcome = core.send("me@example.com", &message).await.expect("send");
+    assert_eq!(outcome.recipients, 3);
     assert!(outcome.saved_to.is_none(), "POP3 has no Sent mailbox");
     assert!(outcome.save_error.is_none());
 
     let seen = server.await.expect("server");
     assert!(seen.iter().any(|line| line == "MAIL FROM:<me@example.com>"));
-    assert!(seen.iter().any(|line| line == "RCPT TO:<peer@example.com>"));
-    assert!(seen.iter().any(|line| line == "Subject: hello"));
-    assert!(seen.iter().any(|line| line == "To: peer@example.com"));
-    assert!(seen.iter().any(|line| line == "Ym9keQ=="));
+    for recipient in ["peer@example.com", "cc@example.com", "hidden@example.com"] {
+        assert!(
+            seen.iter()
+                .any(|line| line == &format!("RCPT TO:<{recipient}>")),
+            "missing RCPT TO for {recipient}"
+        );
+    }
+
+    let data = data_lines(&seen);
+    let raw = format!("{}\r\n", data.join("\r\n"));
+    let parsed = mail_parse::parse_message(raw.as_bytes());
+    assert_eq!(parsed.text.as_deref(), Some("body"));
+    assert_eq!(parsed.attachments.len(), 1);
+    assert_eq!(parsed.attachments[0].filename.as_deref(), Some("note.txt"));
+    assert_eq!(parsed.attachments[0].bytes, b"attachment body");
+
+    let headers: Vec<&String> = data.iter().take_while(|line| !line.is_empty()).collect();
+    assert!(headers.iter().any(|line| *line == "To: peer@example.com"));
+    assert!(headers.iter().any(|line| *line == "Cc: cc@example.com"));
+    assert!(
+        headers.iter().all(|line| !line.starts_with("Bcc:")),
+        "Bcc must not be written to the headers"
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|line| !line.to_ascii_lowercase().contains("hidden@example.com")),
+        "Bcc address must not leak into the headers"
+    );
 }

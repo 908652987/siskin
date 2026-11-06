@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 use mail_core::{
-    presets, AccountSpec, Core, ReceiveProtocol, SecurityMode, SmtpSettings, SyncOutcome,
-    WatchOptions,
+    presets, AccountSpec, Core, OutgoingAttachment, OutgoingMessage, ReceiveProtocol, SecurityMode,
+    SmtpSettings, SyncOutcome, WatchOptions,
 };
 use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Store, StoredMessage};
@@ -54,6 +54,20 @@ fn required(flags: &HashMap<String, String>, name: &str) -> Result<String, Strin
         .get(name)
         .cloned()
         .ok_or_else(|| format!("missing --{name}"))
+}
+
+fn comma_list(flags: &HashMap<String, String>, name: &str) -> Vec<String> {
+    flags
+        .get(name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The keychain is the default. macOS ties its grants to each binary's CDHash,
@@ -335,12 +349,7 @@ async fn run() -> Result<(), String> {
         }
         "send" => {
             let email = required(&args.flags, "email")?;
-            let to: Vec<String> = required(&args.flags, "to")?
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect();
+            let to = comma_list(&args.flags, "to");
             if to.is_empty() {
                 return Err("--to needs at least one address".to_string());
             }
@@ -354,8 +363,30 @@ async fn run() -> Result<(), String> {
                     None => return Err("missing --body or --body-file".to_string()),
                 },
             };
+            let mut attachments = Vec::new();
+            for path in comma_list(&args.flags, "attach") {
+                let data = std::fs::read(&path).map_err(|e| format!("reading {path}: {e}"))?;
+                let filename = PathBuf::from(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| path.clone());
+                attachments.push(OutgoingAttachment {
+                    filename,
+                    content_type: None,
+                    data,
+                });
+            }
+            let message = OutgoingMessage {
+                to,
+                cc: comma_list(&args.flags, "cc"),
+                bcc: comma_list(&args.flags, "bcc"),
+                subject,
+                body_text: body,
+                attachments,
+            };
             let outcome = core
-                .send(&email, &to, &subject, &body)
+                .send(&email, &message)
                 .await
                 .map_err(|e| e.to_string())?;
             println!("sent to {} recipient(s)", outcome.recipients);

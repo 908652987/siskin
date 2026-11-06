@@ -15,3 +15,4 @@
 /apps/macos/libs
 /apps/macos/Sources/mail_ffiFFI
 /apps/macos/.swiftpm
+/apps/macos/dist
