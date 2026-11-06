@@ -215,14 +215,87 @@ fn mailbox_creation_and_restore_reach_the_change_log() {
 }
 
 #[test]
-fn devices_can_be_listed_and_revoked() {
-    let (store, _, _) = setup();
-    let device = store.create_device("phone", "hash").unwrap();
+fn devices_are_bound_to_an_account_and_can_be_revoked() {
+    let (store, account, _) = setup();
+    let device = store.create_device("phone", account, "hash").unwrap();
     let listed = store.list_devices().unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, device);
+    assert_eq!(listed[0].account_id, Some(account));
+    assert_eq!(
+        store
+            .device_by_token_hash("hash")
+            .unwrap()
+            .unwrap()
+            .account_id,
+        Some(account)
+    );
     assert!(store.revoke_device(device).unwrap());
     assert!(store.list_devices().unwrap().is_empty());
     assert!(store.device_by_token_hash("hash").unwrap().is_none());
     assert!(!store.revoke_device(device).unwrap());
+}
+
+#[test]
+fn raw_bytes_follow_the_message_lifecycle() {
+    let (store, account, inbox) = setup();
+    let baseline = store.blob_bytes().unwrap();
+    store
+        .apply_fetch(account, inbox, &[msg(1, "draft")], &[])
+        .unwrap();
+    let message_id = store.list_messages(account, 10, 0).unwrap()[0].id;
+    let raw = b"Message-ID: <1@test>\r\nSubject: draft\r\n\r\nbody";
+    let raw_len = raw.len() as i64;
+
+    store.attach_raw_blob(account, message_id, raw).unwrap();
+    assert_eq!(
+        store.raw_blob(account, message_id).unwrap().as_deref(),
+        Some(&raw[..])
+    );
+    assert_eq!(store.blob_bytes().unwrap(), baseline + raw_len);
+
+    // Re-attaching identical bytes must not hold a second reference.
+    store.attach_raw_blob(account, message_id, raw).unwrap();
+    assert_eq!(store.blob_bytes().unwrap(), baseline + raw_len);
+
+    // Another account cannot read the bytes.
+    assert!(store.raw_blob(account + 99, message_id).unwrap().is_none());
+
+    // Purging the last location releases the raw copy.
+    store.remove_all_locations(account, message_id).unwrap();
+    assert!(store.raw_blob(account, message_id).unwrap().is_none());
+    assert_eq!(store.blob_bytes().unwrap(), baseline);
+    assert!(matches!(
+        store.attach_raw_blob(account, message_id, raw),
+        Err(mail_store::StoreError::MessageNotFound(_))
+    ));
+}
+
+#[test]
+fn submissions_are_recorded_per_account() {
+    let (store, account, inbox) = setup();
+    store
+        .apply_fetch(account, inbox, &[msg(1, "sent")], &[])
+        .unwrap();
+    let message_id = store.list_messages(account, 10, 0).unwrap()[0].id;
+    let envelope = r#"{"mailFrom":{"email":"test@example.com"},"rcptTo":[{"email":"peer@test"}]}"#;
+    let first = store
+        .create_submission(account, message_id, "i1", envelope, 1_700_000_100)
+        .unwrap();
+    let second = store
+        .create_submission(account, message_id, "i1", envelope, 1_700_000_200)
+        .unwrap();
+
+    let all = store.submissions(account, &[], 10).unwrap();
+    assert_eq!(
+        all.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![second, first]
+    );
+    assert_eq!(all[0].envelope, envelope);
+    assert_eq!(all[0].undo_status, "final");
+    let targeted = store.submissions(account, &[first], 10).unwrap();
+    assert_eq!(targeted.len(), 1);
+    assert_eq!(targeted[0].id, first);
+    assert!(store.submissions(account + 99, &[], 10).unwrap().is_empty());
+    assert!(store.submissions(account, &[999], 10).unwrap().is_empty());
 }

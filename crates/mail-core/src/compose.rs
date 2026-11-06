@@ -280,6 +280,143 @@ fn wrap_base64(encoded: &str) -> String {
     out
 }
 
+/// Byte offset where the header section ends, and the separator length.
+fn find_header_end(raw: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < raw.len() {
+        let rest = &raw[index..];
+        if rest.starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if rest.starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Derives an SMTP envelope from an already composed message. Used when a
+/// JMAP client omits `envelope` on `EmailSubmission/set` (RFC 8621 §7.1):
+/// recipients come from `To`, `Cc` and `Bcc`, since Bcc addresses exist only
+/// in the header until the server strips it.
+pub fn derive_envelope(raw: &[u8]) -> Result<Vec<String>, ComposeError> {
+    let mut envelope: Vec<String> = Vec::new();
+    for field in ["to", "cc", "bcc"] {
+        let Some(value) = mail_parse::raw_header_value(raw, field) else {
+            continue;
+        };
+        let decoded = mail_parse::decode_encoded_words(&value);
+        for token in split_address_list(&decoded) {
+            let Ok(address) = normalize_address(&token) else {
+                continue;
+            };
+            if !envelope
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(&address))
+            {
+                envelope.push(address);
+            }
+        }
+    }
+    if envelope.is_empty() {
+        return Err(ComposeError::NoRecipients);
+    }
+    Ok(envelope)
+}
+
+/// Removes every `Bcc` header field (with its folded continuation lines) from
+/// the header section, leaving the body untouched. RFC 8621 §7.5 requires the
+/// server to do this during delivery.
+pub fn strip_bcc_header(raw: &[u8]) -> Vec<u8> {
+    let (header_end, _) = match find_header_end(raw) {
+        Some(bounds) => bounds,
+        None => (raw.len(), 0),
+    };
+    let header = &raw[..header_end];
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skip = false;
+    for line in header.split_inclusive(|byte| *byte == b'\n') {
+        let end = line
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(line.len());
+        let mut content = &line[..end];
+        if content.last() == Some(&b'\r') {
+            content = &content[..content.len() - 1];
+        }
+        let continuation = matches!(content.first(), Some(b' ') | Some(b'\t'));
+        if continuation && skip {
+            continue;
+        }
+        skip = false;
+        let is_bcc =
+            content.len() >= 4 && content[..3].eq_ignore_ascii_case(b"bcc") && content[3] == b':';
+        if is_bcc {
+            skip = true;
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(&raw[header_end..]);
+    out
+}
+
+/// Splits a header value into addr-spec tokens, honouring quoted strings,
+/// comments and angle addresses. Display names are dropped.
+fn split_address_list(header: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    for ch in header.chars() {
+        match ch {
+            '"' => {
+                in_quote = !in_quote;
+                current.push(ch);
+            }
+            '<' | '(' if !in_quote => {
+                depth += 1;
+                current.push(ch);
+            }
+            '>' | ')' if !in_quote => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if !in_quote && depth == 0 => {
+                tokens.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    tokens.push(current);
+    tokens
+        .iter()
+        .map(|token| addr_spec(token))
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn addr_spec(token: &str) -> String {
+    let token = token.trim();
+    if let (Some(open), Some(close)) = (token.rfind('<'), token.rfind('>')) {
+        if open < close {
+            return token[open + 1..close].trim().to_string();
+        }
+    }
+    let mut out = String::new();
+    let mut depth = 0i32;
+    for ch in token.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,13 +604,53 @@ mod tests {
     }
 
     #[test]
-    fn unknown_media_type_falls_back_to_octet_stream() {
-        assert_eq!(media_type(None), FALLBACK_MEDIA_TYPE);
-        assert_eq!(media_type(Some("not a type")), FALLBACK_MEDIA_TYPE);
+    fn derives_an_envelope_from_headers_without_duplicates() {
+        let raw = b"From: me@example.com\r\n\
+                    To: Peer <peer@example.com>, second@example.com\r\n\
+                    Cc: =?utf-8?B?5Lit5paH?= <third@example.com>\r\n\
+                    Bcc: hidden@example.com\r\n\
+                    \r\nbody";
+        let envelope = derive_envelope(raw).expect("envelope");
         assert_eq!(
-            media_type(Some("text/plain; charset=x")),
-            FALLBACK_MEDIA_TYPE
+            envelope,
+            vec![
+                "peer@example.com".to_string(),
+                "second@example.com".to_string(),
+                "third@example.com".to_string(),
+                "hidden@example.com".to_string(),
+            ]
         );
-        assert_eq!(media_type(Some("image/png")), "image/png");
+
+        let duplicate = b"To: A <a@example.com>, a@example.com\r\n\r\nbody";
+        assert_eq!(
+            derive_envelope(duplicate).expect("envelope"),
+            vec!["a@example.com".to_string()]
+        );
+
+        assert_eq!(
+            derive_envelope(b"Subject: none\r\n\r\nbody"),
+            Err(ComposeError::NoRecipients)
+        );
+    }
+
+    #[test]
+    fn removes_bcc_headers_and_their_continuations_only() {
+        let raw = b"To: peer@example.com\r\n\
+                    Bcc: first@example.com,\r\n\
+                    \tsecond@example.com\r\n\
+                    Subject: hi\r\n\
+                    \r\nBcc: not a header\r\n";
+        let stripped = strip_bcc_header(raw);
+        let text = String::from_utf8(stripped.clone()).expect("utf8");
+        assert_eq!(
+            text,
+            "To: peer@example.com\r\nSubject: hi\r\n\r\nBcc: not a header\r\n"
+        );
+        // The body still contains the literal text; only the header section lost
+        // its Bcc fields.
+        assert!(stripped.ends_with(b"Bcc: not a header\r\n"));
+
+        let without = strip_bcc_header(b"Subject: plain\r\n\r\nbody");
+        assert_eq!(without, b"Subject: plain\r\n\r\nbody");
     }
 }

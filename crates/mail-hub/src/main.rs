@@ -28,8 +28,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use futures::stream;
 use mail_api::{
-    BodySource, FetchedBody, Jmap, RequestError, WriteError, WriteSink, MAX_UPLOAD_BYTES,
+    BodySource, FetchedBody, Jmap, RequestError, SubmissionEnvelope, SubmissionOutcome,
+    SubmissionSink, WriteError, WriteSink, MAX_UPLOAD_BYTES,
 };
+use mail_core::compose::{derive_envelope, strip_bcc_header};
 use mail_core::{Core, CoreError};
 use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Device, Store};
@@ -70,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
             store: Arc::clone(&store),
         }))
         .with_writes(Arc::new(CoreWrites {
+            core: Arc::clone(&core),
+            store: Arc::clone(&store),
+        }))
+        .with_submissions(Arc::new(CoreSubmission {
             core: Arc::clone(&core),
             store: Arc::clone(&store),
         }));
@@ -117,24 +123,31 @@ fn router(state: Arc<AppState>) -> Router {
 }
 
 async fn session(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(err) = authenticate(&headers, &state) {
-        return auth_error(err);
-    }
-    match state.jmap.session() {
-        Ok(value) => Json(value).into_response(),
+    let account_id = match account_of(&headers, &state) {
+        Ok(account_id) => account_id,
+        Err(err) => return auth_error(err),
+    };
+    match state.jmap.session_for(account_id) {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "urn:ietf:params:jmap:error:notFound",
+            "account not found",
+        ),
         Err(err) => server_error(err),
     }
 }
 
 async fn jmap(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Err(err) = authenticate(&headers, &state) {
-        return auth_error(err);
-    }
+    let account_id = match account_of(&headers, &state) {
+        Ok(account_id) => account_id,
+        Err(err) => return auth_error(err),
+    };
     let request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => return problem(StatusCode::BAD_REQUEST, "notJSON", &err.to_string()),
     };
-    match state.jmap.handle(request).await {
+    match state.jmap.handle_for_account(request, account_id).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => request_error(err),
     }
@@ -144,6 +157,8 @@ async fn jmap(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Byte
 struct PairRequest {
     code: String,
     name: Option<String>,
+    #[serde(rename = "accountId")]
+    account_id: Option<Value>,
 }
 
 async fn pair(State(state): State<Arc<AppState>>, Json(request): Json<PairRequest>) -> Response {
@@ -154,22 +169,76 @@ async fn pair(State(state): State<Arc<AppState>>, Json(request): Json<PairReques
             "pairing code does not match",
         );
     }
+    let account_id = match resolve_pairing_account(&state, request.account_id.as_ref()) {
+        Ok(account_id) => account_id,
+        Err(response) => return *response,
+    };
     let token = random_token();
     let name = request
         .name
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "device".to_string());
-    match state.store.create_device(&name, &token_hash(&token)) {
+    match state
+        .store
+        .create_device(&name, account_id, &token_hash(&token))
+    {
         Ok(device_id) => {
-            info!(device_id, %name, "device paired");
+            info!(device_id, %name, account_id, "device paired");
             (
                 StatusCode::CREATED,
-                Json(json!({ "token": token, "device": name })),
+                Json(json!({
+                    "token": token,
+                    "device": name,
+                    "accountId": account_id.to_string(),
+                })),
             )
                 .into_response()
         }
         Err(err) => server_error(err),
+    }
+}
+
+/// Resolves which account a newly paired device may use. A store with exactly
+/// one account binds it implicitly; otherwise the request must name one.
+fn resolve_pairing_account(
+    state: &AppState,
+    requested: Option<&Value>,
+) -> Result<i64, Box<Response>> {
+    let accounts = match state.store.list_accounts() {
+        Ok(accounts) => accounts,
+        Err(err) => return Err(Box::new(server_error(err))),
+    };
+    let requested = requested.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+    });
+    match requested {
+        Some(account_id) => {
+            if state
+                .store
+                .account_by_id(account_id)
+                .map_err(|err| Box::new(server_error(err)))?
+                .is_some()
+            {
+                Ok(account_id)
+            } else {
+                Err(Box::new(problem(
+                    StatusCode::BAD_REQUEST,
+                    "urn:ietf:params:jmap:error:notFound",
+                    "account not found",
+                )))
+            }
+        }
+        None => match accounts.as_slice() {
+            [account] => Ok(account.id),
+            _ => Err(Box::new(problem(
+                StatusCode::BAD_REQUEST,
+                "urn:ietf:params:jmap:error:invalidArguments",
+                "accountId is required when the store holds more than one account",
+            ))),
+        },
     }
 }
 
@@ -181,8 +250,16 @@ async fn upload(
     Path(account_id): Path<i64>,
     body: Bytes,
 ) -> Response {
-    if let Err(err) = authenticate(&headers, &state) {
-        return auth_error(err);
+    let bound = match account_of(&headers, &state) {
+        Ok(account_id) => account_id,
+        Err(err) => return auth_error(err),
+    };
+    if bound != account_id {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "urn:ietf:params:jmap:error:notFound",
+            "account not found",
+        );
     }
     match state.store.account_by_id(account_id) {
         Ok(Some(_)) => {}
@@ -229,8 +306,16 @@ async fn download(
     headers: HeaderMap,
     Path((account_id, blob_id, _name)): Path<(i64, String, String)>,
 ) -> Response {
-    if let Err(err) = authenticate(&headers, &state) {
-        return auth_error(err);
+    let bound = match account_of(&headers, &state) {
+        Ok(account_id) => account_id,
+        Err(err) => return auth_error(err),
+    };
+    if bound != account_id {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "urn:ietf:params:jmap:error:notFound",
+            "blob not found",
+        );
     }
     let blob = match state.store.blob_for_account(account_id, &blob_id) {
         Ok(Some(blob)) => blob,
@@ -280,9 +365,10 @@ async fn eventsource(
     headers: HeaderMap,
     Query(params): Query<EventQuery>,
 ) -> Response {
-    if let Err(err) = authenticate(&headers, &state) {
-        return auth_error(err);
-    }
+    let bound = match account_of(&headers, &state) {
+        Ok(account_id) => account_id,
+        Err(err) => return auth_error(err),
+    };
     let ping = parse_seconds(params.ping.as_deref(), 10);
     let closeafter = parse_seconds(params.closeafter.as_deref(), 60);
     let types: Vec<String> = params
@@ -300,10 +386,7 @@ async fn eventsource(
         types
     };
 
-    let accounts: Vec<i64> = match state.store.list_accounts() {
-        Ok(accounts) => accounts.into_iter().map(|account| account.id).collect(),
-        Err(err) => return server_error(err),
-    };
+    let accounts = vec![bound];
     let mut interval = tokio::time::interval(ping);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -388,10 +471,24 @@ fn parse_seconds(raw: Option<&str>, default: u64) -> Duration {
     Duration::from_secs(seconds.unwrap_or(default).clamp(1, 300))
 }
 
+#[derive(Debug)]
 enum AuthError {
     MissingToken,
     UnknownToken,
+    UnboundAccount,
     Store(mail_store::StoreError),
+}
+
+/// Authenticates and returns the single account the device may use. Devices
+/// paired before accounts were bound cannot be attributed, so they must pair
+/// again instead of inheriting access to every account.
+fn account_of(headers: &HeaderMap, state: &AppState) -> Result<i64, AuthError> {
+    let device = authenticate(headers, state)?;
+    bound_account(&device)
+}
+
+fn bound_account(device: &Device) -> Result<i64, AuthError> {
+    device.account_id.ok_or(AuthError::UnboundAccount)
 }
 
 fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Device, AuthError> {
@@ -418,6 +515,11 @@ fn auth_error(err: AuthError) -> Response {
         AuthError::Store(err) => server_error(err),
         AuthError::MissingToken => unauthorized("missing bearer token"),
         AuthError::UnknownToken => unauthorized("unknown token"),
+        AuthError::UnboundAccount => problem(
+            StatusCode::FORBIDDEN,
+            "urn:ietf:params:jmap:error:forbidden",
+            "device is not bound to an account; pair it again",
+        ),
     }
 }
 
@@ -575,13 +677,13 @@ impl WriteSink for CoreWrites {
         &'a self,
         account_id: i64,
         mailbox_id: i64,
-        raw: Vec<u8>,
+        raw: &'a [u8],
         keywords: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
         Box::pin(async move {
             let email = self.email(account_id)?;
             self.core
-                .import_message(&email, mailbox_id, &raw, &keywords)
+                .import_message(&email, mailbox_id, raw, &keywords)
                 .await
                 .map_err(core_write_error)
         })
@@ -614,6 +716,52 @@ fn core_write_error(err: CoreError) -> WriteError {
     }
 }
 
+/// Delivers `EmailSubmission` messages through `mail-core`: SMTP first, then
+/// the Sent copy. The SMTP envelope is the client's, or derived from the
+/// message headers when the client omitted it.
+struct CoreSubmission {
+    core: Arc<Core>,
+    store: Arc<Store>,
+}
+
+impl SubmissionSink for CoreSubmission {
+    fn submit<'a>(
+        &'a self,
+        account_id: i64,
+        raw: Vec<u8>,
+        envelope: Option<SubmissionEnvelope>,
+    ) -> Pin<Box<dyn Future<Output = Result<SubmissionOutcome, WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            let account = self
+                .store
+                .account_by_id(account_id)
+                .map_err(|err| WriteError::Server(err.to_string()))?
+                .ok_or_else(|| WriteError::NotFound(format!("account {account_id} not found")))?;
+            let envelope = match envelope {
+                Some(envelope) => envelope,
+                None => SubmissionEnvelope {
+                    mail_from: account.email.clone(),
+                    rcpt_to: derive_envelope(&raw)
+                        .map_err(|err| WriteError::NotSupported(err.to_string()))?,
+                },
+            };
+            // RFC 8621 §7.5: Bcc addresses stay in the envelope only.
+            let raw = strip_bcc_header(&raw);
+            let outcome = self
+                .core
+                .send_raw(&account.email, &envelope.rcpt_to, &raw)
+                .await
+                .map_err(core_write_error)?;
+            Ok(SubmissionOutcome {
+                envelope,
+                recipients: outcome.recipients,
+                saved_to: outcome.saved_to,
+                save_error: outcome.save_error,
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +781,16 @@ mod tests {
         })
     }
 
+    fn seed_account(state: &Arc<AppState>) -> i64 {
+        if let Some(account) = state.store.list_accounts().expect("accounts").first() {
+            return account.id;
+        }
+        state
+            .store
+            .create_account("imap", "me@example.com", None, "secret", &json!({}))
+            .expect("account")
+    }
+
     async fn body_json(response: Response) -> Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -640,47 +798,73 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
-    async fn pair_with(state: &Arc<AppState>, code: &str) -> Response {
+    async fn pair_with(state: &Arc<AppState>, code: &str, account_id: Option<i64>) -> Response {
+        let body = match account_id {
+            Some(account_id) => {
+                format!(r#"{{"code":"{code}","name":"phone","accountId":{account_id}}}"#)
+            }
+            None => format!(r#"{{"code":"{code}","name":"phone"}}"#),
+        };
         router(Arc::clone(state))
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/pair")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"code":"{code}","name":"phone"}}"#)))
+                    .body(Body::from(body))
                     .expect("request"),
             )
             .await
             .expect("response")
     }
 
-    async fn paired_token(state: &Arc<AppState>) -> String {
-        body_json(pair_with(state, "pair-me").await).await["token"]
+    async fn paired_token_for(state: &Arc<AppState>, account_id: i64) -> String {
+        body_json(pair_with(state, "pair-me", Some(account_id)).await).await["token"]
             .as_str()
             .expect("token")
             .to_string()
     }
 
+    async fn paired_token(state: &Arc<AppState>) -> String {
+        let account_id = seed_account(state);
+        paired_token_for(state, account_id).await
+    }
+
     #[tokio::test]
     async fn pairing_checks_the_code_and_stores_only_a_hash() {
         let state = state();
-        let wrong = pair_with(&state, "nope").await;
+        let account = seed_account(&state);
+        let wrong = pair_with(&state, "nope", Some(account)).await;
         assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
 
-        let response = pair_with(&state, "pair-me").await;
+        let response = pair_with(&state, "pair-me", Some(account)).await;
         assert_eq!(response.status(), StatusCode::CREATED);
         let payload = body_json(response).await;
+        assert_eq!(payload["accountId"], json!(account.to_string()));
         let token = payload["token"].as_str().expect("token").to_string();
-        assert!(state
+        let device = state
             .store
             .device_by_token_hash(&token_hash(&token))
             .expect("lookup")
-            .is_some());
+            .expect("device");
+        assert_eq!(device.account_id, Some(account));
         assert!(state
             .store
             .device_by_token_hash(&token)
             .expect("lookup")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn pairing_requires_an_account_when_several_exist() {
+        let state = state();
+        seed_account(&state);
+        state
+            .store
+            .create_account("imap", "other@example.com", None, "secret", &json!({}))
+            .expect("account");
+        let response = pair_with(&state, "pair-me", None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -716,6 +900,7 @@ mod tests {
     #[tokio::test]
     async fn jmap_endpoint_answers_method_calls() {
         let state = state();
+        let account = seed_account(&state);
         let token = paired_token(&state).await;
         let response = router(state)
             .oneshot(
@@ -724,19 +909,93 @@ mod tests {
                     .uri("/jmap")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::from(
-                        r#"{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Mailbox/get",{"accountId":"1"},"c0"]]}"#,
-                    ))
+                    .body(Body::from(format!(
+                        r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Mailbox/get",{{"accountId":"{account}"}},"c0"]]}}"#
+                    )))
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         let payload = body_json(response).await;
+        assert_eq!(payload["methodResponses"][0][0], json!("Mailbox/get"));
         assert_eq!(
-            payload["methodResponses"][0][1]["type"],
+            payload["methodResponses"][0][1]["accountId"],
+            json!(account.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_cannot_reach_another_account() {
+        let state = state();
+        let account = seed_account(&state);
+        let other = state
+            .store
+            .create_account("imap", "other@example.com", None, "secret", &json!({}))
+            .expect("account");
+        let token = paired_token_for(&state, account).await;
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/jmap")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(format!(
+                        r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":[
+                             ["Mailbox/get",{{"accountId":"{account}"}},"a"],
+                             ["Mailbox/get",{{"accountId":"{other}"}},"b"]
+                           ]}}"#
+                    )))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = body_json(response).await;
+        assert_eq!(payload["methodResponses"][0][0], json!("Mailbox/get"));
+        assert_eq!(payload["methodResponses"][1][0], json!("error"));
+        assert_eq!(
+            payload["methodResponses"][1][1]["type"],
             json!("accountNotFound")
         );
+
+        // Uploads and downloads for another account are indistinguishable from
+        // missing blobs.
+        let upload = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/upload/{other}"))
+                    .header(header::CONTENT_TYPE, "message/rfc822")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from("Subject: x\r\n\r\n"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(upload.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_legacy_device_without_an_account_is_refused() {
+        let device = Device {
+            id: 1,
+            name: "phone".to_string(),
+            account_id: None,
+            created_at: 0,
+            last_seen_at: None,
+        };
+        assert!(matches!(
+            bound_account(&device),
+            Err(AuthError::UnboundAccount)
+        ));
+        let bound = Device {
+            account_id: Some(7),
+            ..device
+        };
+        assert_eq!(bound_account(&bound).expect("bound"), 7);
     }
 
     fn seed_blob(state: &Arc<AppState>) -> (i64, String) {

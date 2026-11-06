@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mail_api::{
-    BodySource, FetchedBody, Jmap, RequestError, WriteError, WriteSink, CORE_CAPABILITY,
-    MAIL_CAPABILITY,
+    BodySource, FetchedBody, Jmap, RequestError, SubmissionEnvelope, SubmissionOutcome,
+    SubmissionSink, WriteError, WriteSink, CORE_CAPABILITY, MAIL_CAPABILITY, SUBMISSION_CAPABILITY,
 };
 use mail_store::{BodyPartInput, DbKey, NewMessage, Store};
 use serde_json::{json, Value};
@@ -446,7 +446,7 @@ async fn unsupported_inputs_fail_explicitly() {
     .await;
     assert_eq!(response[1]["type"], json!("unsupportedSort"));
 
-    let response = call(&jmap, "Identity/get", json!({"accountId": account})).await;
+    let response = call(&jmap, "Email/queryChanges", json!({"accountId": account})).await;
     assert_eq!(response[1]["type"], json!("unknownMethod"));
 }
 
@@ -498,7 +498,7 @@ impl WriteSink for StoreWrites {
         &'a self,
         _account_id: i64,
         _mailbox_id: i64,
-        _raw: Vec<u8>,
+        _raw: &[u8],
         _keywords: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
         Box::pin(async { Err(WriteError::NotSupported("import is not wired here".into())) })
@@ -555,7 +555,7 @@ impl WriteSink for RecordingWrites {
         &'a self,
         _account_id: i64,
         _mailbox_id: i64,
-        _raw: Vec<u8>,
+        _raw: &[u8],
         _keywords: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
         Box::pin(async { Err(WriteError::NotSupported("import is not wired here".into())) })
@@ -712,6 +712,58 @@ async fn email_set_moves_through_the_sink() {
     assert_eq!(
         *writes.moves.lock().expect("moves"),
         vec![(id, fixture.sent)]
+    );
+}
+
+#[tokio::test]
+async fn email_set_accepts_the_standard_move_patch() {
+    let fixture = setup();
+    fixture
+        .store
+        .apply_fetch(fixture.account, fixture.inbox, &[message(8, "draft")], &[])
+        .expect("fetch");
+    let id = fixture.store.list_messages(fixture.account, 10, 0).unwrap()[0].id;
+    let writes = Arc::new(RecordingWrites::default());
+    let jmap = Jmap::new(Arc::clone(&fixture.store)).with_writes(writes.clone());
+
+    // RFC 8621 §7.5 examples express a move as "remove from one mailbox,
+    // add to another"; the IMAP backend performs it with MOVE.
+    let response = result(
+        &call(
+            &jmap,
+            "Email/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "update": { id.to_string(): {
+                    format!("mailboxIds/{}", fixture.inbox): Value::Null,
+                    format!("mailboxIds/{}", fixture.sent): true,
+                }},
+            }),
+        )
+        .await,
+    );
+    assert!(response["updated"].get(id.to_string()).is_some());
+    assert_eq!(
+        *writes.moves.lock().expect("moves"),
+        vec![(id, fixture.sent)]
+    );
+
+    let removal_only = result(
+        &call(
+            &jmap,
+            "Email/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "update": { id.to_string(): {
+                    format!("mailboxIds/{}", fixture.inbox): Value::Null,
+                }},
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        removal_only["notUpdated"][id.to_string()]["type"],
+        json!("notSupported")
     );
 }
 
@@ -900,11 +952,11 @@ impl WriteSink for ImportWrites {
         &'a self,
         account_id: i64,
         mailbox_id: i64,
-        raw: Vec<u8>,
+        raw: &'a [u8],
         keywords: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
         Box::pin(async move {
-            let text = String::from_utf8_lossy(&raw).to_string();
+            let text = String::from_utf8_lossy(raw).to_string();
             let message_id = text
                 .lines()
                 .find_map(|line| line.strip_prefix("Message-ID: "))
@@ -1146,6 +1198,15 @@ async fn email_set_creates_a_full_email_from_an_upload() {
     );
     assert_eq!(created["keywords"]["$seen"], json!(true));
     assert_eq!(created["subject"], json!("imported"));
+    assert_eq!(
+        fixture
+            .store
+            .raw_blob(fixture.account, id.parse().expect("id"))
+            .expect("raw")
+            .as_deref(),
+        Some(&raw[..]),
+        "create must keep the uploaded bytes for EmailSubmission"
+    );
     assert!(fixture
         .store
         .message_by_message_id(fixture.account, "<create@example.com>")
@@ -1339,4 +1400,349 @@ async fn email_set_accepts_the_state_from_email_changes_after_a_mailbox_change()
         .await,
     );
     assert!(response["updated"].as_object().expect("updated").len() == 1);
+}
+
+struct RecordingSubmission {
+    sent: Mutex<Vec<(Vec<u8>, Option<SubmissionEnvelope>)>>,
+    /// Envelope the sink reports when the client supplied none.
+    derived: SubmissionEnvelope,
+}
+
+impl Default for RecordingSubmission {
+    fn default() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+            derived: SubmissionEnvelope {
+                mail_from: ACCOUNT_EMAIL.to_string(),
+                rcpt_to: vec!["derived@example.com".to_string()],
+            },
+        }
+    }
+}
+
+impl SubmissionSink for RecordingSubmission {
+    fn submit<'a>(
+        &'a self,
+        _account_id: i64,
+        raw: Vec<u8>,
+        envelope: Option<SubmissionEnvelope>,
+    ) -> Pin<Box<dyn Future<Output = Result<SubmissionOutcome, WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.sent
+                .lock()
+                .expect("sent")
+                .push((raw, envelope.clone()));
+            let envelope = envelope.unwrap_or_else(|| self.derived.clone());
+            Ok(SubmissionOutcome {
+                recipients: envelope.rcpt_to.len(),
+                envelope,
+                saved_to: Some("Sent".to_string()),
+                save_error: None,
+            })
+        })
+    }
+}
+
+fn submitting_jmap(fixture: &Fixture, sink: Arc<RecordingSubmission>) -> Jmap {
+    Jmap::new(Arc::clone(&fixture.store))
+        .with_writes(Arc::new(ImportWrites {
+            store: Arc::clone(&fixture.store),
+            next_uid: AtomicUsize::new(0),
+        }))
+        .with_submissions(sink)
+}
+
+/// Imports raw bytes through the write path, which is what makes them
+/// submittable later.
+async fn import_raw(fixture: &Fixture, raw: &[u8]) -> String {
+    let blob_id = fixture
+        .store
+        .store_upload(fixture.account, "message/rfc822", raw)
+        .expect("upload");
+    let response = result(
+        &call(
+            &writing_jmap(fixture),
+            "Email/import",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "emails": {
+                    "k1": { "blobId": blob_id, "mailboxIds": { fixture.inbox.to_string(): true } }
+                },
+            }),
+        )
+        .await,
+    );
+    response["created"]["k1"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string()
+}
+
+#[tokio::test]
+async fn session_and_identity_are_account_scoped() {
+    let fixture = setup();
+    let jmap = Jmap::new(Arc::clone(&fixture.store));
+
+    let session = jmap
+        .session_for(fixture.account)
+        .expect("session")
+        .expect("account");
+    assert!(session["capabilities"][SUBMISSION_CAPABILITY].is_object());
+    assert_eq!(
+        session["primaryAccounts"][SUBMISSION_CAPABILITY],
+        json!(fixture.account.to_string())
+    );
+    assert_eq!(session["accounts"].as_object().expect("accounts").len(), 1);
+
+    let identity = result(
+        &call(
+            &jmap,
+            "Identity/get",
+            json!({"accountId": fixture.account.to_string()}),
+        )
+        .await,
+    );
+    let list = identity["list"].as_array().expect("list");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["email"], json!(ACCOUNT_EMAIL));
+    assert_eq!(list[0]["mayDelete"], json!(false));
+}
+
+#[tokio::test]
+async fn a_bound_request_cannot_name_another_account() {
+    let fixture = setup();
+    let other = fixture
+        .store
+        .create_account("imap", "other@example.com", None, "secret", &json!({}))
+        .expect("account");
+    let jmap = Jmap::new(Arc::clone(&fixture.store));
+
+    let request = json!({
+        "using": [CORE_CAPABILITY, MAIL_CAPABILITY],
+        "methodCalls": [
+            ["Mailbox/get", {"accountId": fixture.account.to_string()}, "a"],
+            ["Mailbox/get", {"accountId": other.to_string()}, "b"],
+        ],
+    });
+    let response = jmap
+        .handle_for_account(request, fixture.account)
+        .await
+        .expect("request");
+    assert_eq!(response["methodResponses"][0][0], json!("Mailbox/get"));
+    assert_eq!(response["methodResponses"][1][0], json!("error"));
+    assert_eq!(
+        response["methodResponses"][1][1]["type"],
+        json!("accountNotFound")
+    );
+
+    let session = jmap
+        .session_for(fixture.account)
+        .expect("session")
+        .expect("account");
+    assert_eq!(session["accounts"].as_object().expect("accounts").len(), 1);
+}
+
+#[tokio::test]
+async fn submission_delivers_the_raw_bytes_and_is_queryable() {
+    let fixture = setup();
+    let raw = b"Message-ID: <sub@example.com>\r\nTo: peer@example.com\r\nSubject: hi\r\n\r\nbody";
+    let email_id = import_raw(&fixture, raw).await;
+    let sink = Arc::new(RecordingSubmission::default());
+    let jmap = submitting_jmap(&fixture, Arc::clone(&sink));
+
+    let response = result(
+        &call(
+            &jmap,
+            "EmailSubmission/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "create": {
+                    "k1": {
+                        "emailId": email_id,
+                        "identityId": format!("i{}", fixture.account),
+                        "envelope": {
+                            "mailFrom": {"email": ACCOUNT_EMAIL},
+                            "rcptTo": [{"email": "peer@example.com"}],
+                        },
+                    }
+                },
+            }),
+        )
+        .await,
+    );
+    let created = &response["created"]["k1"];
+    assert_eq!(created["emailId"], json!(email_id));
+    assert_eq!(created["undoStatus"], json!("final"));
+    assert_eq!(created["savedTo"], json!("Sent"));
+    assert_eq!(
+        created["envelope"]["rcptTo"][0]["email"],
+        json!("peer@example.com")
+    );
+
+    {
+        let sent = sink.sent.lock().expect("sent");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, raw, "the sink must receive the uploaded bytes");
+    }
+
+    let id = created["id"].as_str().expect("id").to_string();
+    let fetched = result(
+        &call(
+            &jmap,
+            "EmailSubmission/get",
+            json!({"accountId": fixture.account.to_string(), "ids": [id]}),
+        )
+        .await,
+    );
+    assert_eq!(fetched["list"][0]["id"], json!(id));
+    assert_eq!(fetched["notFound"], json!([]));
+}
+
+#[tokio::test]
+async fn submission_without_a_raw_copy_is_rejected() {
+    let fixture = setup();
+    fixture
+        .store
+        .apply_fetch(fixture.account, fixture.inbox, &[message(1, "synced")], &[])
+        .expect("fetch");
+    let email_id = fixture.store.list_messages(fixture.account, 10, 0).unwrap()[0]
+        .id
+        .to_string();
+    let sink = Arc::new(RecordingSubmission::default());
+    let jmap = submitting_jmap(&fixture, Arc::clone(&sink));
+
+    let response = result(
+        &call(
+            &jmap,
+            "EmailSubmission/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "create": {
+                    "k1": {
+                        "emailId": email_id,
+                        "identityId": format!("i{}", fixture.account),
+                        "envelope": {
+                            "mailFrom": {"email": ACCOUNT_EMAIL},
+                            "rcptTo": [{"email": "peer@example.com"}],
+                        },
+                    }
+                },
+            }),
+        )
+        .await,
+    );
+    assert_eq!(response["notCreated"]["k1"]["type"], json!("invalidEmail"));
+    assert!(sink.sent.lock().expect("sent").is_empty());
+}
+
+#[tokio::test]
+async fn submission_validates_envelopes_and_identities() {
+    let fixture = setup();
+    let email_id = import_raw(&fixture, b"Message-ID: <v@example.com>\r\n\r\nbody").await;
+    let sink = Arc::new(RecordingSubmission::default());
+    let jmap = submitting_jmap(&fixture, Arc::clone(&sink));
+    let account = fixture.account.to_string();
+
+    let bad_recipient = result(
+        &call(
+            &jmap,
+            "EmailSubmission/set",
+            json!({
+                "accountId": account,
+                "create": {
+                    "k1": {
+                        "emailId": email_id,
+                        "identityId": format!("i{}", fixture.account),
+                        "envelope": {
+                            "mailFrom": {"email": ACCOUNT_EMAIL},
+                            "rcptTo": [{"email": "not an address"}],
+                        },
+                    }
+                },
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        bad_recipient["notCreated"]["k1"]["type"],
+        json!("invalidRecipients")
+    );
+
+    let bad_identity = result(
+        &call(
+            &jmap,
+            "EmailSubmission/set",
+            json!({
+                "accountId": account,
+                "create": {
+                    "k1": {
+                        "emailId": email_id,
+                        "identityId": "i999",
+                        "envelope": {
+                            "mailFrom": {"email": ACCOUNT_EMAIL},
+                            "rcptTo": [{"email": "peer@example.com"}],
+                        },
+                    }
+                },
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        bad_identity["notCreated"]["k1"]["type"],
+        json!("invalidProperties")
+    );
+    assert!(sink.sent.lock().expect("sent").is_empty());
+}
+
+#[tokio::test]
+async fn submission_uses_the_derived_envelope_and_updates_the_email() {
+    let fixture = setup();
+    let email_id = import_raw(&fixture, b"Message-ID: <d@example.com>\r\n\r\nbody").await;
+    let sink = Arc::new(RecordingSubmission::default());
+    let jmap = submitting_jmap(&fixture, Arc::clone(&sink));
+
+    let request = json!({
+        "using": [CORE_CAPABILITY, MAIL_CAPABILITY, SUBMISSION_CAPABILITY],
+        "methodCalls": [[
+            "EmailSubmission/set",
+            {
+                "accountId": fixture.account.to_string(),
+                "create": {
+                    "k1": {
+                        "emailId": email_id,
+                        "identityId": format!("i{}", fixture.account),
+                    }
+                },
+                "onSuccessUpdateEmail": {
+                    "#k1": { "keywords/$seen": true }
+                },
+            },
+            "c0"
+        ]],
+    });
+    let response = jmap.handle(request).await.expect("request");
+    let responses = response["methodResponses"].as_array().expect("responses");
+    assert_eq!(responses.len(), 2, "an implicit Email/set follows");
+    assert_eq!(responses[0][0], json!("EmailSubmission/set"));
+    assert_eq!(responses[1][0], json!("Email/set"));
+    assert_eq!(responses[1][2], json!("c0"));
+    assert_eq!(
+        responses[0][1]["created"]["k1"]["envelope"]["rcptTo"][0]["email"],
+        json!("derived@example.com")
+    );
+
+    let implicit = &responses[1][1];
+    assert!(implicit["notUpdated"]
+        .as_object()
+        .expect("notUpdated")
+        .is_empty());
+    assert_eq!(
+        implicit["updated"]
+            .as_object()
+            .expect("updated")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec![&email_id]
+    );
 }

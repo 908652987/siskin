@@ -28,7 +28,7 @@
 | D10 | 首发平台 | macOS + Windows（同一里程碑，先后实现） | |
 | D11 | Windows 内存路线 | 先 WinUI 3（目标 110–130 MB），若不接受再评估 C++/WinRT 或 Slint | 未在 Windows 上验证 |
 | D12 | Linux 桌面 UI 技术栈 | Slint（纯 Rust，单进程直连 `mail-core`） | 无 WebView / GTK / Qt 运行时依赖；macOS 上即可编译运行验证。代价：第四套 UI，Windows 若也转 Slint 需重评 D11 |
-| D13 | 客户端双模式形态 | 首次运行选择本地模式或远程模式；远程模式只填服务端地址 + 设备令牌，邮箱凭据只在服务端；客户端缓存列表元数据与已打开正文/附件，可一键清除；服务端地址必须 HTTPS（回环例外），令牌按账户授权 | 把 D4 落成可操作产品形态；远程模式客户端不接触邮箱密码；列表可全量缓存，正文/附件按需；远程发送需服务端新增提交端点 |
+| D13 | 客户端双模式形态 | 首次运行选择本地模式或远程模式；远程模式只填服务端地址 + 设备令牌，邮箱凭据只在服务端；客户端缓存列表元数据与已打开正文/附件，可一键清除；服务端地址必须 HTTPS（回环例外），令牌按账户授权 | 把 D4 落成可操作产品形态；远程模式客户端不接触邮箱密码；列表可全量缓存，正文/附件按需；服务端提交端点与令牌按账户授权已实现，客户端适配层待做 |
 
 完整理由与代价见 `docs/ARCHITECTURE.md` §2。
 
@@ -59,11 +59,13 @@
 | 本地回收站与保留期 | 完成 | `mail-store::missing_at`/`purge_trash`/`settings`；删除邮箱进回收站，默认 90 天，`sync` 自动清理；同名单重建保留旧数据 |
 | 变更日志压缩与快照 | 完成 | `mail-store::compact_changes` + `change_snapshots`；默认 20,000 行阈值，`sync`/`sync_account`/`watch` 每轮同步后自动执行；Dovecot 10,010 条压缩后日志归零、水位不倒退 |
 | HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
-| JMAP 子集（读写） | 完成 | `mail-api`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（create/destroy）、`Email/import`、`Thread/get|changes`、`BodySource` 按需正文、`WriteSink` 写路径；25 个 API 测试；Dovecot 实跑 |
-| Hub 服务端与设备配对 | 完成 | `mail-hub`（axum）：配对码换令牌、库中只存哈希、Bearer 鉴权、`/eventsource`、`/download`；`mail-cli devices`/`revoke-device`；5 个路由测试 + 实跑 |
-| Hub 远程模式前置（HTTPS / 发送 / 账户授权） | 未开始 | 当前 Hub 明文 HTTP、默认 `127.0.0.1:8080`；无发送提交端点；配对令牌可访问库内全部账户 |
+| JMAP 子集（读写） | 完成 | `mail-api`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（create/destroy）、`Email/import`、`Thread/get|changes`、`Identity/get`、`EmailSubmission/get|set`、`BodySource` 按需正文、`WriteSink`/`SubmissionSink` 写路径、账户作用域 `session_for`/`handle_for_account`；32 个 API 测试；Dovecot 实跑 |
+| Hub 服务端与设备配对 | 完成 | `mail-hub`（axum）：配对码换令牌、库中只存哈希、Bearer 鉴权、`/eventsource`、`/download`；`mail-cli devices`/`revoke-device`（`devices` 显示绑定账户）；10 个路由测试 + 实跑 |
+| Hub 远程模式前置（HTTPS / 发送 / 账户授权） | 部分完成 | 设备令牌已绑定账户（`hub_devices.account_id`，Session/upload/download/SSE/方法级 `accountId` 全部校验）；发送走标准 `Identity/get` + `EmailSubmission/set`（create）；**剩余**：HTTPS 仍由反代终止、Hub 无后台同步任务 |
 | 客户端双模式（本地 / 远程） | 未开始 | macOS 目前只有本地直连（FFI → `mail-core`）；无 JMAP 客户端、无远程配置入口、无独立缓存与清缓存 |
 | Hub 写操作与 SSE | 完成 | `Email/set` 已读/标志/移动（含多副本）/创建/永久删除、`Mailbox/changes`、SSE 状态事件、blob 下载；Dovecot 实跑（`\Seen` 置/清、移动、计数、下载、token 吊销后 401） |
+| Hub 发送（EmailSubmission） | 完成 | `Identity/get`（每账户一个身份）、`EmailSubmission/get|set`（create、`onSuccessUpdateEmail` 隐式 `Email/set`、`sendAt` 拒绝、`undoStatus=final`）；原始报文随 `Email/import|create` 入库（`messages.raw_blob_hash`）；服务端推导 envelope、投递前剥除 `Bcc` 头；Dovecot + 本地 SMTP sink 实跑：3 个 RCPT（含 Bcc）、服务端副本无 Bcc、Sent +1 |
+| Hub 账户隔离 | 完成 | 配对必须给账户（多账户时），`hub_devices.account_id`；Session 只列绑定账户；`/upload`、`/download`、SSE 与每个 JMAP 方法校验 `accountId`；跨账户返回 404/`accountNotFound`；单账户旧库自动回填，多账户保持未绑定并要求重新配对；10 个路由测试 + 实跑 |
 | Hub 上传与导入 | 完成 | `/upload`（内容寻址 + 24 h 回收）+ `Email/import`（APPEND → 同步 → 返回本地 id）；Dovecot 实跑 2 封导入、首封带 `\Seen` |
 | 线程（Thread/get\|changes） | 完成 | schema v8 `in_reply_to`；`thread_id` 取父线程根，父后到递归改挂；`Email/get.threadId` 与 `Thread/get` 一致；线程变更由写侧记录（created/updated/removed）；单元 9 项 + Dovecot 实跑「回复并入同一线程」「根 created、回复 updated、销毁后 destroyed」 |
 | Hub APNs/FCM 推送 | 未开始 | 依赖推送凭据；SSE 已可替代桌面/局域网客户端 |
@@ -90,7 +92,8 @@ crates/
                            MasterKey（HKDF 发送子密钥）、seal/open（XChaCha20-Poly1305 + AAD）
   mail-store/src/lib.rs    SQLCipher 打开（PRAGMA key + 错密钥/明文库拒绝）、schema、
                            迁移（v6 重建 FTS 并从 blob 回填正文；v8 加 in_reply_to
-                           与 uploads）、账户/邮箱/消息/位置、
+                           与 uploads；v9 加 hub_devices.account_id、messages.raw_blob_hash
+                           与 email_submissions）、账户/邮箱/消息/位置、
                            变更日志（message/mailbox/thread 三类）、settings、
                            apply_fetch（事务，线程变更随消息写入）、
                            search_messages（FTS/LIKE 双路，含正文）、
@@ -100,6 +103,8 @@ crates/
                            list_trash / purge_trash（回收站保留期）、
                            blobs（内容寻址 + 引用计数）、message_parts/attachments、
                            record_body_structure/store_body_parts/store_attachment、
+                           attach_raw_blob/raw_blob（客户端上传的原始报文）、
+                           create_submission/submissions（Hub 提交记录）、
                            threads/list_threads/thread_for_message/adopt_descendants、
                            store_upload/upload_for_account/purge_expired_uploads、
                            message_by_message_id/message_at/mailbox_by_role、
@@ -107,12 +112,14 @@ crates/
                            changes_since/latest_change_seq/latest_change_seq_type/change_window、
                            account_state/latest_snapshot/compact_changes、
                            change_log_max_rows
-  mail-store/tests/        44 个存储测试（含错密钥、明文库、落盘无明文、blob 回收、
+  mail-store/tests/        49 个存储测试（含错密钥、明文库、落盘无明文、blob 回收、
                            回收站与保留期、变更日志快照与压缩、正文索引与截断、
-                           v5→v6 与 v7→v8 迁移、标志位/位置移动、blob 账户隔离、
-                           设备吊销、线程归并与乱序父到达、线程变更日志、上传隔离与过期回收）
+                           v5→v6、v7→v8 与 v8→v9 迁移、标志位/位置移动、blob 账户隔离、
+                           设备绑定与吊销、原始报文生命周期、提交记录、
+                           线程归并与乱序父到达、线程变更日志、上传隔离与过期回收）
   mail-store/src/lib.rs    migration_tests：v5 库（四列 FTS、无 body_text）升级后
-                           主题索引保留、正文从 blob 回填
+                           主题索引保留、正文从 blob 回填；v9 单账户回填设备绑定、
+                           多账户保持未绑定
   mail-proto/src/lib.rs    Stream（TLS/明文/STARTTLS）、ImapSession、CapabilitySet、
                            Tier(A/B/C)、fetch_range/fetch_flags/CHANGEDSINCE、
                            list_uids、fetch_body_layout（BODYSTRUCTURE 扁平化）、
@@ -133,25 +140,31 @@ crates/
                            add_account（密码入钥匙串）、协议分派、sync/sync_account、
                            watch（单邮箱）/ watch_account（全邮箱：IDLE 池 + 扫尾，
                            只推送真实变更）、check、send（SMTP + Sent 归档）、
+                           send_raw（客户端提供的 RFC 822 + envelope）、
                            fetch_body（缓存优先，命中时补写正文索引）、fetch_attachment（按需）、
                            set_keywords（JMAP 关键字 → IMAP STORE）、
                            move_message（MOVE 或 COPY+EXPUNGE；多副本保留一份、其余进 Trash）、
                            destroy_message（每个副本永久删除）、
                            purge_expired_trash / trash_retention_days
   mail-core/src/compose.rs OutgoingMessage → RFC 5322：To/Cc/Bcc（Bcc 只进信封）、
-                           头注入校验、2047 主题/附件名、multipart/mixed、25 MiB 上限
+                           头注入校验、2047 主题/附件名、multipart/mixed、25 MiB 上限；
+                           derive_envelope（从 To/Cc/Bcc 头推导信封）、strip_bcc_header
   mail-core/src/presets.rs gmail/qq/88/custom 主机与默认端口
-  mail-api/src/lib.rs      JMAP 子集：Session、Mailbox/get|changes、
+  mail-api/src/lib.rs      JMAP 子集：Session（含 submission 能力与 session_for）、
+                           Mailbox/get|changes、
                            Email/query|get|changes|set|import（create/destroy）、
-                           Thread/get|changes、BodySource 按需正文、
-                           WriteSink 写路径（含 import/destroy）、
-                           filter/sort 的显式拒绝
-  mail-api/tests/          25 个 API 测试（邮箱计数、筛选分页、正文、变更语义、
+                           Thread/get|changes、Identity/get、EmailSubmission/get|set、
+                           BodySource 按需正文、WriteSink/SubmissionSink 写路径
+                           （含 import/destroy）、handle_for_account 账户隔离、
+                           mailboxIds/<id> 子补丁、filter/sort 的显式拒绝
+  mail-api/tests/          32 个 API 测试（邮箱计数、筛选分页、正文、变更语义、
                            线程变更、关键字写入、移动、state 冲突、blobId、导入、
-                           创建/销毁、错误）
+                           创建/销毁、错误、身份、提交与 envelope、
+                           onSuccessUpdateEmail、账户隔离）
   mail-hub/src/main.rs     axum 服务：/.well-known/jmap、/jmap、/pair、/eventsource、
-                           /download、/upload（两种斜杠形式）；CoreBodies/CoreWrites
-                           同文件 tests：7 个路由测试（配对、鉴权、JMAP、下载、上传、SSE）
+                           /download、/upload（两种斜杠形式）；CoreBodies/CoreWrites/
+                           CoreSubmission 同文件 tests：10 个路由测试（配对与账户绑定、
+                           鉴权、JMAP、跨账户拒绝、下载、上传、SSE）
   mail-ffi/src/lib.rs      UniFFI 门面：provider_presets + MailClient（open/accounts/add_account/mailboxes/
                            messages/body/set_seen/move_message/sync/send）、FfiError
   mail-ffi/src/bin/        uniffi-bindgen
@@ -193,7 +206,7 @@ docs/
 
 ```bash
 # 1) 环境（细节见 §6）
-~/.cargo/bin/cargo test --workspace          # 期望 151 个测试全过
+~/.cargo/bin/cargo test --workspace          # 期望 166 个测试全过
 ~/.cargo/bin/cargo build --release
 export EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets   # 开发期绕开钥匙串；发布验证不要设置
 
@@ -254,8 +267,10 @@ EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets EYRIE_HUB_DB=/tmp/smoke.db \
 EYRIE_HUB_BIND=127.0.0.1:18080 EYRIE_HUB_PAIRING_CODE=dev-code \
 cargo run -p mail-hub --release
 TOKEN=$(curl -s -X POST http://127.0.0.1:18080/pair -H 'Content-Type: application/json' \
-  -d '{"code":"dev-code","name":"phone"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+  -d '{"code":"dev-code","name":"phone","accountId":"1"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+# 单账户库可省略 accountId；多账户时必须给出，否则 400。令牌只在该账户内有效。
 curl -s http://127.0.0.1:18080/.well-known/jmap -H "Authorization: Bearer $TOKEN"
+# Session 只列出绑定账户，并带 urn:ietf:params:jmap:submission 能力
 curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":"1"},"c0"]]}'
@@ -302,6 +317,23 @@ curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Thread/changes",{"accountId":"1","sinceState":"<state>"},"c0"]]}'
 # 尾斜杠同样可用；导入后 doveadm fetch 可核对服务器上的 flags 与 In-Reply-To
+# 4.1.1) 远程发送：上传 → Email/import 到 Drafts → EmailSubmission/set
+# blobId 取 /upload 响应，emailId 取 Email/import 的 created id，identityId 为 "i<accountId>"
+curl -s -X POST http://127.0.0.1:18080/upload/1 -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: message/rfc822' --data-binary @/tmp/msg.eml
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/import",{"accountId":"1","emails":{"d1":{"blobId":"<blob>","mailboxIds":{"<drafts>":true},"keywords":{"$draft":true}}}},"c0"]]}'
+# envelope 可省略（服务端按 To/Cc/Bcc 头推导）；给 envelope 时 Bcc 只放在这里
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[["EmailSubmission/set",{"accountId":"1","create":{"k1":{"emailId":"<id>","identityId":"i1","envelope":{"mailFrom":{"email":"vmail@example.com"},"rcptTo":[{"email":"peer@example.com"}]}}},"onSuccessUpdateEmail":{"#k1":{"keywords/$seen":true}}},"c0"]]}'
+# 成功时返回两条 methodResponses：EmailSubmission/set 与隐式 Email/set（同一 call id）；
+# 投递前服务端删除报文里的 Bcc 头，Sent 归档由内核对 IMAP 账户执行（失败只体现在 saveError）
+curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[["EmailSubmission/get",{"accountId":"1","ids":["1"]},"c0"]]}'
+# 只接受客户端上传/导入过的消息（有原始报文）；同步来的邮件提交返回 invalidEmail
 # 设备管理（与 Hub 共用库）
 cargo run -p mail-cli -- --db /tmp/smoke.db devices
 cargo run -p mail-cli -- --db /tmp/smoke.db revoke-device --id <deviceId>
@@ -423,6 +455,10 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | Hub `Thread/get`（Dovecot） | 同一线程返回 `emailIds=[10021,10022]`；未知 id 进 `notFound`；`Email/changes` 把两封导入报为 `created` |
 | Hub 设备吊销 | `revoke-device` 后原令牌请求 Session 返回 401 |
 | Hub 上传 → 导入 → 线程（Dovecot 10,020 封库） | `/upload` 201；`Email/import` 2 封 `created`，`newState` 10033→10037；`Thread/get` 同线程 2 封；`doveadm` 头部与 `\Seen` 一致 |
+| Hub 配对绑定账户（双账户库） | `POST /pair {"accountId":1}` → 201；Session `accounts` 只有 `1`；`upload/2` → 404；JMAP `Mailbox/get{accountId:2}` → `accountNotFound`，账户 1 的调用正常 |
+| Hub `EmailSubmission/set`（Dovecot + 本地 SMTP sink） | 上传 180 字节 → `Email/import` 到 Drafts（id=10025）→ 提交返回 `created.k1`（`undoStatus=final`、`savedTo=Sent`、`sendAt` 时间戳）；sink 收到 3 个 `RCPT`（含 Bcc）、报文 `bcc_header=False`；Sent 6→7；`doveadm fetch` 副本无 `Bcc` 头、`\Seen` 存在；`onSuccessUpdateEmail` 产生同一 call id 的隐式 `Email/set`，本地 `$seen` 落库 |
+| Hub 提交 envelope 派生 | 省略 `envelope` → 服务端按 `To` 解析出 `peer2@example.com` 并投递；`sendAt` 非空 → `notCreated.invalidProperties`；对同步来的消息（无原始报文）提交 → `notCreated.invalidEmail` |
+| Hub `EmailSubmission/get` | 按 id 返回 `identityId`/`emailId`/`threadId`/`envelope`/`sendAt`/`undoStatus`/`deliveryStatus`（每个收件人 `delivered=yes`）；未知 id 进 `notFound` |
 | Hub `Email/set create`（Dovecot） | 上传 175 字节 → `created.k1` 返回完整 Email 对象（`id`/`threadId`/`mailboxIds`/`keywords`/`textBody`）；`doveadm fetch` 显示 `\Seen`，消息在目标邮箱 uid=1 |
 | Hub `Email/set destroy`（Dovecot） | `destroyed=["10023"]`；`Email/get` 该 id 进 `notFound`；`doveadm search` 无结果；双副本消息销毁后 INBOX/归档/Trash 均为 0 |
 | Hub 多副本移动（Dovecot） | 同一 Message-ID 位于 INBOX+新箱 → `mailboxIds` 更新到归档后变 `{归档, Trash}`；服务器 归档 1 封、Trash 1 封、新箱 0 封 |
@@ -460,9 +496,10 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 13. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应先进入服务器 Trash 并同步到本地 Trash）；回收站不提供手工恢复。**验收**：UI 可按邮箱/时间浏览回收站；恢复操作有明确语义。
 14. **多邮箱列表已去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选、跨邮箱计数需要新的查询接口。**验收**：列表可按邮箱过滤且不重复，计数与筛选一致。
 15. **macOS 通知、草稿与多账户切换未做**。列表/阅读/搜索/同步/标已读/标星/移动/HTML/附件/分页/i18n/撰写（To/Cc/Bcc + 附件）/`.app` 打包已接通。剩余：新邮件通知（需 FFI 事件流 + `UNUserNotificationCenter`）、草稿保存、真实多账户切换。**验收**：新邮件可触发系统通知；**未验证**：真实 Gmail/QQ/88 账户投递（§10），通知权限与签名分发。
-16. **Hub 写操作覆盖面**。已完成 `keywords`/`mailboxIds` 更新、多副本移动、`/upload`、`Email/import`、`Email/set` 的 `create`/`destroy`、`Thread/get|changes`；自定义关键字、APNs/FCM、`Email/query` 的 `operator`/`conditions` 组合过滤与升序排序未做；导入/创建只支持 IMAP 账户与单邮箱；一次 `Email/get` 内正文串行拉取；`Thread/changes` 只覆盖本构建之后的变更（升级前历史线程不补发，客户端先 `Thread/get`）。**验收**：客户端可导入、按线程展示并永久删除（已完成）；APNs/FCM 待凭据。
+16. **Hub 写操作覆盖面**。已完成 `keywords`/`mailboxIds` 更新、多副本移动、`/upload`、`Email/import`、`Email/set` 的 `create`/`destroy`、`Thread/get|changes`、`Identity/get`、`EmailSubmission/get|set`（create）；自定义关键字、APNs/FCM、`Email/query` 的 `operator`/`conditions` 组合过滤与升序排序、`EmailSubmission` 的 update/destroy/delayed send 未做；导入/创建只支持 IMAP 账户与单邮箱；一次 `Email/get` 内正文串行拉取；`Thread/changes` 只覆盖本构建之后的变更（升级前历史线程不补发，客户端先 `Thread/get`）。**验收**：客户端可导入、按线程展示、永久删除并发送（已完成）；APNs/FCM 待凭据。
 17. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。**验收**：重建后客户端能收到 `cannotCalculateChanges` 或完整 destroyed 列表。
-18. **客户端双模式未实现（D13，下一项）**。macOS 目前只有本地直连；远程模式需要的 Hub 前置（HTTPS、发送提交端点、令牌按账户授权）与客户端适配层（模式选择、地址 + 令牌配置、JMAP 客户端、独立缓存与清除）都未开始。**验收**：同一 `.app` 首次运行可选两种模式；远程模式在断网时仍能打开上次缓存的列表，清缓存后可重新加载；客户端不保存邮箱密码。
+18. **客户端双模式未实现（D13，下一项）**。Hub 侧前置已完成：设备令牌绑定账户、标准 `EmailSubmission/set` 发送。剩余前置：Hub 仍无后台同步任务（库只在手动 `sync` 时更新）、对外 HTTPS 依赖反代。客户端适配层（模式选择、地址 + 令牌配置、JMAP 客户端、独立缓存与清除）未开始。**验收**：同一 `.app` 首次运行可选两种模式；远程模式在断网时仍能打开上次缓存的列表，清缓存后可重新加载；客户端不保存邮箱密码。
+19. **Hub 部署底线未补**。无 `/healthz`、无 Dockerfile、无容器密钥后端（`FileStore` 仅开发）、无同步任务调度；TLS 未内置（按 `docs/ARCHITECTURE.md` §3.2 由反代终止）。**验收**：容器内起 Hub 后不跑 CLI 也能收到新邮件（同步任务）；`curl /healthz` 200；反代 TLS 下远程模式连通。
 
 ---
 
@@ -481,7 +518,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 ### 第 4 段：服务端与移动（进行中）
 
-6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**读写子集、SSE、附件下载、设备吊销、上传、`Email/import`、`Email/set create/destroy`、多副本移动、`Thread/get|changes` 完成**（2026-11-06）；剩余：APNs/FCM 推送（缺凭据）、远程模式前置（HTTPS、发送提交端点、令牌按账户授权）。
+6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**读写子集、SSE、附件下载、设备吊销、上传、`Email/import`、`Email/set create/destroy`、多副本移动、`Thread/get|changes`、令牌绑定账户、`Identity/get`、`EmailSubmission/get|set` 完成**（2026-11-06）；剩余：APNs/FCM 推送（缺凭据）、Hub 后台同步任务与部署底线（`/healthz`、Dockerfile、容器密钥后端、TLS 反代）。
 7. iOS/Android 薄客户端（依赖 Hub 推送凭据）。
 
 ### 第 5 段：日历与翻译
@@ -491,7 +528,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 ### 第 6 段：桌面 UI
 
-10. 客户端双模式（D13）：首次运行选择本地/远程；远程填服务端地址 + 设备令牌；抽象 UI 数据源（FFI 本地 / JMAP 远程）；独立缓存与清缓存；远程模式隐藏撰写直到服务端发送端点就绪。
+10. 客户端双模式（D13）：首次运行选择本地/远程；远程填服务端地址 + 设备令牌（配对时绑定账户）；抽象 UI 数据源（FFI 本地 / JMAP 远程）；独立缓存与清缓存。远程发送已就绪（标准 `EmailSubmission/set`），客户端需在 FFI 侧暴露「按 compose 字段生成 RFC 822 + envelope」的助手，避免 Swift 再写一套 MIME。
 11. macOS SwiftUI：列表/阅读/搜索/同步/标已读/撰写（To/Cc/Bcc + 附件）/`.app` 打包完成；剩余通知、草稿、真实多账户切换。
 12. Windows WinUI 3（复用 Rust 核心）。
 13. Linux Slint（`apps/linux`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定，实现未开始。
@@ -621,7 +658,17 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 - `Thread/changes` 只记录本构建之后的线程变更；旧库升级后历史线程没有 `changes` 行，客户端应先用 `Thread/get`。压缩会同时删掉 thread 行，早于快照的游标一律 `cannotCalculateChanges`。
 - 删除最后一份副本时 `remove_all_locations` 必须先删 `message_locations` 再 `purge_orphan_messages`；顺序反了会留下没有位置的消息行（`Email/get` 看不到但线程仍把它算进 `emailIds`）。
 - 远程模式客户端只能持有 Hub 地址与设备令牌，**不得保存邮箱密码**，否则等于绕开服务端、破坏“凭据只在服务端”的边界；本地模式的账号与钥匙串也不能被远程模式复用。
-- Hub 当前是明文 HTTP、默认绑定 `127.0.0.1:8080`（仅兼容/开发），且没有发送端点与账户级授权。远程模式对外开放前必须先补 HTTPS、`Email/submission`（或等价发送端点）与令牌绑定账户，否则只能做本机回环演示；端口默认用标准值，但必须能通过 `EYRIE_HUB_BIND`、反代配置或客户端地址覆盖，不要在代码里改常量。
+- Hub 的令牌必须绑定账户：`hub_devices.account_id` 为 NULL 时一律 403 要求重新配对，绝不回退成“全部账户”。迁移只在库里恰好一个账户时回填；多账户旧库保持未绑定。
+- 账户隔离要在服务端每个入口校验：Session 只列绑定账户、`/upload`/`/download`/SSE 只认绑定账户、JMAP 每个方法调用的 `accountId` 必须等于绑定账户（否则该调用返回 `accountNotFound`）。不要相信客户端自报的账户。
+- 提交只接受 `Email/import` 或 `Email/set create` 写入的消息：原始报文存在 `messages.raw_blob_hash`，同步来的邮件没有 raw，提交返回 `invalidEmail`。不要为了“能发”从服务器重新下载并重解析。
+- `attach_raw_blob` 复用 `store_blob` 的引用计数：同一内容重复挂接不 `+1`，不同内容先释放旧 hash；原始报文的引用在 `purge_orphan_messages` 的 blob UNION 里释放，不要在别处二次释放。
+- `EmailSubmission` 走客户端给的信封：`Bcc` 只出现在 `envelope.rcptTo`，投递前用 `compose::strip_bcc_header` 从报文头里删掉；不要用 `compose()` 重新生成报文，否则客户端上传的字节被替换。
+- 省略 `envelope` 时服务端按 `To`/`Cc`/`Bcc` 头推导（`compose::derive_envelope`），推导失败按 `notSupported` 报错；`sendAt` 非空必须拒绝（`maxDelayedSend=0`）。
+- `onSuccessUpdateEmail` 是隐式 `Email/set`：必须排在 `EmailSubmission/set` 响应之后，且两条响应共用同一个方法 call id。
+- 发送成功但 Sent 归档失败只体现在 `saveError`/`savedTo`；Sent 的服务端副本要等下一次 `sync` 才进本地库，提交后立刻 `Email/get` 可能只看到 Drafts 位置（本地 `send` 同样如此）。
+- `mailboxIds/<id>: null` 与 `mailboxIds/<id>: true` 同时出现表示 JMAP 的移动，后端用 IMAP `MOVE` 满足；只删不加、或删除多个邮箱都不支持，返回 `notSupported`。
+- `EmailSubmission` 没有变更日志：`oldState`/`newState` 取该账户最新提交 id（`e<id>`）；不要把提交写入 `changes`，否则 `Email/changes` 的游标语义会被污染。
+- Hub 仍然是明文 HTTP、默认绑定 `127.0.0.1:8080`，且没有后台同步任务。远程模式对外开放前必须有反代 TLS 与同步任务（见 §8-19）；端口默认用标准值，但必须能通过 `EYRIE_HUB_BIND`、反代配置或客户端地址覆盖，不要在代码里改常量。
 - 远程模式的“清除缓存”只清客户端缓存与对应 state，绝不调用服务端删除；清完后从 `state=0` 重新拉当前窗口，不能把 `cannotCalculateChanges` 当成清缓存。
 - 列表允许全量元数据缓存，正文/附件按需；不要为了“列表本地”在客户端预先拉全量正文，也不要为了“不全量”把列表改成每次都走网络。
 

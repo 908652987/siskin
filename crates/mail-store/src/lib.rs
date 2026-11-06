@@ -29,13 +29,15 @@ pub enum StoreError {
     AccountNotFound(String),
     #[error("mailbox not found: {0}")]
     MailboxNotFound(String),
+    #[error("message not found: {0}")]
+    MessageNotFound(i64),
     #[error("invalid setting {key}: {value}")]
     InvalidSetting { key: String, value: String },
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 /// Uploaded blobs not referenced by a message are dropped after one day.
 pub const UPLOAD_TTL_SECONDS: i64 = 24 * 60 * 60;
 /// Trash retention when the user never chose one (three months).
@@ -171,13 +173,27 @@ pub struct MessagePage {
     pub total: i64,
 }
 
-/// One paired Hub device. The token itself is never stored.
+/// One paired Hub device. The token itself is never stored. `account_id` is
+/// the only account the device may read or write; `None` means the device was
+/// paired before accounts were bound and must be paired again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
     pub id: i64,
     pub name: String,
+    pub account_id: Option<i64>,
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailSubmission {
+    pub id: i64,
+    pub email_id: i64,
+    pub identity_id: String,
+    /// JSON `{mailFrom, rcptTo}` exactly as delivered.
+    pub envelope: String,
+    pub send_at: i64,
+    pub undo_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +520,22 @@ impl Store {
         if !has_column(&conn, "messages", "in_reply_to")? {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN in_reply_to TEXT;")?;
         }
+        if !has_column(&conn, "messages", "raw_blob_hash")? {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN raw_blob_hash BLOB;")?;
+        }
+        if !has_column(&conn, "hub_devices", "account_id")? {
+            conn.execute_batch(
+                "ALTER TABLE hub_devices ADD COLUMN account_id INTEGER REFERENCES accounts(id);",
+            )?;
+        }
+        // Devices paired before tokens were account-scoped can only be bound
+        // unambiguously when the store holds exactly one account. Otherwise
+        // they stay unbound and authenticate returns "pair again".
+        conn.execute(
+            "UPDATE hub_devices SET account_id = (SELECT id FROM accounts LIMIT 1)
+              WHERE account_id IS NULL AND (SELECT COUNT(*) FROM accounts) = 1",
+            [],
+        )?;
         // The index needs the column, so it cannot live in SCHEMA: that batch
         // runs before the ALTER on database files created by older versions.
         conn.execute_batch(
@@ -1270,11 +1302,12 @@ impl Store {
 
     /// Registers a paired device. `token_hash` is a hash of the bearer token,
     /// never the token itself.
-    pub fn create_device(&self, name: &str, token_hash: &str) -> Result<i64> {
+    pub fn create_device(&self, name: &str, account_id: i64, token_hash: &str) -> Result<i64> {
         let conn = self.conn.lock().expect("poisoned");
         conn.execute(
-            "INSERT INTO hub_devices (name, token_hash, created_at) VALUES (?1, ?2, ?3)",
-            params![name, token_hash, Utc::now().timestamp()],
+            "INSERT INTO hub_devices (name, account_id, token_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, account_id, token_hash, Utc::now().timestamp()],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -1283,15 +1316,16 @@ impl Store {
         let conn = self.conn.lock().expect("poisoned");
         Ok(conn
             .query_row(
-                "SELECT id, name, created_at, last_seen_at FROM hub_devices
+                "SELECT id, name, account_id, created_at, last_seen_at FROM hub_devices
                  WHERE token_hash = ?1",
                 [token_hash],
                 |row| {
                     Ok(Device {
                         id: row.get(0)?,
                         name: row.get(1)?,
-                        created_at: row.get(2)?,
-                        last_seen_at: row.get(3)?,
+                        account_id: row.get(2)?,
+                        created_at: row.get(3)?,
+                        last_seen_at: row.get(4)?,
                     })
                 },
             )
@@ -1309,14 +1343,16 @@ impl Store {
 
     pub fn list_devices(&self) -> Result<Vec<Device>> {
         let conn = self.conn.lock().expect("poisoned");
-        let mut stmt =
-            conn.prepare("SELECT id, name, created_at, last_seen_at FROM hub_devices ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, account_id, created_at, last_seen_at FROM hub_devices ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(Device {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                created_at: row.get(2)?,
-                last_seen_at: row.get(3)?,
+                account_id: row.get(2)?,
+                created_at: row.get(3)?,
+                last_seen_at: row.get(4)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1327,6 +1363,132 @@ impl Store {
     pub fn revoke_device(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock().expect("poisoned");
         Ok(conn.execute("DELETE FROM hub_devices WHERE id = ?1", [id])? > 0)
+    }
+
+    /// Keeps the raw RFC 5322 bytes a client uploaded for `message_id` so the
+    /// Hub can submit the message later. Re-attaching identical bytes does not
+    /// bump the blob refcount; different bytes release the previous blob.
+    pub fn attach_raw_blob(&self, account_id: i64, message_id: i64, raw: &[u8]) -> Result<()> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM messages WHERE id = ?1 AND account_id = ?2",
+                params![message_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::MessageNotFound(message_id));
+        }
+        let hash = hash_bytes(raw);
+        let previous: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT raw_blob_hash FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if previous.as_deref() == Some(hash.as_slice()) {
+            return Ok(());
+        }
+        store_blob(&tx, &hash, raw)?;
+        tx.execute(
+            "UPDATE messages SET raw_blob_hash = ?2 WHERE id = ?1",
+            params![message_id, &hash],
+        )?;
+        if let Some(previous) = previous {
+            release_blob(&tx, &previous)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Raw bytes kept for a message the client uploaded, if any. Messages that
+    /// arrived through sync have no raw copy.
+    pub fn raw_blob(&self, account_id: i64, message_id: i64) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT b.data FROM messages m JOIN blobs b ON b.hash = m.raw_blob_hash
+                  WHERE m.id = ?1 AND m.account_id = ?2",
+                params![message_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records an accepted submission. The envelope is stored as JSON so
+    /// `EmailSubmission/get` can echo exactly what was delivered.
+    pub fn create_submission(
+        &self,
+        account_id: i64,
+        email_id: i64,
+        identity_id: &str,
+        envelope: &str,
+        send_at: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().expect("poisoned");
+        conn.execute(
+            "INSERT INTO email_submissions
+                 (account_id, email_id, identity_id, envelope, send_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                account_id,
+                email_id,
+                identity_id,
+                envelope,
+                send_at,
+                Utc::now().timestamp()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Submissions of one account, newest first. An empty `ids` lists the most
+    /// recent `limit` rows; otherwise only the requested ids are returned.
+    pub fn submissions(
+        &self,
+        account_id: i64,
+        ids: &[i64],
+        limit: i64,
+    ) -> Result<Vec<EmailSubmission>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut out = Vec::new();
+        let map = |row: &rusqlite::Row<'_>| {
+            Ok(EmailSubmission {
+                id: row.get(0)?,
+                email_id: row.get(1)?,
+                identity_id: row.get(2)?,
+                envelope: row.get(3)?,
+                send_at: row.get(4)?,
+                undo_status: row.get(5)?,
+            })
+        };
+        if ids.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT id, email_id, identity_id, envelope, send_at, undo_status
+                   FROM email_submissions WHERE account_id = ?1
+                  ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![account_id, limit], |row| map(row))?;
+            out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+            return Ok(out);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, email_id, identity_id, envelope, send_at, undo_status
+               FROM email_submissions WHERE account_id = ?1 AND id = ?2",
+        )?;
+        for id in ids {
+            if let Some(row) = stmt
+                .query_row(params![account_id, id], |row| map(row))
+                .optional()?
+            {
+                out.push(row);
+            }
+        }
+        Ok(out)
     }
 
     /// Messages whose only copies live in mailboxes the server no longer
@@ -2942,6 +3104,9 @@ fn purge_orphan_messages(tx: &Transaction<'_>) -> Result<usize> {
              UNION ALL
              SELECT blob_hash FROM attachments
               WHERE message_id IN ({orphans}) AND blob_hash IS NOT NULL
+             UNION ALL
+             SELECT raw_blob_hash FROM messages
+              WHERE id IN ({orphans}) AND raw_blob_hash IS NOT NULL
          ) GROUP BY blob_hash"
     );
     let blobs: Vec<(Vec<u8>, i64)> = {
@@ -3173,7 +3338,8 @@ CREATE TABLE IF NOT EXISTS messages (
   snippet     TEXT,
   has_attach  INTEGER NOT NULL DEFAULT 0,
   body_state  TEXT NOT NULL DEFAULT 'headers',
-  body_text   TEXT
+  body_text   TEXT,
+  raw_blob_hash BLOB
 );
 CREATE UNIQUE INDEX IF NOT EXISTS messages_account_message_id
   ON messages (account_id, message_id) WHERE message_id IS NOT NULL;
@@ -3206,13 +3372,28 @@ CREATE TABLE IF NOT EXISTS change_snapshots (
 );
 
 -- Paired devices of the optional Hub. Only a hash of the bearer token is
--- stored, so a database leak does not hand out API access.
+-- stored, so a database leak does not hand out API access. A device may only
+-- touch the account it was paired for.
 CREATE TABLE IF NOT EXISTS hub_devices (
   id           INTEGER PRIMARY KEY,
   name         TEXT NOT NULL,
+  account_id   INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
   token_hash   TEXT NOT NULL UNIQUE,
   created_at   INTEGER NOT NULL,
   last_seen_at INTEGER
+);
+
+-- Submissions accepted by the Hub. The body is not copied: each row points at
+-- the message whose raw bytes were delivered.
+CREATE TABLE IF NOT EXISTS email_submissions (
+  id          INTEGER PRIMARY KEY,
+  account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  email_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  identity_id TEXT NOT NULL,
+  envelope    TEXT NOT NULL,
+  send_at     INTEGER NOT NULL,
+  undo_status TEXT NOT NULL DEFAULT 'final',
+  created_at  INTEGER NOT NULL
 );
 
 -- Content-addressed bodies and attachments; refcount keeps one copy per hash.
@@ -3508,6 +3689,110 @@ mod migration_tests {
                 .len(),
             1
         );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// v9 adds the device binding, the raw-message column and the submission
+    /// table. A lone account lets an existing device keep working.
+    #[test]
+    fn device_binding_upgrades_when_one_account_exists() {
+        let path = temp_path("migrate-v9-single");
+        let key = DbKey::from_bytes(&[6u8; 32]).expect("key");
+        let account = {
+            let store = Store::open(&path, &key).expect("store");
+            let account = store
+                .create_account(
+                    "imap",
+                    "v8@example.com",
+                    None,
+                    "secret",
+                    &serde_json::json!({}),
+                )
+                .expect("account");
+            store
+                .create_device("phone", account, "legacy-hash")
+                .expect("device");
+            {
+                let conn = store.conn.lock().expect("poisoned");
+                conn.execute_batch(
+                    "ALTER TABLE messages DROP COLUMN raw_blob_hash;
+                     ALTER TABLE hub_devices DROP COLUMN account_id;
+                     DROP TABLE email_submissions;
+                     PRAGMA user_version = 8;",
+                )
+                .expect("downgrade");
+            }
+            account
+        };
+
+        let store = Store::open(&path, &key).expect("reopen");
+        let version: i64 = {
+            let conn = store.conn.lock().expect("poisoned");
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version")
+        };
+        assert_eq!(version, SCHEMA_VERSION);
+        let device = store
+            .device_by_token_hash("legacy-hash")
+            .expect("lookup")
+            .expect("device");
+        assert_eq!(device.account_id, Some(account));
+        assert!(store
+            .submissions(account, &[], 10)
+            .expect("submissions")
+            .is_empty());
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With several accounts a legacy device cannot be attributed; it stays
+    /// unbound and the Hub refuses it until it pairs again.
+    #[test]
+    fn device_binding_stays_unbound_with_several_accounts() {
+        let path = temp_path("migrate-v9-multi");
+        let key = DbKey::from_bytes(&[5u8; 32]).expect("key");
+        {
+            let store = Store::open(&path, &key).expect("store");
+            let first = store
+                .create_account(
+                    "imap",
+                    "one@example.com",
+                    None,
+                    "secret",
+                    &serde_json::json!({}),
+                )
+                .expect("account");
+            store
+                .create_account(
+                    "imap",
+                    "two@example.com",
+                    None,
+                    "secret",
+                    &serde_json::json!({}),
+                )
+                .expect("account");
+            store
+                .create_device("phone", first, "legacy-hash")
+                .expect("device");
+            {
+                let conn = store.conn.lock().expect("poisoned");
+                conn.execute_batch(
+                    "ALTER TABLE hub_devices DROP COLUMN account_id;
+                     PRAGMA user_version = 8;",
+                )
+                .expect("downgrade");
+            }
+        }
+
+        let store = Store::open(&path, &key).expect("reopen");
+        let device = store
+            .device_by_token_hash("legacy-hash")
+            .expect("lookup")
+            .expect("device");
+        assert_eq!(device.account_id, None);
 
         drop(store);
         let _ = std::fs::remove_file(path);

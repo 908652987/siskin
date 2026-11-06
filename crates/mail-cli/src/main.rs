@@ -711,9 +711,12 @@ async fn run() -> Result<(), String> {
             }
             for device in devices {
                 println!(
-                    "id={} name={} created_at={} last_seen_at={}",
+                    "id={} name={} account={} created_at={} last_seen_at={}",
                     device.id,
                     device.name,
+                    device
+                        .account_id
+                        .map_or_else(|| "-".to_string(), |id| id.to_string()),
                     device.created_at,
                     device
                         .last_seen_at

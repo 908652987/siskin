@@ -1524,12 +1524,50 @@ impl Core {
     pub async fn send(&self, email: &str, message: &OutgoingMessage) -> Result<SendOutcome> {
         let account = self.account(email)?;
         let settings = settings_of(&account)?;
+        let password = self.password(&account)?;
+        let composed = compose::compose(&account.email, message)?;
+        self.deliver(
+            &account,
+            &settings,
+            password,
+            &composed.envelope,
+            &composed.bytes,
+        )
+        .await
+    }
+
+    /// Delivers already composed RFC 5322 bytes with an explicit SMTP envelope.
+    /// The caller supplies the envelope because `Bcc` recipients only exist
+    /// there. Used by the Hub's `EmailSubmission` path, which must not recompose
+    /// what the client uploaded.
+    pub async fn send_raw(
+        &self,
+        email: &str,
+        envelope: &[String],
+        raw: &[u8],
+    ) -> Result<SendOutcome> {
+        if envelope.is_empty() {
+            return Err(CoreError::Compose(ComposeError::NoRecipients));
+        }
+        let account = self.account(email)?;
+        let settings = settings_of(&account)?;
+        let password = self.password(&account)?;
+        self.deliver(&account, &settings, password, envelope, raw)
+            .await
+    }
+
+    async fn deliver(
+        &self,
+        account: &Account,
+        settings: &ServerSettings,
+        password: String,
+        envelope: &[String],
+        raw: &[u8],
+    ) -> Result<SendOutcome> {
         let smtp = settings
             .smtp
             .as_ref()
             .ok_or_else(|| CoreError::Settings("no SMTP settings for this account".into()))?;
-        let password = self.password(&account)?;
-        let composed = compose::compose(&account.email, message)?;
 
         let mut session = SmtpSession::connect(&SmtpConfig {
             host: smtp.host.clone(),
@@ -1543,9 +1581,7 @@ impl Core {
             password: Some(password),
         })
         .await?;
-        session
-            .send(&account.email, &composed.envelope, &composed.bytes)
-            .await?;
+        session.send(&account.email, envelope, raw).await?;
         session.quit().await;
 
         let mut saved_to = None;
@@ -1555,9 +1591,9 @@ impl Core {
                 .sent_mailbox
                 .clone()
                 .unwrap_or_else(|| "Sent".to_string());
-            match self.connect_imap(&account).await {
+            match self.connect_imap(account).await {
                 Ok(mut imap) => {
-                    match imap.append(&mailbox, Some("\\Seen"), &composed.bytes).await {
+                    match imap.append(&mailbox, Some("\\Seen"), raw).await {
                         Ok(()) => saved_to = Some(mailbox),
                         Err(err) => save_error = Some(err.to_string()),
                     }
@@ -1568,7 +1604,7 @@ impl Core {
         }
 
         Ok(SendOutcome {
-            recipients: composed.envelope.len(),
+            recipients: envelope.len(),
             saved_to,
             save_error,
         })

@@ -2,11 +2,13 @@
 //!
 //! Transport-agnostic: the Hub owns HTTP, authentication and network access.
 //! Implemented methods are `Mailbox/get`, `Mailbox/changes`, `Email/query`,
-//! `Email/get`, `Email/changes`, `Email/set`, `Email/import` and `Thread/get`;
+//! `Email/get`, `Email/changes`, `Email/set`, `Email/import`,
+//! `Thread/get|changes`, `Identity/get` and `EmailSubmission/get|set`;
 //! everything else returns a JMAP `unknownMethod` error. Bodies are read from
 //! the store and fetched through [`BodySource`]; writes go through
-//! [`WriteSink`] so this crate keeps the `mail-api -> mail-store` dependency
-//! edge.
+//! [`WriteSink`] and [`SubmissionSink`] so this crate keeps the
+//! `mail-api -> mail-store` dependency edge. Requests scoped to one Hub device
+//! use [`Jmap::handle_for_account`], which refuses calls naming another account.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -15,14 +17,15 @@ use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use mail_store::{
-    MessageBody, MessageLocationInfo, MessageQuery, MessageWithLocations, Store, StoredAttachment,
-    StoredPart,
+    Account, EmailSubmission, MessageBody, MessageLocationInfo, MessageQuery, MessageWithLocations,
+    Store, StoredAttachment, StoredPart,
 };
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 pub const CORE_CAPABILITY: &str = "urn:ietf:params:jmap:core";
 pub const MAIL_CAPABILITY: &str = "urn:ietf:params:jmap:mail";
+pub const SUBMISSION_CAPABILITY: &str = "urn:ietf:params:jmap:submission";
 
 /// Upper bounds advertised in the Session object and enforced here.
 pub const MAX_CALLS_IN_REQUEST: usize = 32;
@@ -156,7 +159,7 @@ pub trait WriteSink: Send + Sync {
         &'a self,
         account_id: i64,
         mailbox_id: i64,
-        raw: Vec<u8>,
+        raw: &'a [u8],
         keywords: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>>;
 
@@ -169,10 +172,40 @@ pub trait WriteSink: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>>;
 }
 
+/// SMTP envelope of one submission (RFC 8621 §7.1). `Bcc` recipients exist
+/// only here, never in the message header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionEnvelope {
+    pub mail_from: String,
+    pub rcpt_to: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionOutcome {
+    /// The envelope actually used; the server derives one when the client
+    /// omitted it.
+    pub envelope: SubmissionEnvelope,
+    pub recipients: usize,
+    pub saved_to: Option<String>,
+    pub save_error: Option<String>,
+}
+
+/// Delivers a message the client stored in the account. Implemented by the Hub
+/// with `mail-core`; the trait keeps SMTP out of this crate.
+pub trait SubmissionSink: Send + Sync {
+    fn submit<'a>(
+        &'a self,
+        account_id: i64,
+        raw: Vec<u8>,
+        envelope: Option<SubmissionEnvelope>,
+    ) -> Pin<Box<dyn Future<Output = Result<SubmissionOutcome, WriteError>> + Send + 'a>>;
+}
+
 pub struct Jmap {
     store: Arc<Store>,
     bodies: Option<Arc<dyn BodySource>>,
     writes: Option<Arc<dyn WriteSink>>,
+    submissions: Option<Arc<dyn SubmissionSink>>,
 }
 
 impl Jmap {
@@ -181,6 +214,7 @@ impl Jmap {
             store,
             bodies: None,
             writes: None,
+            submissions: None,
         }
     }
 
@@ -194,12 +228,30 @@ impl Jmap {
         self
     }
 
+    pub fn with_submissions(mut self, submissions: Arc<dyn SubmissionSink>) -> Self {
+        self.submissions = Some(submissions);
+        self
+    }
+
     /// Session object served from `/.well-known/jmap`. Every local account is
     /// listed; the first one is primary.
     pub fn session(&self) -> Result<Value, mail_store::StoreError> {
         let accounts = self.store.list_accounts()?;
+        self.session_for_accounts(&accounts)
+    }
+
+    /// Session limited to the account a paired device may use. The Hub must
+    /// never advertise accounts the token cannot reach.
+    pub fn session_for(&self, account_id: i64) -> Result<Option<Value>, mail_store::StoreError> {
+        match self.store.account_by_id(account_id)? {
+            Some(account) => Ok(Some(self.session_for_accounts(&[account])?)),
+            None => Ok(None),
+        }
+    }
+
+    fn session_for_accounts(&self, accounts: &[Account]) -> Result<Value, mail_store::StoreError> {
         let mut account_objects = Map::new();
-        for account in &accounts {
+        for account in accounts {
             let id = account.id.to_string();
             account_objects.insert(
                 id,
@@ -211,6 +263,7 @@ impl Jmap {
                     "accountCapabilities": {
                         CORE_CAPABILITY: {},
                         MAIL_CAPABILITY: {},
+                        SUBMISSION_CAPABILITY: {},
                     },
                 }),
             );
@@ -220,6 +273,7 @@ impl Jmap {
         if let Some(primary) = &primary {
             primary_accounts.insert(CORE_CAPABILITY.to_string(), json!(primary));
             primary_accounts.insert(MAIL_CAPABILITY.to_string(), json!(primary));
+            primary_accounts.insert(SUBMISSION_CAPABILITY.to_string(), json!(primary));
         }
         Ok(json!({
             "capabilities": {
@@ -234,6 +288,10 @@ impl Jmap {
                     "collationAlgorithms": ["i;ascii-casemap"],
                 },
                 MAIL_CAPABILITY: {},
+                SUBMISSION_CAPABILITY: {
+                    "maxDelayedSend": 0,
+                    "submissionExtensions": {},
+                },
             },
             "accounts": account_objects,
             "primaryAccounts": primary_accounts,
@@ -253,12 +311,34 @@ impl Jmap {
     /// as `error` entries; only malformed requests or unknown capabilities
     /// fail the whole call.
     pub async fn handle(&self, request: Value) -> Result<Value, RequestError> {
+        self.handle_inner(request, None).await
+    }
+
+    /// Executes a request on behalf of a device bound to one account. Every
+    /// method call must name that account; a call naming another account fails
+    /// with `accountNotFound` and never touches the store.
+    pub async fn handle_for_account(
+        &self,
+        request: Value,
+        account_id: i64,
+    ) -> Result<Value, RequestError> {
+        self.handle_inner(request, Some(account_id)).await
+    }
+
+    async fn handle_inner(
+        &self,
+        request: Value,
+        bound: Option<i64>,
+    ) -> Result<Value, RequestError> {
         let object = request.as_object().ok_or(RequestError::NotRequest)?;
         if let Some(using) = object.get("using") {
             let using = using.as_array().ok_or(RequestError::NotRequest)?;
             for capability in using {
                 let capability = capability.as_str().ok_or(RequestError::NotRequest)?;
-                if capability != CORE_CAPABILITY && capability != MAIL_CAPABILITY {
+                if capability != CORE_CAPABILITY
+                    && capability != MAIL_CAPABILITY
+                    && capability != SUBMISSION_CAPABILITY
+                {
                     return Err(RequestError::UnknownCapability(capability.to_string()));
                 }
             }
@@ -270,6 +350,7 @@ impl Jmap {
         if calls.len() > MAX_CALLS_IN_REQUEST {
             return Err(RequestError::TooManyCalls);
         }
+        let bound_name = bound.map(|id| id.to_string());
 
         let mut responses = Vec::with_capacity(calls.len());
         for call in calls {
@@ -280,8 +361,29 @@ impl Jmap {
             let name = parts[0].as_str().ok_or(RequestError::NotRequest)?;
             let args = parts[1].as_object().ok_or(RequestError::NotRequest)?;
             let call_id = parts[2].as_str().ok_or(RequestError::NotRequest)?;
+            if let Some(bound_name) = &bound_name {
+                let requested = args.get("accountId").and_then(Value::as_str);
+                if requested != Some(bound_name.as_str()) {
+                    responses.push(json!([
+                        "error",
+                        {
+                            "type": "accountNotFound",
+                            "description": "the device is not authorized for this account",
+                        },
+                        call_id
+                    ]));
+                    continue;
+                }
+            }
             match self.dispatch(name, args).await {
-                Ok(value) => responses.push(json!([name, value, call_id])),
+                Ok(items) => {
+                    // A method may produce a follow-up response (the implicit
+                    // `Email/set` of `EmailSubmission/set`); both keep the same
+                    // method call id, as RFC 8621 §7.5 requires.
+                    for (method, value) in items {
+                        responses.push(json!([method, value, call_id]));
+                    }
+                }
                 Err(err) => responses.push(json!([
                     "error",
                     {
@@ -303,17 +405,27 @@ impl Jmap {
         Ok(format!("s{}", self.store.list_accounts()?.len()))
     }
 
-    async fn dispatch(&self, name: &str, args: &Map<String, Value>) -> Result<Value, ApiError> {
+    async fn dispatch(
+        &self,
+        name: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Vec<(&'static str, Value)>, ApiError> {
+        let single = |value: Value, method: &'static str| Ok(vec![(method, value)]);
         match name {
-            "Mailbox/get" => self.mailbox_get(args),
-            "Mailbox/changes" => self.changes(args, "mailbox"),
-            "Email/query" => self.email_query(args),
-            "Email/get" => self.email_get(args).await,
-            "Email/changes" => self.changes(args, "message"),
-            "Email/set" => self.email_set(args).await,
-            "Email/import" => self.email_import(args).await,
-            "Thread/get" => self.thread_get(args),
-            "Thread/changes" => self.changes(args, "thread"),
+            "Mailbox/get" => single(self.mailbox_get(args)?, "Mailbox/get"),
+            "Mailbox/changes" => single(self.changes(args, "mailbox")?, "Mailbox/changes"),
+            "Email/query" => single(self.email_query(args)?, "Email/query"),
+            "Email/get" => single(self.email_get(args).await?, "Email/get"),
+            "Email/changes" => single(self.changes(args, "message")?, "Email/changes"),
+            "Email/set" => single(self.email_set(args).await?, "Email/set"),
+            "Email/import" => single(self.email_import(args).await?, "Email/import"),
+            "Thread/get" => single(self.thread_get(args)?, "Thread/get"),
+            "Thread/changes" => single(self.changes(args, "thread")?, "Thread/changes"),
+            "Identity/get" => single(self.identity_get(args)?, "Identity/get"),
+            "EmailSubmission/get" => {
+                single(self.email_submission_get(args)?, "EmailSubmission/get")
+            }
+            "EmailSubmission/set" => self.email_submission_set(args).await,
             other => Err(ApiError::UnknownMethod(other.to_string())),
         }
     }
@@ -766,9 +878,14 @@ impl Jmap {
         let keywords =
             import_keywords(object.get("keywords")).map_err(|err| write_error_object(&err))?;
         let message_id = sink
-            .import_message(account_id, mailbox_id, upload.bytes, keywords)
+            .import_message(account_id, mailbox_id, &upload.bytes, keywords)
             .await
             .map_err(|err| write_error_object(&err))?;
+        // Keep the bytes the client uploaded so EmailSubmission can deliver
+        // them later. Synced messages have no raw copy.
+        self.store
+            .attach_raw_blob(account_id, message_id, &upload.bytes)
+            .map_err(|err| json!({"type": "serverFail", "description": err.to_string()}))?;
         Ok(ImportedEmail {
             message_id,
             blob_id,
@@ -858,6 +975,356 @@ impl Jmap {
         }))
     }
 
+    /// `Identity/get`. The Hub exposes one sending identity per account: the
+    /// account's own address.
+    fn identity_get(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or_else(|| ApiError::UnknownAccount(account_id.to_string()))?;
+        let identity = identity_id(account_id);
+        let mut not_found = Vec::new();
+        if let Some(ids) = args.get("ids") {
+            let ids = ids.as_array().ok_or(ApiError::InvalidArguments)?;
+            let mut requested = Vec::with_capacity(ids.len());
+            for id in ids {
+                requested.push(id.as_str().ok_or(ApiError::InvalidArguments)?.to_string());
+            }
+            if !requested.iter().any(|id| id == &identity) {
+                not_found = requested;
+                return Ok(json!({
+                    "accountId": account_id.to_string(),
+                    "state": identity,
+                    "list": [],
+                    "notFound": not_found,
+                }));
+            }
+        }
+        let object = json!({
+            "id": identity,
+            "name": account.display_name.clone().unwrap_or_else(|| account.email.clone()),
+            "email": account.email,
+            "replyTo": Value::Null,
+            "bcc": Value::Null,
+            "textSignature": "",
+            "htmlSignature": "",
+            "mayDelete": false,
+        });
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "state": identity,
+            "list": [object],
+            "notFound": not_found,
+        }))
+    }
+
+    /// `EmailSubmission/get`. Submissions are recorded when accepted; there is
+    /// no change log for them yet.
+    fn email_submission_get(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let ids: Vec<i64> = match args.get("ids") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => {
+                let values = value.as_array().ok_or(ApiError::InvalidArguments)?;
+                if values.len() > MAX_OBJECTS_IN_GET {
+                    return Err(ApiError::InvalidArguments);
+                }
+                let mut out = Vec::with_capacity(values.len());
+                for value in values {
+                    out.push(
+                        value
+                            .as_str()
+                            .ok_or(ApiError::InvalidArguments)?
+                            .parse()
+                            .map_err(|_| ApiError::InvalidArguments)?,
+                    );
+                }
+                out
+            }
+        };
+        let rows = self
+            .store
+            .submissions(account_id, &ids, MAX_OBJECTS_IN_GET as i64)?;
+        let mut found = HashSet::new();
+        let mut list = Vec::with_capacity(rows.len());
+        for row in &rows {
+            found.insert(row.id);
+            list.push(self.submission_object(account_id, row)?);
+        }
+        let not_found: Vec<String> = ids
+            .iter()
+            .filter(|id| !found.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "state": self.submission_state(account_id)?,
+            "list": list,
+            "notFound": not_found,
+        }))
+    }
+
+    /// `EmailSubmission/set` (RFC 8621 §7.5), create only. Sending is
+    /// synchronous: `undoStatus` is `final` and `sendAt` in the future is
+    /// rejected because delayed send is not offered (`maxDelayedSend` is 0).
+    /// `onSuccessUpdateEmail` becomes the implicit `Email/set` response.
+    async fn email_submission_set(
+        &self,
+        args: &Map<String, Value>,
+    ) -> Result<Vec<(&'static str, Value)>, ApiError> {
+        let account_id = self.account_id(args)?;
+        let old_state = self.submission_state(account_id)?;
+        let create = optional_object(args, "create")?;
+        let update = optional_object(args, "update")?;
+        let destroy = optional_array(args, "destroy")?;
+        let total =
+            create.map_or(0, Map::len) + update.map_or(0, Map::len) + destroy.map_or(0, Vec::len);
+        if total > MAX_OBJECTS_IN_SET {
+            return Err(ApiError::InvalidArguments);
+        }
+
+        let mut created = Map::new();
+        let mut not_created = Map::new();
+        let mut not_updated = Map::new();
+        let mut not_destroyed = Map::new();
+        for (key, _) in update.into_iter().flatten() {
+            not_updated.insert(
+                key.clone(),
+                json!({"type": "notSupported", "description": "updating a submission is not supported"}),
+            );
+        }
+        for key in destroy.into_iter().flatten() {
+            let id = key.as_str().ok_or(ApiError::InvalidArguments)?;
+            not_destroyed.insert(
+                id.to_string(),
+                json!({"type": "notSupported", "description": "destroying a submission is not supported"}),
+            );
+        }
+
+        // creation id -> email id, used by `onSuccessUpdateEmail`.
+        let mut submission_emails: HashMap<String, i64> = HashMap::new();
+        if let Some(create) = create {
+            let sink = match self.submissions.as_ref() {
+                Some(sink) => sink,
+                None => {
+                    for creation_id in create.keys() {
+                        not_created.insert(
+                            creation_id.clone(),
+                            json!({"type": "notSupported", "description": "submitting is disabled"}),
+                        );
+                    }
+                    return Ok(vec![(
+                        "EmailSubmission/set",
+                        submission_set_response(
+                            account_id,
+                            &old_state,
+                            &self.submission_state(account_id)?,
+                            created,
+                            not_created,
+                            not_updated,
+                            not_destroyed,
+                        ),
+                    )]);
+                }
+            };
+            let mut order: Vec<&String> = create.keys().collect();
+            order.sort();
+            for creation_id in order {
+                let Some(object) = create[creation_id.as_str()].as_object() else {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({"type": "invalidProperties", "description": "a creation must be an object"}),
+                    );
+                    continue;
+                };
+                match self.submit_one(account_id, sink, creation_id, object).await {
+                    Ok((value, email_id)) => {
+                        submission_emails.insert(creation_id.clone(), email_id);
+                        created.insert(creation_id.clone(), value);
+                    }
+                    Err(err) => {
+                        not_created.insert(creation_id.clone(), err);
+                    }
+                }
+            }
+        }
+
+        let new_state = self.submission_state(account_id)?;
+        let mut responses = vec![(
+            "EmailSubmission/set",
+            submission_set_response(
+                account_id,
+                &old_state,
+                &new_state,
+                created,
+                not_created,
+                not_updated,
+                not_destroyed,
+            ),
+        )];
+
+        // The implicit Email/set must come after the submission response and
+        // share its method call id.
+        if let Some(patches) = args.get("onSuccessUpdateEmail") {
+            if !patches.is_null() {
+                let patches = patches.as_object().ok_or(ApiError::InvalidArguments)?;
+                let mut update = Map::new();
+                for (key, patch) in patches {
+                    let email_id = match key.strip_prefix('#') {
+                        Some(creation_id) => submission_emails.get(creation_id).copied(),
+                        None => None,
+                    };
+                    let email_id = match email_id {
+                        Some(id) => Some(id),
+                        None => key.parse::<i64>().ok().and_then(|submission_id| {
+                            self.store
+                                .submissions(account_id, &[submission_id], 1)
+                                .ok()
+                                .and_then(|rows| rows.first().map(|row| row.email_id))
+                        }),
+                    };
+                    if let Some(email_id) = email_id {
+                        update.insert(email_id.to_string(), patch.clone());
+                    }
+                }
+                if !update.is_empty() {
+                    let mut set_args = Map::new();
+                    set_args.insert("accountId".into(), json!(account_id.to_string()));
+                    set_args.insert("update".into(), Value::Object(update));
+                    let value = self.email_set(&set_args).await?;
+                    responses.push(("Email/set", value));
+                }
+            }
+        }
+
+        Ok(responses)
+    }
+
+    async fn submit_one(
+        &self,
+        account_id: i64,
+        sink: &Arc<dyn SubmissionSink>,
+        _creation_id: &str,
+        object: &Map<String, Value>,
+    ) -> Result<(Value, i64), Value> {
+        let email_id = match object.get("emailId").and_then(Value::as_str) {
+            Some(raw) => raw
+                .parse::<i64>()
+                .map_err(|_| json!({"type": "invalidProperties", "description": "emailId must be an email id"}))?,
+            None => {
+                return Err(
+                    json!({"type": "invalidProperties", "description": "emailId is required"}),
+                )
+            }
+        };
+        if self
+            .store
+            .messages_with_locations(account_id, &[email_id])
+            .map_err(|err| json!({"type": "serverFail", "description": err.to_string()}))?
+            .is_empty()
+        {
+            return Err(
+                json!({"type": "invalidProperties", "description": "emailId is not in this account"}),
+            );
+        }
+        let expected_identity = identity_id(account_id);
+        if object.get("identityId").and_then(Value::as_str) != Some(expected_identity.as_str()) {
+            return Err(json!({
+                "type": "invalidProperties",
+                "description": "unknown identityId",
+                "properties": ["identityId"],
+            }));
+        }
+        if let Some(send_at) = object.get("sendAt") {
+            if !send_at.is_null() {
+                return Err(json!({
+                    "type": "invalidProperties",
+                    "description": "delayed send is not supported",
+                    "properties": ["sendAt"],
+                }));
+            }
+        }
+        let envelope = match object.get("envelope") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(parse_envelope(value)?),
+        };
+        let raw = match self.store.raw_blob(account_id, email_id) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                return Err(json!({
+                    "type": "invalidEmail",
+                    "description": "this message has no stored raw copy to send",
+                }))
+            }
+            Err(err) => return Err(json!({"type": "serverFail", "description": err.to_string()})),
+        };
+        let outcome = sink
+            .submit(account_id, raw, envelope)
+            .await
+            .map_err(|err| write_error_object(&err))?;
+        let send_at = Utc::now().timestamp();
+        let envelope_json = envelope_json(&outcome.envelope);
+        let submission_id = self
+            .store
+            .create_submission(
+                account_id,
+                email_id,
+                &expected_identity,
+                &envelope_json.to_string(),
+                send_at,
+            )
+            .map_err(|err| json!({"type": "serverFail", "description": err.to_string()}))?;
+        let row = EmailSubmission {
+            id: submission_id,
+            email_id,
+            identity_id: expected_identity,
+            envelope: envelope_json.to_string(),
+            send_at,
+            undo_status: "final".to_string(),
+        };
+        let mut value = self
+            .submission_object(account_id, &row)
+            .map_err(|err| json!({"type": "serverFail", "description": err.to_string()}))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("savedTo".into(), json!(outcome.saved_to));
+            object.insert("saveError".into(), json!(outcome.save_error));
+        }
+        Ok((value, email_id))
+    }
+
+    fn submission_object(&self, account_id: i64, row: &EmailSubmission) -> Result<Value, ApiError> {
+        let envelope: Value = serde_json::from_str(&row.envelope).unwrap_or(Value::Null);
+        let mut delivery = Map::new();
+        if let Some(recipients) = envelope.get("rcptTo").and_then(Value::as_array) {
+            for recipient in recipients {
+                if let Some(email) = recipient.get("email").and_then(Value::as_str) {
+                    delivery.insert(email.to_string(), json!({"delivered": "yes"}));
+                }
+            }
+        }
+        Ok(json!({
+            "id": row.id.to_string(),
+            "identityId": row.identity_id,
+            "emailId": row.email_id.to_string(),
+            "threadId": self.thread_id_of(account_id, row.email_id)?,
+            "envelope": envelope,
+            "sendAt": utc_date(Some(row.send_at)),
+            "undoStatus": row.undo_status,
+            "deliveryStatus": Value::Object(delivery),
+        }))
+    }
+
+    fn submission_state(&self, account_id: i64) -> Result<String, ApiError> {
+        let newest = self
+            .store
+            .submissions(account_id, &[], 1)?
+            .first()
+            .map(|row| row.id)
+            .unwrap_or(0);
+        Ok(format!("e{newest}"))
+    }
+
     /// `Thread/get` over the threads the store assigned while syncing.
     fn thread_get(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
         let account_id = self.account_id(args)?;
@@ -941,6 +1408,9 @@ impl Jmap {
         let mut add = Vec::new();
         let mut remove = Vec::new();
         let mut destination = None;
+        // `mailboxIds/<id>: null` entries. A single removal paired with one
+        // addition is JMAP's move; the IMAP backend satisfies it with MOVE.
+        let mut remove_mailboxes = Vec::new();
         for (key, value) in patch {
             match key.as_str() {
                 "keywords" => match value {
@@ -998,11 +1468,45 @@ impl Jmap {
                         }
                     }
                 }
+                other if other.starts_with("mailboxIds/") => {
+                    let raw = &other["mailboxIds/".len()..];
+                    let mailbox_id: i64 = raw
+                        .parse()
+                        .map_err(|_| WriteError::NotSupported(format!("bad mailbox id {raw}")))?;
+                    match value {
+                        Value::Bool(true) => destination = Some(mailbox_id),
+                        Value::Bool(false) | Value::Null => remove_mailboxes.push(mailbox_id),
+                        _ => {
+                            return Err(WriteError::NotSupported(format!(
+                                "{other} must be a boolean"
+                            )))
+                        }
+                    }
+                }
                 other => {
                     return Err(WriteError::NotSupported(format!(
                         "property {other} is not writable"
                     )))
                 }
+            }
+        }
+
+        if !remove_mailboxes.is_empty() {
+            let Some(target) = destination else {
+                return Err(WriteError::NotSupported(
+                    "removing a mailbox copy without a destination is not supported; move the message instead"
+                        .to_string(),
+                ));
+            };
+            if remove_mailboxes.len() > 1 {
+                return Err(WriteError::NotSupported(
+                    "a move can remove the message from one mailbox only".to_string(),
+                ));
+            }
+            if remove_mailboxes.contains(&target) {
+                return Err(WriteError::NotSupported(
+                    "the patch both moves to and removes from the same mailbox".to_string(),
+                ));
             }
         }
 
@@ -1275,6 +1779,117 @@ fn write_error_object(err: &WriteError) -> Value {
         WriteError::Server(detail) => {
             json!({"type": "serverFail", "description": detail})
         }
+    }
+}
+
+/// Identity id of the single sending identity the Hub exposes per account.
+fn identity_id(account_id: i64) -> String {
+    format!("i{account_id}")
+}
+
+fn submission_set_response(
+    account_id: i64,
+    old_state: &str,
+    new_state: &str,
+    created: Map<String, Value>,
+    not_created: Map<String, Value>,
+    not_updated: Map<String, Value>,
+    not_destroyed: Map<String, Value>,
+) -> Value {
+    json!({
+        "accountId": account_id.to_string(),
+        "oldState": old_state,
+        "newState": new_state,
+        "created": created,
+        "notCreated": not_created,
+        "updated": {},
+        "notUpdated": not_updated,
+        "destroyed": [],
+        "notDestroyed": not_destroyed,
+    })
+}
+
+/// The RFC 8621 §7.1 envelope object, as echoed in responses.
+fn envelope_json(envelope: &SubmissionEnvelope) -> Value {
+    json!({
+        "mailFrom": { "email": envelope.mail_from, "parameters": Value::Null },
+        "rcptTo": envelope
+            .rcpt_to
+            .iter()
+            .map(|email| json!({ "email": email, "parameters": Value::Null }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn set_error(kind: &str, detail: &str) -> Value {
+    json!({ "type": kind, "description": detail })
+}
+
+/// Parses a client-supplied envelope. The server derives one from the message
+/// when the client omits it; this only runs for explicit envelopes.
+fn parse_envelope(value: &Value) -> Result<SubmissionEnvelope, Value> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| set_error("invalidProperties", "envelope must be an object"))?;
+    let mail_from = object
+        .get("mailFrom")
+        .and_then(|value| value.get("email"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| set_error("invalidProperties", "envelope.mailFrom.email is required"))?;
+    if !valid_address(mail_from) {
+        return Err(json!({
+            "type": "invalidRecipients",
+            "description": "envelope.mailFrom is not a valid address",
+            "invalidRecipients": [mail_from],
+        }));
+    }
+    let recipients = object
+        .get("rcptTo")
+        .and_then(Value::as_array)
+        .ok_or_else(|| set_error("invalidProperties", "envelope.rcptTo must be an array"))?;
+    if recipients.is_empty() {
+        return Err(set_error("noRecipients", "envelope has no recipients"));
+    }
+    let mut rcpt_to = Vec::with_capacity(recipients.len());
+    let mut invalid = Vec::new();
+    for recipient in recipients {
+        let email = recipient
+            .get("email")
+            .and_then(Value::as_str)
+            .ok_or_else(|| set_error("invalidProperties", "each rcptTo needs an email"))?;
+        if valid_address(email) {
+            rcpt_to.push(email.to_string());
+        } else {
+            invalid.push(email.to_string());
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(json!({
+            "type": "invalidRecipients",
+            "description": "envelope contains invalid recipients",
+            "invalidRecipients": invalid,
+        }));
+    }
+    Ok(SubmissionEnvelope {
+        mail_from: mail_from.to_string(),
+        rcpt_to,
+    })
+}
+
+/// Matches the address syntax `mail-core::compose` accepts, so a submission
+/// cannot smuggle a display name or header injection into the SMTP envelope.
+fn valid_address(value: &str) -> bool {
+    if value.is_empty() || value.trim() != value {
+        return false;
+    }
+    if value.chars().any(|c| {
+        c.is_whitespace() || c.is_control() || matches!(c, ',' | ';' | ':' | '<' | '>' | '"')
+    }) {
+        return false;
+    }
+    match value.split_once('@') {
+        Some((local, domain)) => !local.is_empty() && !domain.is_empty() && !domain.contains('@'),
+        None => false,
     }
 }
 
