@@ -822,6 +822,24 @@ impl Store {
         Self::load_mailbox(&conn, mailbox_id)
     }
 
+    /// First live mailbox with this SPECIAL-USE role, such as `trash`.
+    pub fn mailbox_by_role(&self, account_id: i64, role: &str) -> Result<Option<Mailbox>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM mailboxes
+                 WHERE account_id = ?1 AND role = ?2 AND missing_at IS NULL
+                 ORDER BY id LIMIT 1",
+                params![account_id, role],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Self::load_mailbox(&conn, id),
+            None => Ok(None),
+        }
+    }
+
     pub fn update_sync_state(&self, mailbox_id: i64, state: &SyncState) -> Result<()> {
         let conn = self.conn.lock().expect("poisoned");
         conn.execute(
@@ -1498,23 +1516,26 @@ impl Store {
             tx.commit()?;
             return Ok(false);
         }
-        let remaining: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM message_locations WHERE message_id = ?1",
-            [message_id],
-            |row| row.get(0),
-        )?;
-        record_change(
-            &tx,
-            account_id,
-            "message",
-            &message_id.to_string(),
-            if remaining == 0 { "removed" } else { "updated" },
-        )?;
-        if remaining == 0 {
-            purge_orphan_messages(&tx)?;
-        }
+        finish_location_removal(&tx, account_id, message_id)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Drops every local location of a message after the server confirmed a
+    /// permanent delete. Copies kept only in the local trash are cleared too,
+    /// so the message row (and its thread) disappears with them.
+    pub fn remove_all_locations(&self, account_id: i64, message_id: i64) -> Result<usize> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM message_locations WHERE message_id = ?1",
+            [message_id],
+        )?;
+        if removed > 0 {
+            finish_location_removal(&tx, account_id, message_id)?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// Applies keyword changes to every live copy of a message. Flags are
@@ -2226,6 +2247,28 @@ impl Store {
         Ok(self.change_window(account_id)?.latest_seq)
     }
 
+    /// Watermark for one entity type. JMAP states are per data type, so a
+    /// reader that got a state from `Email/changes` must be able to hand the
+    /// same value back to `Email/set` even when mailbox or thread rows have
+    /// advanced the account-wide sequence since.
+    pub fn latest_change_seq_type(&self, account_id: i64, entity_type: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("poisoned");
+        let newest: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM changes
+             WHERE account_id = ?1 AND entity_type = ?2",
+            params![account_id, entity_type],
+            |row| row.get(0),
+        )?;
+        let snapshot: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM change_snapshots WHERE account_id = ?1",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(newest.max(snapshot.unwrap_or(0)))
+    }
+
     pub fn count_changes(&self, account_id: i64) -> Result<i64> {
         let conn = self.conn.lock().expect("poisoned");
         Ok(conn.query_row(
@@ -2387,6 +2430,14 @@ fn upsert_message(
 
     let message_row = match existing {
         Some(id) => {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT thread_id FROM messages WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
             let thread_id =
                 thread_for_message(tx, account_id, msg.message_id.as_deref(), in_reply_to, id)?;
             tx.execute(
@@ -2408,6 +2459,23 @@ fn upsert_message(
                     thread_id
                 ],
             )?;
+            // A row stored before threading existed gains a thread now; an
+            // already-threaded row keeps the one it had (COALESCE above).
+            if previous.is_none() {
+                let members: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM messages
+                     WHERE account_id = ?1 AND COALESCE(thread_id, 't' || id) = ?2 AND id <> ?3",
+                    params![account_id, thread_id, id],
+                    |row| row.get(0),
+                )?;
+                record_change(
+                    tx,
+                    account_id,
+                    "thread",
+                    &thread_id,
+                    if members == 0 { "created" } else { "updated" },
+                )?;
+            }
             id
         }
         None => {
@@ -2434,12 +2502,33 @@ fn upsert_message(
                 "UPDATE messages SET thread_id = ?2 WHERE id = ?1",
                 params![id, thread_id],
             )?;
+            // Whether the thread is new must be decided before late replies
+            // are folded in, otherwise a brand-new parent looks like an
+            // existing thread with several members.
+            let existed: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE account_id = ?1 AND COALESCE(thread_id, 't' || id) = ?2 AND id <> ?3",
+                params![account_id, thread_id, id],
+                |row| row.get(0),
+            )?;
             // A reply can arrive before the message it answers; when the
             // parent shows up, fold the waiting subtree into its thread.
+            let mut adopted = Vec::new();
             if let Some(mid) = msg.message_id.as_deref() {
-                adopt_descendants(tx, account_id, mid, &thread_id)?;
+                adopted = adopt_descendants(tx, account_id, mid, &thread_id)?;
             }
             rewrite_fts(tx, id)?;
+
+            record_change(
+                tx,
+                account_id,
+                "thread",
+                &thread_id,
+                if existed == 0 { "created" } else { "updated" },
+            )?;
+            for old in adopted {
+                record_thread_membership(tx, account_id, &old)?;
+            }
             id
         }
     };
@@ -2501,12 +2590,34 @@ fn thread_for_message(
 }
 
 /// Re-threads already stored replies once their parent arrives out of order.
+/// Returns the thread ids the subtree left behind, so their new (possibly
+/// empty) state can be recorded in the change log.
 fn adopt_descendants(
     tx: &Transaction<'_>,
     account_id: i64,
     parent: &str,
     thread_id: &str,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let previous: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "WITH RECURSIVE subtree(id, message_id) AS (
+                 SELECT id, message_id FROM messages
+                 WHERE account_id = ?1 AND (in_reply_to = ?2 OR in_reply_to = ?3)
+                 UNION
+                 SELECT m.id, m.message_id FROM messages m
+                 JOIN subtree s ON m.in_reply_to = s.message_id
+                 WHERE m.account_id = ?1 AND s.message_id IS NOT NULL
+             )
+             SELECT DISTINCT COALESCE(m.thread_id, 't' || m.id)
+             FROM messages m JOIN subtree s ON s.id = m.id
+             WHERE COALESCE(m.thread_id, 't' || m.id) <> ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![account_id, parent, format!("<{parent}>"), thread_id],
+            |row| row.get(0),
+        )?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
     tx.execute(
         "WITH RECURSIVE subtree(id, message_id) AS (
              SELECT id, message_id FROM messages
@@ -2519,6 +2630,45 @@ fn adopt_descendants(
          UPDATE messages SET thread_id = ?4 WHERE id IN (SELECT id FROM subtree)",
         params![account_id, parent, format!("<{parent}>"), thread_id],
     )?;
+    Ok(previous)
+}
+
+/// Records the current membership of a thread after it gained or lost a
+/// message. A thread with no messages left is reported as destroyed.
+fn record_thread_membership(tx: &Transaction<'_>, account_id: i64, thread_id: &str) -> Result<()> {
+    let members: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM messages
+         WHERE account_id = ?1 AND COALESCE(thread_id, 't' || id) = ?2",
+        params![account_id, thread_id],
+        |row| row.get(0),
+    )?;
+    record_change(
+        tx,
+        account_id,
+        "thread",
+        thread_id,
+        if members == 0 { "removed" } else { "updated" },
+    )
+}
+
+/// Records a message change after one location disappeared, purging the row
+/// (and its thread membership) once no copy is left.
+fn finish_location_removal(tx: &Transaction<'_>, account_id: i64, message_id: i64) -> Result<()> {
+    let remaining: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM message_locations WHERE message_id = ?1",
+        [message_id],
+        |row| row.get(0),
+    )?;
+    record_change(
+        tx,
+        account_id,
+        "message",
+        &message_id.to_string(),
+        if remaining == 0 { "removed" } else { "updated" },
+    )?;
+    if remaining == 0 {
+        purge_orphan_messages(tx)?;
+    }
     Ok(())
 }
 
@@ -2777,6 +2927,14 @@ fn group_threads(rows: Vec<(String, i64, i64)>, limit: Option<i64>) -> Vec<Threa
 fn purge_orphan_messages(tx: &Transaction<'_>) -> Result<usize> {
     let orphans =
         "SELECT id FROM messages WHERE id NOT IN (SELECT message_id FROM message_locations)";
+    let threads: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT account_id, COALESCE(thread_id, 't' || id)
+             FROM messages WHERE id IN ({orphans})"
+        ))?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
     let blob_refs = format!(
         "SELECT blob_hash, COUNT(*) FROM (
              SELECT blob_hash FROM message_parts
@@ -2807,6 +2965,15 @@ fn purge_orphan_messages(tx: &Transaction<'_>) -> Result<usize> {
         [],
     )?;
     let dropped = tx.execute(&format!("DELETE FROM messages WHERE id IN ({orphans})"), [])?;
+
+    // A thread whose last message vanished is destroyed; one that still has
+    // messages is reported as updated so clients can refresh its emailIds.
+    let mut seen = std::collections::BTreeSet::new();
+    for (account_id, thread_id) in threads {
+        if seen.insert((account_id, thread_id.clone())) {
+            record_thread_membership(tx, account_id, &thread_id)?;
+        }
+    }
     Ok(dropped)
 }
 

@@ -243,3 +243,83 @@ async fn imap_append_passes_flags_as_a_parenthesized_list() {
         "flags must be parenthesized: {append}"
     );
 }
+
+#[tokio::test]
+async fn imap_delete_marks_and_expunges_only_that_uid() {
+    let mock = Mock::start(|mut socket| async move {
+        let (read, mut write) = socket.split();
+        let mut reader = BufReader::new(read);
+        let mut seen = Vec::new();
+        write
+            .write_all(b"* OK mock imap\r\n")
+            .await
+            .expect("greeting");
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.expect("read") == 0 {
+                break;
+            }
+            let line = line.trim_end().to_string();
+            seen.push(line.clone());
+            let tag = line.split_whitespace().next().unwrap_or("").to_string();
+            let upper = line.to_ascii_uppercase();
+            if upper.contains("CAPABILITY") {
+                write
+                    .write_all(
+                        format!("* CAPABILITY IMAP4rev1 UIDPLUS\r\n{tag} OK capability\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .expect("capability");
+            } else if upper.contains("SELECT") {
+                write
+                    .write_all(
+                        format!("* 1 EXISTS\r\n{tag} OK [READ-WRITE] selected\r\n").as_bytes(),
+                    )
+                    .await
+                    .expect("select");
+            } else if upper.contains("LOGOUT") {
+                write
+                    .write_all(format!("* BYE\r\n{tag} OK logout\r\n").as_bytes())
+                    .await
+                    .expect("logout");
+                break;
+            } else {
+                write
+                    .write_all(format!("{tag} OK done\r\n").as_bytes())
+                    .await
+                    .expect("ok");
+            }
+        }
+        seen
+    })
+    .await;
+
+    let (mut session, _) = ImapSession::connect(&ImapConfig {
+        host: mock.addr.ip().to_string(),
+        port: mock.addr.port(),
+        security: Security::Plaintext,
+        username: "user@example.com".into(),
+        password: "secret".into(),
+    })
+    .await
+    .expect("imap login");
+
+    session.select("INBOX").await.expect("select");
+    session.delete_message(7).await.expect("delete");
+
+    drop(session);
+
+    let seen = mock.handle.await.expect("mock");
+    assert!(
+        seen.iter().any(|line| line
+            .to_ascii_uppercase()
+            .contains("UID STORE 7 +FLAGS.SILENT (\\DELETED)")),
+        "delete must mark the uid deleted: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|line| line.to_ascii_uppercase().contains("UID EXPUNGE 7")),
+        "delete must expunge only that uid: {seen:?}"
+    );
+}

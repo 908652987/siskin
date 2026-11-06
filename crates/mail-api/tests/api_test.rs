@@ -503,12 +503,26 @@ impl WriteSink for StoreWrites {
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
         Box::pin(async { Err(WriteError::NotSupported("import is not wired here".into())) })
     }
+
+    fn destroy_message<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.store
+                .remove_all_locations(account_id, message_id)
+                .map_err(|err| WriteError::Server(err.to_string()))?;
+            Ok(())
+        })
+    }
 }
 
 /// Records move calls without touching the store.
 #[derive(Default)]
 struct RecordingWrites {
     moves: Mutex<Vec<(i64, i64)>>,
+    destroys: Mutex<Vec<i64>>,
 }
 
 impl WriteSink for RecordingWrites {
@@ -545,6 +559,17 @@ impl WriteSink for RecordingWrites {
         _keywords: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
         Box::pin(async { Err(WriteError::NotSupported("import is not wired here".into())) })
+    }
+
+    fn destroy_message<'a>(
+        &'a self,
+        _account_id: i64,
+        message_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.destroys.lock().expect("destroys").push(message_id);
+            Ok(())
+        })
     }
 }
 
@@ -917,6 +942,19 @@ impl WriteSink for ImportWrites {
                 .ok_or_else(|| WriteError::Server("imported message vanished".to_string()))
         })
     }
+
+    fn destroy_message<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.store
+                .remove_all_locations(account_id, message_id)
+                .map_err(|err| WriteError::Server(err.to_string()))?;
+            Ok(())
+        })
+    }
 }
 
 fn writing_jmap(fixture: &Fixture) -> Jmap {
@@ -972,7 +1010,7 @@ async fn email_import_files_an_uploaded_message() {
         response["newState"].as_str().unwrap(),
         fixture
             .store
-            .latest_change_seq(fixture.account)
+            .latest_change_seq_type(fixture.account, "message")
             .unwrap()
             .to_string()
     );
@@ -1066,4 +1104,239 @@ async fn session_advertises_the_upload_limit() {
         session["capabilities"][CORE_CAPABILITY]["maxConcurrentUpload"],
         json!(4)
     );
+}
+
+#[tokio::test]
+async fn email_set_creates_a_full_email_from_an_upload() {
+    let fixture = setup();
+    let raw = b"Message-ID: <create@example.com>\r\nSubject: created\r\n\r\nbody";
+    let blob_id = fixture
+        .store
+        .store_upload(fixture.account, "message/rfc822", raw)
+        .expect("upload");
+    let jmap = writing_jmap(&fixture);
+
+    let response = result(
+        &call(
+            &jmap,
+            "Email/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "create": {
+                    "k1": {
+                        "blobId": blob_id,
+                        "mailboxIds": { fixture.inbox.to_string(): true },
+                        "keywords": {"$seen": true},
+                    }
+                },
+            }),
+        )
+        .await,
+    );
+    assert!(response["notCreated"]
+        .as_object()
+        .expect("notCreated")
+        .is_empty());
+    let created = &response["created"]["k1"];
+    let id = created["id"].as_str().expect("id");
+    assert_eq!(created["threadId"], json!("<create@example.com>"));
+    assert_eq!(
+        created["mailboxIds"][fixture.inbox.to_string()],
+        json!(true)
+    );
+    assert_eq!(created["keywords"]["$seen"], json!(true));
+    assert_eq!(created["subject"], json!("imported"));
+    assert!(fixture
+        .store
+        .message_by_message_id(fixture.account, "<create@example.com>")
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        response["newState"].as_str().unwrap(),
+        fixture
+            .store
+            .latest_change_seq_type(fixture.account, "message")
+            .unwrap()
+            .to_string()
+    );
+    let _ = id;
+}
+
+#[tokio::test]
+async fn email_set_create_reports_unknown_blobs_and_bad_mailboxes() {
+    let fixture = setup();
+    let raw = b"Subject: created\r\n\r\nbody";
+    let blob_id = fixture
+        .store
+        .store_upload(fixture.account, "message/rfc822", raw)
+        .expect("upload");
+    let jmap = writing_jmap(&fixture);
+
+    let response = result(
+        &call(
+            &jmap,
+            "Email/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "create": {
+                    "missing": {
+                        "blobId": "0".repeat(64),
+                        "mailboxIds": { fixture.inbox.to_string(): true },
+                    },
+                    "two": {
+                        "blobId": blob_id,
+                        "mailboxIds": {
+                            fixture.inbox.to_string(): true,
+                            fixture.sent.to_string(): true,
+                        },
+                    },
+                },
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        response["notCreated"]["missing"]["type"],
+        json!("blobNotFound")
+    );
+    assert_eq!(response["notCreated"]["two"]["type"], json!("notSupported"));
+    assert!(response["created"].as_object().expect("created").is_empty());
+    assert_eq!(fixture.store.count_messages(fixture.account).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn email_set_destroys_through_the_sink() {
+    let fixture = setup();
+    fixture
+        .store
+        .apply_fetch(fixture.account, fixture.inbox, &[message(1, "one")], &[])
+        .expect("fetch");
+    let id = fixture.store.list_messages(fixture.account, 10, 0).unwrap()[0].id;
+    let writes = Arc::new(RecordingWrites::default());
+    let jmap = Jmap::new(Arc::clone(&fixture.store)).with_writes(writes.clone());
+
+    let response = result(
+        &call(
+            &jmap,
+            "Email/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "destroy": [id.to_string()],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(ids(&response["destroyed"]), vec![id.to_string()]);
+    assert_eq!(*writes.destroys.lock().expect("destroys"), vec![id]);
+    assert!(response["notDestroyed"]
+        .as_object()
+        .expect("notDestroyed")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn email_set_destroy_without_a_sink_is_not_supported() {
+    let fixture = setup();
+    let jmap = Jmap::new(Arc::clone(&fixture.store));
+    let response = result(
+        &call(
+            &jmap,
+            "Email/set",
+            json!({"accountId": fixture.account.to_string(), "destroy": ["1"]}),
+        )
+        .await,
+    );
+    assert_eq!(response["notDestroyed"]["1"]["type"], json!("notSupported"));
+    assert!(response["destroyed"]
+        .as_array()
+        .expect("destroyed")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn thread_changes_report_new_and_updated_threads() {
+    let fixture = setup();
+    let mut reply = message(1, "reply");
+    reply.message_id = Some("<reply@example.com>".to_string());
+    reply.in_reply_to = Some("<root@example.com>".to_string());
+    fixture
+        .store
+        .apply_fetch(fixture.account, fixture.inbox, &[reply], &[])
+        .expect("fetch");
+    let jmap = Jmap::new(Arc::clone(&fixture.store));
+
+    let first = result(
+        &call(
+            &jmap,
+            "Thread/changes",
+            json!({"accountId": fixture.account.to_string(), "sinceState": "0"}),
+        )
+        .await,
+    );
+    assert_eq!(ids(&first["created"]), vec!["<reply@example.com>"]);
+    let state = first["newState"].as_str().expect("state").to_string();
+
+    // The parent arrives late: the thread is adopted under the root id.
+    let mut root = message(2, "root");
+    root.message_id = Some("<root@example.com>".to_string());
+    fixture
+        .store
+        .apply_fetch(fixture.account, fixture.inbox, &[root], &[])
+        .expect("fetch");
+    let second = result(
+        &call(
+            &jmap,
+            "Thread/changes",
+            json!({"accountId": fixture.account.to_string(), "sinceState": state}),
+        )
+        .await,
+    );
+    assert!(ids(&second["created"]).contains(&"<root@example.com>".to_string()));
+    assert!(ids(&second["destroyed"]).contains(&"<reply@example.com>".to_string()));
+}
+
+#[tokio::test]
+async fn email_set_accepts_the_state_from_email_changes_after_a_mailbox_change() {
+    let fixture = setup();
+    fixture
+        .store
+        .apply_fetch(fixture.account, fixture.inbox, &[message(1, "one")], &[])
+        .expect("fetch");
+    let jmap = Jmap::new(Arc::clone(&fixture.store)).with_writes(Arc::new(StoreWrites {
+        store: Arc::clone(&fixture.store),
+    }));
+
+    let changes = result(
+        &call(
+            &jmap,
+            "Email/changes",
+            json!({"accountId": fixture.account.to_string(), "sinceState": "0"}),
+        )
+        .await,
+    );
+    let state = changes["newState"].as_str().expect("state").to_string();
+
+    // A mailbox change advances the account-wide sequence but not the Email
+    // state; `ifInState` must keep accepting the Email state.
+    fixture
+        .store
+        .ensure_mailbox(fixture.account, "Archive", Some("archive"))
+        .expect("mailbox");
+
+    let id = fixture.store.list_messages(fixture.account, 10, 0).unwrap()[0]
+        .id
+        .to_string();
+    let response = result(
+        &call(
+            &jmap,
+            "Email/set",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "ifInState": state,
+                "update": { id: {"keywords": {"$seen": true}} },
+            }),
+        )
+        .await,
+    );
+    assert!(response["updated"].as_object().expect("updated").len() == 1);
 }

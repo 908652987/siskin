@@ -586,6 +586,20 @@ impl WriteSink for CoreWrites {
                 .map_err(core_write_error)
         })
     }
+
+    fn destroy_message<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            let email = self.email(account_id)?;
+            self.core
+                .destroy_message(&email, message_id)
+                .await
+                .map_err(core_write_error)
+        })
+    }
 }
 
 fn core_write_error(err: CoreError) -> WriteError {
@@ -593,9 +607,9 @@ fn core_write_error(err: CoreError) -> WriteError {
         CoreError::MessageNotFound(_) | CoreError::MailboxNotFound(_) => {
             WriteError::NotFound(err.to_string())
         }
-        CoreError::Unsupported(_)
-        | CoreError::MultipleLocations(_)
-        | CoreError::UnknownKeyword(_) => WriteError::NotSupported(err.to_string()),
+        CoreError::Unsupported(_) | CoreError::UnknownKeyword(_) => {
+            WriteError::NotSupported(err.to_string())
+        }
         other => WriteError::Server(other.to_string()),
     }
 }

@@ -66,11 +66,11 @@ fn compaction_bounds_the_log_and_preserves_the_watermark() {
         store.latest_change_seq(account_id).unwrap()
     );
     assert_eq!(before.snapshot_seq, None);
-    assert_eq!(store.count_changes(account_id).unwrap(), 32);
+    assert_eq!(store.count_changes(account_id).unwrap(), 62);
 
     let compaction = store.compact_changes(account_id, 10).unwrap().unwrap();
     assert_eq!(compaction.snapshot_seq, before.latest_seq);
-    assert_eq!(compaction.removed_changes, 32);
+    assert_eq!(compaction.removed_changes, 62);
     assert_eq!(store.count_changes(account_id).unwrap(), 0);
 
     let after = store.change_window(account_id).unwrap();
@@ -94,7 +94,7 @@ fn compaction_is_skipped_below_the_threshold() {
     let window = store.change_window(account_id).unwrap();
     assert_eq!(window.snapshot_seq, None);
     assert_eq!(window.oldest_seq, Some(1));
-    assert_eq!(window.latest_seq, 3);
+    assert_eq!(window.latest_seq, 4);
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn changes_after_compaction_continue_above_the_snapshot() {
     assert_eq!(window.oldest_seq, Some(snapshot_seq + 1));
 
     let changes = store.changes_since(account_id, snapshot_seq, 100).unwrap();
-    assert_eq!(changes.len(), 2);
+    assert_eq!(changes.len(), 3);
     assert!(changes.iter().all(|change| change.seq > snapshot_seq));
     assert!(changes
         .iter()

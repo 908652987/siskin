@@ -167,6 +167,120 @@ fn threads_only_cover_live_mailboxes() {
 }
 
 #[test]
+fn thread_changes_track_creation_updates_and_late_parents() {
+    let (store, account, inbox) = setup();
+    assert_eq!(store.latest_change_seq_type(account, "thread").unwrap(), 0);
+
+    store
+        .apply_fetch(
+            account,
+            inbox,
+            &[msg(1, Some("<reply@test>"), Some("<root@test>"))],
+            &[],
+        )
+        .unwrap();
+    let first = store.latest_change_seq_type(account, "thread").unwrap();
+    let changes = store.changes_since_type(account, "thread", 0, 100).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].entity_id, "<reply@test>");
+    assert_eq!(changes[0].op, "created");
+
+    store
+        .apply_fetch(
+            account,
+            inbox,
+            &[msg(2, Some("<nested@test>"), Some("<reply@test>"))],
+            &[],
+        )
+        .unwrap();
+    let changes = store
+        .changes_since_type(account, "thread", first, 100)
+        .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].entity_id, "<reply@test>");
+    assert_eq!(changes[0].op, "updated");
+
+    // The parent arrives late: a new thread is created and the old
+    // reply-rooted thread disappears once its messages are folded in.
+    let before_parent = store.latest_change_seq_type(account, "thread").unwrap();
+    store
+        .apply_fetch(account, inbox, &[msg(3, Some("<root@test>"), None)], &[])
+        .unwrap();
+    let changes = store
+        .changes_since_type(account, "thread", before_parent, 100)
+        .unwrap();
+    assert!(changes
+        .iter()
+        .any(|change| change.entity_id == "<root@test>" && change.op == "created"));
+    assert!(changes
+        .iter()
+        .any(|change| change.entity_id == "<reply@test>" && change.op == "removed"));
+}
+
+#[test]
+fn removing_the_last_message_destroys_the_thread() {
+    let (store, account, inbox) = setup();
+    store
+        .apply_fetch(account, inbox, &[msg(1, Some("<one@test>"), None)], &[])
+        .unwrap();
+    let id = store.message_at(inbox, 1).unwrap().expect("message");
+    let before = store.latest_change_seq_type(account, "thread").unwrap();
+
+    assert_eq!(store.remove_all_locations(account, id).unwrap(), 1);
+    assert!(store
+        .messages_with_locations(account, &[id])
+        .unwrap()
+        .is_empty());
+    let changes = store
+        .changes_since_type(account, "thread", before, 100)
+        .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].entity_id, "<one@test>");
+    assert_eq!(changes[0].op, "removed");
+
+    // A message with two copies keeps its thread until the last copy goes.
+    store
+        .apply_fetch(account, inbox, &[msg(2, Some("<two@test>"), None)], &[])
+        .unwrap();
+    let sent = store
+        .ensure_mailbox(account, "Sent", Some("sent"))
+        .unwrap()
+        .id;
+    store
+        .apply_fetch(account, sent, &[msg(9, Some("<two@test>"), None)], &[])
+        .unwrap();
+    let id = store
+        .message_by_message_id(account, "<two@test>")
+        .unwrap()
+        .unwrap();
+    let before = store.latest_change_seq_type(account, "thread").unwrap();
+    store.remove_location(account, id, inbox).unwrap();
+    let changes = store
+        .changes_since_type(account, "thread", before, 100)
+        .unwrap();
+    assert!(
+        changes.is_empty(),
+        "a surviving copy must not change the thread"
+    );
+}
+
+#[test]
+fn change_watermarks_are_per_entity_type() {
+    let (store, account, inbox) = setup();
+    assert!(store.latest_change_seq_type(account, "mailbox").unwrap() > 0);
+    assert_eq!(store.latest_change_seq_type(account, "message").unwrap(), 0);
+    assert_eq!(store.latest_change_seq_type(account, "thread").unwrap(), 0);
+
+    store
+        .apply_fetch(account, inbox, &[msg(1, Some("<one@test>"), None)], &[])
+        .unwrap();
+    let message = store.latest_change_seq_type(account, "message").unwrap();
+    let thread = store.latest_change_seq_type(account, "thread").unwrap();
+    assert!(message > 0 && thread > 0);
+    assert!(store.latest_change_seq(account).unwrap() >= thread);
+}
+
+#[test]
 fn uploads_are_scoped_to_their_account() {
     let (store, account, _) = setup();
     let other = store

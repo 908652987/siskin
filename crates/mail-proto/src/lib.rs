@@ -504,6 +504,21 @@ impl ImapSession {
         }
     }
 
+    /// Permanently removes one message from the selected mailbox: mark it
+    /// `\Deleted`, then expunge only that UID so other pending deletions in the
+    /// mailbox survive.
+    pub async fn delete_message(&mut self, uid: u32) -> Result<()> {
+        let mut stream = self
+            .session()
+            .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+            .await?;
+        while stream.try_next().await?.is_some() {}
+        drop(stream);
+        let mut expunged = Box::pin(self.session().uid_expunge(uid.to_string()).await?);
+        while expunged.try_next().await?.is_some() {}
+        Ok(())
+    }
+
     /// Sends IDLE and waits for the first mailbox change or timeout.
     pub async fn idle_wait(&mut self, timeout: Duration) -> Result<IdleEvent> {
         let mut handle = self.inner.take().expect("session taken").idle();

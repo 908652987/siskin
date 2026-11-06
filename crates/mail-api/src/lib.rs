@@ -107,6 +107,13 @@ pub struct FetchedBody {
     pub html: Option<String>,
 }
 
+/// One blob filed by `Email/import` or `Email/set create`.
+struct ImportedEmail {
+    message_id: i64,
+    blob_id: String,
+    size: i64,
+}
+
 /// On-demand body access. Implemented by the Hub with `mail-core`; keeping it
 /// behind a trait preserves the `mail-api -> mail-store` dependency edge.
 pub trait BodySource: Send + Sync {
@@ -152,6 +159,14 @@ pub trait WriteSink: Send + Sync {
         raw: Vec<u8>,
         keywords: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>>;
+
+    /// Permanently removes the message from every mailbox. Moving to Trash is
+    /// a `move_message` call, matching JMAP's model where Trash is a mailbox.
+    fn destroy_message<'a>(
+        &'a self,
+        account_id: i64,
+        message_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>>;
 }
 
 pub struct Jmap {
@@ -298,6 +313,7 @@ impl Jmap {
             "Email/set" => self.email_set(args).await,
             "Email/import" => self.email_import(args).await,
             "Thread/get" => self.thread_get(args),
+            "Thread/changes" => self.changes(args, "thread"),
             other => Err(ApiError::UnknownMethod(other.to_string())),
         }
     }
@@ -385,7 +401,7 @@ impl Jmap {
 
         Ok(json!({
             "accountId": account_id.to_string(),
-            "state": self.store.latest_change_seq(account_id)?.to_string(),
+            "state": self.store.latest_change_seq_type(account_id, "mailbox")?.to_string(),
             "list": list,
             "notFound": not_found,
         }))
@@ -424,7 +440,7 @@ impl Jmap {
             .collect();
         Ok(json!({
             "accountId": account_id.to_string(),
-            "queryState": self.store.latest_change_seq(account_id)?.to_string(),
+            "queryState": self.store.latest_change_seq_type(account_id, "message")?.to_string(),
             "canCalculateChanges": false,
             "position": position,
             "ids": ids,
@@ -470,7 +486,7 @@ impl Jmap {
 
         Ok(json!({
             "accountId": account_id.to_string(),
-            "state": self.store.latest_change_seq(account_id)?.to_string(),
+            "state": self.store.latest_change_seq_type(account_id, "message")?.to_string(),
             "list": list,
             "notFound": not_found,
         }))
@@ -526,6 +542,9 @@ impl Jmap {
                 ("mailbox", "created") => Last::Created,
                 ("mailbox", "removed" | "retired") => Last::Removed,
                 ("mailbox", "updated" | "restored") => Last::Updated,
+                ("thread", "created") => Last::Created,
+                ("thread", "removed") => Last::Removed,
+                ("thread", "updated") => Last::Updated,
                 _ => continue,
             };
             if op == Last::Created {
@@ -570,11 +589,16 @@ impl Jmap {
         }))
     }
 
-    /// `Email/set` supports keyword and mailbox updates. Creating or destroying
-    /// emails is reported per object instead of failing the whole method.
+    /// `Email/set` creates emails from uploaded blobs, destroys them (JMAP
+    /// destroy is permanent; deleting to Trash is a `mailboxIds` update), and
+    /// applies keyword/mailbox updates. Per-object failures stay in the
+    /// `not*` maps instead of failing the whole method.
     async fn email_set(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
         let account_id = self.account_id(args)?;
-        let old_state = self.store.latest_change_seq(account_id)?.to_string();
+        let old_state = self
+            .store
+            .latest_change_seq_type(account_id, "message")?
+            .to_string();
         if let Some(value) = args.get("ifInState") {
             if !value.is_null() && value.as_str() != Some(old_state.as_str()) {
                 return Err(ApiError::StateMismatch);
@@ -590,28 +614,70 @@ impl Jmap {
             return Err(ApiError::InvalidArguments);
         }
 
+        let mut created = Map::new();
         let mut updated = Map::new();
-        let mut not_updated = Map::new();
         let mut not_created = Map::new();
+        let mut not_updated = Map::new();
         let mut not_destroyed = Map::new();
+        let mut destroyed = Vec::new();
 
         if let Some(create) = create {
-            for id in create.keys() {
-                not_created.insert(
-                    id.clone(),
-                    json!({"type": "notSupported", "description": "creating emails is not supported"}),
-                );
+            let mut order: Vec<&String> = create.keys().collect();
+            order.sort();
+            for creation_id in order {
+                let Some(object) = create[creation_id.as_str()].as_object() else {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({
+                            "type": "invalidProperties",
+                            "description": "a creation must be an object",
+                        }),
+                    );
+                    continue;
+                };
+                let Some(sink) = self.writes.as_ref() else {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({"type": "notSupported", "description": "writing is disabled"}),
+                    );
+                    continue;
+                };
+                match self.import_blob(account_id, sink, object).await {
+                    Ok(imported) => match self.email_view(account_id, imported.message_id).await {
+                        Ok(object) => {
+                            created.insert(creation_id.clone(), Value::Object(object));
+                        }
+                        Err(err) => {
+                            not_created.insert(creation_id.clone(), write_error_object(&err));
+                        }
+                    },
+                    Err(err) => {
+                        not_created.insert(creation_id.clone(), err);
+                    }
+                }
             }
         }
+
         if let Some(destroy) = destroy {
-            for id in destroy {
-                let id = id.as_str().ok_or(ApiError::InvalidArguments)?;
-                not_destroyed.insert(
-                    id.to_string(),
-                    json!({"type": "notSupported", "description": "destroying emails is not supported"}),
-                );
+            for value in destroy {
+                let id = value.as_str().ok_or(ApiError::InvalidArguments)?;
+                let message_id: i64 = id.parse().map_err(|_| ApiError::InvalidArguments)?;
+                let Some(sink) = self.writes.as_ref() else {
+                    not_destroyed.insert(
+                        id.to_string(),
+                        json!({"type": "notSupported", "description": "writing is disabled"}),
+                    );
+                    continue;
+                };
+                match sink.destroy_message(account_id, message_id).await {
+                    Ok(()) => destroyed.push(id.to_string()),
+                    Err(err) => {
+                        not_destroyed.insert(id.to_string(), write_error_object(&err));
+                    }
+                }
             }
         }
+
         if let Some(update) = update {
             for (raw_id, patch) in update {
                 let message_id: i64 = raw_id.parse().map_err(|_| ApiError::InvalidArguments)?;
@@ -630,21 +696,94 @@ impl Jmap {
         Ok(json!({
             "accountId": account_id.to_string(),
             "oldState": old_state,
-            "newState": self.store.latest_change_seq(account_id)?.to_string(),
-            "created": {},
+            "newState": self
+                .store
+                .latest_change_seq_type(account_id, "message")?
+                .to_string(),
+            "created": created,
             "updated": updated,
-            "destroyed": [],
+            "destroyed": destroyed,
             "notCreated": not_created,
             "notUpdated": not_updated,
             "notDestroyed": not_destroyed,
         }))
     }
 
+    /// Full JMAP Email object for a message the store already holds. Used as
+    /// the `created` value of `Email/set`, where the spec requires the object
+    /// rather than the short `Email/import` response.
+    async fn email_view(
+        &self,
+        account_id: i64,
+        message_id: i64,
+    ) -> Result<Map<String, Value>, WriteError> {
+        let mut messages = self
+            .store
+            .messages_with_locations(account_id, &[message_id])
+            .map_err(|err| WriteError::Server(err.to_string()))?;
+        let message = messages
+            .pop()
+            .ok_or_else(|| WriteError::Server(format!("message {message_id} vanished")))?;
+        let body = self
+            .body_view(account_id, message_id, false)
+            .await
+            .map_err(|err| WriteError::Server(err.to_string()))?;
+        Ok(email_object(&message, &body, false, false, None))
+    }
+
+    /// Validates and files one uploaded blob; shared by `Email/import` and
+    /// `Email/set create`. Errors come back as ready-to-send JMAP error
+    /// objects so both methods keep the same per-object types.
+    async fn import_blob(
+        &self,
+        account_id: i64,
+        sink: &Arc<dyn WriteSink>,
+        object: &Map<String, Value>,
+    ) -> Result<ImportedEmail, Value> {
+        let blob_id = match object.get("blobId").and_then(Value::as_str) {
+            Some(blob_id) => blob_id.to_string(),
+            None => {
+                return Err(
+                    json!({"type": "invalidProperties", "description": "blobId is required"}),
+                )
+            }
+        };
+        let upload = match self.store.upload_for_account(account_id, &blob_id) {
+            Ok(Some(upload)) => upload,
+            Ok(None) => {
+                return Err(json!({
+                    "type": "blobNotFound",
+                    "description": format!("blob {blob_id} is not an upload of this account"),
+                }))
+            }
+            Err(err) => return Err(json!({"type": "serverFail", "description": err.to_string()})),
+        };
+        if upload.size > MAX_UPLOAD_BYTES {
+            return Err(json!({"type": "tooLarge", "description": "upload exceeds maxSizeUpload"}));
+        }
+        let mailbox_id =
+            import_mailbox(object.get("mailboxIds")).map_err(|err| write_error_object(&err))?;
+        let keywords =
+            import_keywords(object.get("keywords")).map_err(|err| write_error_object(&err))?;
+        let message_id = sink
+            .import_message(account_id, mailbox_id, upload.bytes, keywords)
+            .await
+            .map_err(|err| write_error_object(&err))?;
+        Ok(ImportedEmail {
+            message_id,
+            blob_id,
+            size: upload.size,
+        })
+    }
+
     /// `Email/import` files bytes a client uploaded earlier. The server round
     /// trip lives in the sink; per-object failures stay in `notCreated`.
     async fn email_import(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
         let account_id = self.account_id(args)?;
-        let old_state = self.store.latest_change_seq(account_id)?.to_string();
+        let old_state = self
+            .store
+            .latest_change_seq_type(account_id, "message")?
+            .to_string();
         if let Some(value) = args.get("ifInState") {
             if !value.is_null() && value.as_str() != Some(old_state.as_str()) {
                 return Err(ApiError::StateMismatch);
@@ -679,77 +818,30 @@ impl Jmap {
         let mut order: Vec<&String> = emails.keys().collect();
         order.sort();
         for creation_id in order {
-            let object = emails[creation_id.as_str()]
-                .as_object()
-                .ok_or(ApiError::InvalidArguments)?;
-            let blob_id = match object.get("blobId").and_then(Value::as_str) {
-                Some(blob_id) => blob_id,
-                None => {
-                    not_created.insert(
-                        creation_id.clone(),
-                        json!({"type": "invalidProperties", "description": "blobId is required"}),
-                    );
-                    continue;
-                }
-            };
-            let upload = match self.store.upload_for_account(account_id, blob_id) {
-                Ok(Some(upload)) => upload,
-                Ok(None) => {
-                    not_created.insert(
-                        creation_id.clone(),
-                        json!({
-                            "type": "blobNotFound",
-                            "description": format!("blob {blob_id} is not an upload of this account"),
-                        }),
-                    );
-                    continue;
-                }
-                Err(err) => {
-                    not_created.insert(
-                        creation_id.clone(),
-                        write_error_object(&WriteError::Server(err.to_string())),
-                    );
-                    continue;
-                }
-            };
-            if upload.size > MAX_UPLOAD_BYTES {
+            let Some(object) = emails[creation_id.as_str()].as_object() else {
                 not_created.insert(
                     creation_id.clone(),
-                    json!({"type": "tooLarge", "description": "upload exceeds maxSizeUpload"}),
+                    json!({
+                        "type": "invalidProperties",
+                        "description": "an import must be an object",
+                    }),
                 );
                 continue;
-            }
-            let mailbox_id = match import_mailbox(object.get("mailboxIds")) {
-                Ok(mailbox_id) => mailbox_id,
-                Err(err) => {
-                    not_created.insert(creation_id.clone(), write_error_object(&err));
-                    continue;
-                }
             };
-            let keywords = match import_keywords(object.get("keywords")) {
-                Ok(keywords) => keywords,
-                Err(err) => {
-                    not_created.insert(creation_id.clone(), write_error_object(&err));
-                    continue;
-                }
-            };
-            match sink
-                .import_message(account_id, mailbox_id, upload.bytes, keywords)
-                .await
-            {
-                Ok(message_id) => {
+            match self.import_blob(account_id, sink, object).await {
+                Ok(imported) => {
                     created.insert(
                         creation_id.clone(),
                         json!({
-                            "id": message_id.to_string(),
-                            "blobId": blob_id,
-                            "threadId": self.thread_id_of(account_id, message_id)?,
-                            "size": upload.size,
+                            "id": imported.message_id.to_string(),
+                            "blobId": imported.blob_id,
+                            "threadId": self.thread_id_of(account_id, imported.message_id)?,
+                            "size": imported.size,
                         }),
                     );
                 }
                 Err(err) => {
-                    not_created.insert(creation_id.clone(), write_error_object(&err));
+                    not_created.insert(creation_id.clone(), err);
                 }
             }
         }
@@ -757,7 +849,10 @@ impl Jmap {
         Ok(json!({
             "accountId": account_id.to_string(),
             "oldState": old_state,
-            "newState": self.store.latest_change_seq(account_id)?.to_string(),
+            "newState": self
+                .store
+                .latest_change_seq_type(account_id, "message")?
+                .to_string(),
             "created": created,
             "notCreated": not_created,
         }))
@@ -806,7 +901,7 @@ impl Jmap {
             .collect();
         Ok(json!({
             "accountId": account_id.to_string(),
-            "state": self.store.latest_change_seq(account_id)?.to_string(),
+            "state": self.store.latest_change_seq_type(account_id, "thread")?.to_string(),
             "list": list,
             "notFound": not_found,
         }))

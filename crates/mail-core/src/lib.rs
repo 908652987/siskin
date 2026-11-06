@@ -57,8 +57,6 @@ pub enum CoreError {
     AttachmentNotFound { message_id: i64, part: String },
     #[error("operation not supported: {0}")]
     Unsupported(&'static str),
-    #[error("message {0} is stored in more than one mailbox; this write needs a single copy")]
-    MultipleLocations(i64),
     #[error("unknown keyword: {0}")]
     UnknownKeyword(String),
     #[error("unknown mailbox: {0}")]
@@ -1072,8 +1070,9 @@ impl Core {
         Ok(())
     }
 
-    /// Moves a message to another mailbox. Only messages with a single live
-    /// copy are accepted, because an IMAP move affects one copy.
+    /// Moves a message so that the destination holds one copy. Extra copies
+    /// (a message stored in several mailboxes) are moved to the account's
+    /// Trash mailbox when one exists; a permanent delete is `destroy_message`.
     pub async fn move_message(&self, email: &str, message_id: i64, mailbox_id: i64) -> Result<()> {
         let account = self.account(email)?;
         let context = self
@@ -1093,10 +1092,6 @@ impl Core {
         if targets.is_empty() {
             return Err(CoreError::Unsupported("message is only in the local trash"));
         }
-        if targets.len() > 1 {
-            return Err(CoreError::MultipleLocations(message_id));
-        }
-        let source = &targets[0];
         let destination = self
             .store
             .mailbox_by_id(mailbox_id)?
@@ -1104,16 +1099,117 @@ impl Core {
         if destination.account_id != account.id || destination.missing_at.is_some() {
             return Err(CoreError::MailboxNotFound(mailbox_id));
         }
-        if destination.id == source.mailbox_id {
+
+        // Keep the copy that already sits in the destination; otherwise move
+        // the first copy there. Everything else goes to Trash, because one
+        // IMAP move only affects one copy and the destination must end up with
+        // exactly one.
+        let canonical = targets
+            .iter()
+            .position(|target| target.mailbox_id == destination.id)
+            .unwrap_or(0);
+        if targets.len() == 1 && canonical == 0 && destination.id == targets[0].mailbox_id {
             return Ok(());
+        }
+        let trash =
+            if targets.len() > 1 {
+                Some(self.store.mailbox_by_role(account.id, "trash")?.ok_or(
+                    CoreError::Unsupported("moving extra copies needs a trash mailbox"),
+                )?)
+            } else {
+                None
+            };
+
+        let mut session = self.connect_imap(&account).await?;
+        let mut outcome = Ok(());
+        let source = &targets[canonical];
+        if source.mailbox_id != destination.id {
+            outcome = self
+                .move_message_imap(&mut session, &account, message_id, source, &destination)
+                .await;
+        }
+        if outcome.is_ok() {
+            if let Some(trash) = &trash {
+                for extra in targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != canonical)
+                {
+                    let extra = extra.1;
+                    if let Err(err) = self
+                        .move_message_imap(&mut session, &account, message_id, extra, trash)
+                        .await
+                    {
+                        outcome = Err(err);
+                        break;
+                    }
+                }
+            }
+        }
+        session.logout().await;
+        outcome
+    }
+
+    /// Permanently removes a message from every live mailbox, then drops any
+    /// copies left in the local trash. JMAP `Email/set destroy` maps here;
+    /// deleting to Trash is a `move_message` to that mailbox instead.
+    pub async fn destroy_message(&self, email: &str, message_id: i64) -> Result<()> {
+        let account = self.account(email)?;
+        let context = self
+            .store
+            .message_context(message_id)?
+            .ok_or(CoreError::MessageNotFound(message_id))?;
+        if context.account_id != account.id {
+            return Err(CoreError::MessageNotFound(message_id));
+        }
+        let settings = settings_of(&account)?;
+        if !matches!(settings.protocol, ReceiveProtocol::Imap) {
+            return Err(CoreError::Unsupported("destroy on a POP3 account"));
+        }
+        let targets = self
+            .store
+            .message_location_targets(account.id, message_id)?;
+        if targets.is_empty() {
+            return Err(CoreError::MessageNotFound(message_id));
         }
 
         let mut session = self.connect_imap(&account).await?;
-        let outcome = self
-            .move_message_imap(&mut session, &account, message_id, source, &destination)
-            .await;
+        let mut failure: Option<CoreError> = None;
+        let mut deleted = Vec::new();
+        let mut selected: Option<&str> = None;
+        for target in &targets {
+            if selected != Some(target.mailbox_name.as_str()) {
+                if let Err(err) = session.select(&target.mailbox_name).await {
+                    failure = Some(err.into());
+                    break;
+                }
+                selected = Some(target.mailbox_name.as_str());
+            }
+            let uid = match uid_of(target.uid) {
+                Ok(uid) => uid,
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            };
+            if let Err(err) = session.delete_message(uid).await {
+                failure = Some(err.into());
+                break;
+            }
+            deleted.push(target.mailbox_id);
+        }
         session.logout().await;
-        outcome
+
+        // Local state follows only the copies the server confirmed as gone.
+        for mailbox_id in deleted {
+            self.store
+                .remove_location(account.id, message_id, mailbox_id)?;
+        }
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        self.store.remove_all_locations(account.id, message_id)?;
+        Ok(())
     }
 
     async fn move_message_imap(

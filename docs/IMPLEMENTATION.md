@@ -1,7 +1,7 @@
 # 实现说明（同步内核 + 加密库 + 多协议 + 正文索引 + 多邮箱实时监听 + Hub + 桌面撰写）
 
 日期：2026-11-06
-范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP/POP3 接收、SMTP 发送（To/Cc/Bcc 与附件）、提供商预设、正文/附件按需拉取与 HTML 净化、正文全文索引（schema v6）、全账户多邮箱遍历与实时监听、本地回收站与保留期、Hub JMAP 子集（含上传、`Email/import`、`Thread/get`）、macOS 撰写与 `.app` 打包、开发 CLI
+范围：工程骨架、本地存储（SQLCipher 加密）、凭据保险箱、IMAP/POP3 接收、SMTP 发送（To/Cc/Bcc 与附件）、提供商预设、正文/附件按需拉取与 HTML 净化、正文全文索引（schema v6）、全账户多邮箱遍历与实时监听、本地回收站与保留期、Hub JMAP 子集（含上传、`Email/import`、`Email/set` 创建/销毁、`Thread/get|changes`）、macOS 撰写与 `.app` 打包、开发 CLI
 状态：协议路径已实测（Dovecot + 88 服务器 STARTTLS）；正文与附件、多邮箱、回收站、实时监听、正文搜索、撰写发送（Dovecot + 本地 SMTP sink）已实跑；真实账号收发未验收
 
 ---
@@ -130,7 +130,7 @@ flowchart LR
 | 正文索引查询（10k 封） | 命中全表的 3 字词 ~55 ms；中文 2 字 LIKE 52 ms（1,000 字/封）/ 137 ms（4,000 字/封）；选择性短语 0.1–0.3 ms |
 | 正文搜索（Dovecot 端到端） | 拉取前搜 `zebraqilin` 无结果，`body` 后命中；中文 2 字 `营收` 经 LIKE 命中 |
 | schema v5→v6 迁移 | 主题索引保留、正文从 blob 回填、`user_version=6`（单测） |
-| 单测 | 141 个全绿（crypto/store/sync/proto/parse/core/api/hub/ffi/cli 组件） |
+| 单测 | 151 个全绿（crypto/store/sync/proto/parse/core/api/hub/ffi/cli 组件） |
 
 首次同步后进程启动有一次钥匙串授权检查（新二进制），之后的同步都在 40 ms 内。
 
@@ -165,15 +165,17 @@ flowchart LR
 - 分层：`mail-api` 只做 JMAP 语义（Session、请求/响应、错误映射），不依赖 HTTP；`mail-hub` 是 axum 二进制，负责配对、鉴权、路由与按需拉正文。依赖方向保持 `mail-hub → mail-api, mail-core`，`mail-api → mail-store`。
 - 认证：配对码（`EYRIE_HUB_PAIRING_CODE`，未设置则每进程随机生成并打印一次）换 32 字节随机令牌；库中 `hub_devices` 只存 SHA-256 哈希与 `last_seen_at`，令牌只在配对响应里出现一次。
 - 端点：`GET /.well-known/jmap`（Session）、`POST /jmap`、`POST /pair`、`GET /eventsource/`（SSE）、`GET /download/{accountId}/{blobId}/{name}`、`POST /upload/{accountId}`（带不带尾斜杠都路由）。上传按内容寻址写入 `blobs` + `uploads`，`maxSizeUpload` 50 MiB，`uploads` 行 24 小时未使用即回收（引用它的消息仍可读）。
-- 已实现 method：`Mailbox/get`（角色映射、`totalEmails`/`unreadEmails`、`myRights` 随写入能力切换）、`Mailbox/changes`、`Email/query`（`inMailbox`、`text`、`hasKeyword`/`notKeyword` 的 `$seen`/`$flagged`、`before`/`after`、position/limit，`total` 与分页一致）、`Email/get`（`mailboxIds` 为全部在线位置并集、keywords 为位置并集、附件元数据与 `blobId`、`bodyValues`）、`Email/changes`、`Email/set`（只更新 `keywords` 与 `mailboxIds`；`create`/`destroy` 按对象返回 `notSupported`）、`Email/import`、`Thread/get`。
+- 已实现 method：`Mailbox/get`（角色映射、`totalEmails`/`unreadEmails`、`myRights` 随写入能力切换）、`Mailbox/changes`、`Email/query`（`inMailbox`、`text`、`hasKeyword`/`notKeyword` 的 `$seen`/`$flagged`、`before`/`after`、position/limit，`total` 与分页一致）、`Email/get`（`mailboxIds` 为全部在线位置并集、keywords 为位置并集、附件元数据与 `blobId`、`bodyValues`）、`Email/changes`、`Email/set`（`create` 从上传 blob 建信、`destroy` 永久删除、`keywords`/`mailboxIds` 更新）、`Email/import`、`Thread/get`、`Thread/changes`。
+- `Email/set create`：与 `Email/import` 共用同一校验与落库路径（本账户 blob、单邮箱、已知关键字、50 MiB 上限），响应里的 `created.<id>` 是完整 Email 对象；`Email/import` 仍返回精简的 `{id, blobId, threadId, size}`。`destroy` 按 RFC 8621 §4.6 永久删除所有副本（`STORE \Deleted` + `UID EXPUNGE`），删除到 Trash 应改用 `mailboxIds` 更新。
 - `Email/import`：只接受本账户 `/upload` 产生的 blob（未知或他人 blob 返回 `blobNotFound`），每次导入一个邮箱、只支持已知关键字；Hub 用 `mail-core::import_message` 执行 `APPEND`（带关键字对应的标志），成功后同步该邮箱取得本地行，响应里的 `id`/`threadId` 就是本地消息；多邮箱与自定义关键字返回 `notSupported`。
 - 线程：同步时把 `In-Reply-To` 写进 `messages.in_reply_to`，`thread_id` 取父邮件的线程根（父未到达时先以自身 `Message-ID` 为根，父到达后递归改挂整棵子树）；无 `Message-ID` 的消息线程 id 为 `t<id>`。`Thread/get` 只返回在线邮箱里的消息，`Email/get` 的 `threadId` 与它一致。
-- 写路径：`mail-api::WriteSink` 由 Hub 用 `mail-core` 实现，保持 `mail-api → mail-store` 依赖方向。`$seen`/`$flagged`/`$answered`/`$draft`/`$forwarded` 映射为 IMAP 标志；先对每个在线位置 `STORE`，全部成功后才更新本地 flags 并写 `message updated`。移动只接受单副本消息，走 `MOVE` 或 `COPY+EXPUNGE`，随后同步目标邮箱取得新 UID、再删源位置；多副本返回 `notSupported`。
+- 写路径：`mail-api::WriteSink` 由 Hub 用 `mail-core` 实现，保持 `mail-api → mail-store` 依赖方向。`$seen`/`$flagged`/`$answered`/`$draft`/`$forwarded` 映射为 IMAP 标志；先对每个在线位置 `STORE`，全部成功后才更新本地 flags 并写 `message updated`。移动走 `MOVE` 或 `COPY+EXPUNGE`，随后同步目标邮箱取得新 UID、再删源位置；多副本时目标保留一份，其余副本移入账户的 `\Trash` 角色邮箱（没有 Trash 邮箱则返回 `notSupported`，不会复制出更多副本）。`destroy` 对每个在线位置 `STORE \Deleted` + `UID EXPUNGE`，随后清掉本地所有位置（含本地回收站里的副本）。
 - 不支持的条件显式失败：其他 filter/sort 返回 `unsupportedFilter`/`unsupportedSort`，未知 method 返回 `unknownMethod`，不静默忽略。排序固定为 `receivedAt` 降序 + id 降序，单次查询上限 1,000 条。
-- 变更语义：`apply_fetch` 写 `message created/updated/removed`，`ensure_mailbox` 写 `mailbox created/restored`；`Email/changes` 与 `Mailbox/changes` 共用游标规则但按 `entity_type` 过滤。同一窗口内创建后又删除的 id 不出现在任何列表，创建后又更新的 id 只出现在 `created`。游标早于快照水位或早于最旧 `changes` 行时返回 `cannotCalculateChanges`。
+- 变更语义：`apply_fetch` 写 `message created/updated/removed` 与对应的 `thread created/updated/removed`（新消息、晚到父邮件改挂、最后一份副本消失），`ensure_mailbox` 写 `mailbox created/restored`；`Email/changes`、`Mailbox/changes`、`Thread/changes` 共用游标规则但按 `entity_type` 过滤。同一窗口内创建后又删除的 id 不出现在任何列表，创建后又更新的 id 只出现在 `created`。游标早于快照水位或早于最旧 `changes` 行时返回 `cannotCalculateChanges`。
+- 状态：`Mailbox/get|changes`、`Email/get|query|changes|set`、`Thread/get|changes` 的 state 按实体类型取水位（`latest_change_seq_type`），避免 mailbox/thread 行推进账户序列后把合法的 `ifInState` 判成 `stateMismatch`。
 - 正文：`Email/get` 只在客户端请求 `fetchTextBodyValues`/`fetchHTMLBodyValues` 时返回 `bodyValues`；未缓存时通过 `mail_api::BodySource`（Hub 用 `mail-core::fetch_body`）按需拉取，失败返回 `serverFail` 而不是空正文。单部件消息的空 section 在 JMAP 层映射为 `text`/`html`。缓存后的正文/附件在 `blobId` 中暴露散列 hex，`/download` 只在 blob 属于该账户时返回字节。
 - SSE：`types` 选 `Email`/`Mailbox`，`closeafter`/`ping` 接受秒数或 `PTxxS`；连接建立即发一次 `state`，之后状态变化发 `state`、空闲发 `ping`。Hub 不持有推送通道，APNs/FCM 未接。
-- 新增存储查询：`mailbox_counts`、`query_messages`、`messages_with_locations`、`message_location_targets`、`update_flags`、`remove_location`、`blob_for_account`、`changes_since_type`、`list_devices`/`revoke_device`；schema v7 增加 `hub_devices`。
+- 新增存储查询：`mailbox_counts`、`mailbox_by_role`、`query_messages`、`messages_with_locations`、`message_location_targets`、`update_flags`、`remove_location`、`remove_all_locations`、`blob_for_account`、`changes_since_type`、`latest_change_seq_type`、`list_devices`/`revoke_device`；schema v7 增加 `hub_devices`。
 
 ---
 
@@ -315,7 +317,7 @@ cargo test --workspace
 11. **主密钥无轮换与自动备份**。`export-key`/`import-key` 支持人工备份到密码管理器，但主密钥仍只有钥匙串一份，且库密钥不能在线轮换。
 12. **回收站只覆盖“整箱消失”**。单封邮件在服务器端消失仍按 UID 差集硬删除（正常流程应已进入服务器 Trash 并同步到本地）；回收站不提供手工恢复，同名单重建时旧数据以 `(local trash <id>)` 行保留至保留期。
 13. **多邮箱会让 `list/search` 去重**。同 Message-ID 只展示一个代表位置；按邮箱筛选的 UI 需要新的查询接口。
-14. **JMAP 写操作覆盖面**。已实现已读/标志、单副本移动、上传、`Email/import`、`Thread/get`；未做 `Email/set` 的 `create`/`destroy`、`Thread/changes`、多副本移动、自定义关键字、APNs/FCM；`Email/query` 不支持 `operator`/`conditions` 组合过滤与升序排序。导入只走 IMAP 账户。设备吊销已提供 `mail-cli revoke-device`。
+14. **JMAP 写操作覆盖面**。已实现已读/标志、多副本移动、上传、`Email/import`、`Email/set create/destroy`、`Thread/get|changes`；未做自定义关键字、`Email/query` 的 `operator`/`conditions` 组合过滤与升序排序、`Email/set create` 的多邮箱落库、APNs/FCM。导入/创建只走 IMAP 账户。`Thread/changes` 只覆盖本次构建之后写入的线程变更，升级前的历史消息不会补发（客户端先 `Thread/get`）。设备吊销已提供 `mail-cli revoke-device`。
 15. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。
 16. **Hub 正文拉取是串行且同步的**。一次 `Email/get` 请求内逐封拉取，未做并发限流；多封大邮件会让单次请求变慢。
 
@@ -325,7 +327,7 @@ cargo test --workspace
 
 按依赖顺序：
 
-1. ~~Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动）、SSE 推送、附件下载、上传与 `Email/import`、`Thread/get`~~（完成；APNs/FCM 仍缺凭据）
+1. ~~Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动/创建/销毁）、多副本移动、SSE 推送、附件下载、上传与 `Email/import`、`Thread/get|changes`~~（完成；APNs/FCM 仍缺凭据）
 2. 移动端薄客户端（依赖 Hub 推送与 APNs/FCM 凭据）
 3. 发信补齐：~~附件~~（完成；To/Cc/Bcc + multipart/mixed）、HTML 正文、草稿、Sent 去重（Gmail 会自动归档）
 4. ~~FTS 正文索引（`body_text`）~~（完成；中文 1–2 字仍走 LIKE，10 万封前需要分词方案）
