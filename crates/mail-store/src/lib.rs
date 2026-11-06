@@ -1,5 +1,6 @@
 //! Local store: accounts, mailboxes, messages, change log, full-text index.
 
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -34,7 +35,9 @@ pub enum StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
+/// Uploaded blobs not referenced by a message are dropped after one day.
+pub const UPLOAD_TTL_SECONDS: i64 = 24 * 60 * 60;
 /// Trash retention when the user never chose one (three months).
 pub const DEFAULT_TRASH_RETENTION_DAYS: u32 = 90;
 /// Upper bound for retention; ten years is already effectively "keep forever".
@@ -181,6 +184,9 @@ pub struct Device {
 pub struct NewMessage {
     pub uid: i64,
     pub message_id: Option<String>,
+    /// `In-Reply-To` of this message, used to build threads. Kept in the
+    /// server's own form (usually angle brackets included), like `message_id`.
+    pub in_reply_to: Option<String>,
     pub subject: Option<String>,
     pub from: Vec<String>,
     pub to: Vec<String>,
@@ -368,6 +374,21 @@ pub struct BlobData {
     pub attachment: bool,
 }
 
+/// Bytes uploaded through the Hub and not yet part of a stored message.
+#[derive(Debug, Clone)]
+pub struct UploadedBlob {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub size: i64,
+}
+
+/// One conversation: every live message sharing a thread id, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadInfo {
+    pub id: String,
+    pub email_ids: Vec<i64>,
+}
+
 /// Body alternative to cache; `data` is the decoded UTF-8 payload.
 pub struct BodyPartInput<'a> {
     pub part: &'a str,
@@ -480,6 +501,15 @@ impl Store {
         if !has_column(&conn, "messages", "body_text")? {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN body_text TEXT;")?;
         }
+        if !has_column(&conn, "messages", "in_reply_to")? {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN in_reply_to TEXT;")?;
+        }
+        // The index needs the column, so it cannot live in SCHEMA: that batch
+        // runs before the ALTER on database files created by older versions.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS messages_account_in_reply_to
+               ON messages (account_id, in_reply_to);",
+        )?;
         conn.execute_batch(FTS_SCHEMA)?;
         if !has_column(&conn, "message_fts", "body_text")? {
             rebuild_fts(&mut conn)?;
@@ -1911,7 +1941,20 @@ impl Store {
                         |row| row.get(0),
                     )
                     .optional()?;
-                (part, None, false)
+                let content_type = match part {
+                    Some(content_type) => Some(content_type),
+                    // Uploaded bytes are downloadable before any message uses
+                    // them, which is how a client checks what it sent.
+                    None => conn
+                        .query_row(
+                            "SELECT content_type FROM uploads
+                             WHERE account_id = ?1 AND hash = ?2",
+                            params![account_id, hash],
+                            |row| row.get(0),
+                        )
+                        .optional()?,
+                };
+                (content_type, None, false)
             }
         };
         if content_type.is_none() {
@@ -1928,6 +1971,180 @@ impl Store {
             filename,
             attachment,
         }))
+    }
+
+    /// Keeps uploaded bytes for a client to reference by `blobId`. The id is
+    /// the SHA-256 of the content; the `uploads` row scopes it to one account
+    /// and holds the lifetime. Bytes uploaded earlier and left unused are
+    /// dropped after [`UPLOAD_TTL_SECONDS`].
+    pub fn store_upload(
+        &self,
+        account_id: i64,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let now = Utc::now().timestamp();
+        purge_stale_uploads(&tx, now)?;
+
+        let hash = hash_bytes(bytes);
+        let existed = tx
+            .query_row(
+                "SELECT 1 FROM uploads WHERE account_id = ?1 AND hash = ?2",
+                params![account_id, &hash],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if existed {
+            tx.execute(
+                "UPDATE uploads SET content_type = ?3, size = ?4, created_at = ?5
+                 WHERE account_id = ?1 AND hash = ?2",
+                params![account_id, &hash, content_type, bytes.len() as i64, now],
+            )?;
+        } else {
+            // One reference per upload row; releasing it on expiry must not
+            // touch references held by message parts.
+            store_blob(&tx, &hash, bytes)?;
+            tx.execute(
+                "INSERT INTO uploads (account_id, hash, content_type, size, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![account_id, &hash, content_type, bytes.len() as i64, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(hex_encode(&hash))
+    }
+
+    /// Drops uploads older than [`UPLOAD_TTL_SECONDS`] and returns how many
+    /// rows were removed. Bytes a stored message references stay readable.
+    pub fn purge_expired_uploads(&self, now: i64) -> Result<usize> {
+        let mut conn = self.conn.lock().expect("poisoned");
+        let tx = conn.transaction()?;
+        let removed = purge_stale_uploads(&tx, now)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Uploaded bytes of one account, for `Email/import`.
+    pub fn upload_for_account(
+        &self,
+        account_id: i64,
+        blob_id: &str,
+    ) -> Result<Option<UploadedBlob>> {
+        let Some(hash) = hex_decode(blob_id) else {
+            return Ok(None);
+        };
+        let conn = self.conn.lock().expect("poisoned");
+        let meta: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT content_type, size FROM uploads WHERE account_id = ?1 AND hash = ?2",
+                params![account_id, hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((content_type, size)) = meta else {
+            return Ok(None);
+        };
+        let bytes: Option<Vec<u8>> = conn
+            .query_row("SELECT data FROM blobs WHERE hash = ?1", [&hash], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(bytes.map(|bytes| UploadedBlob {
+            bytes,
+            content_type,
+            size,
+        }))
+    }
+
+    /// Threads named by `ids`. Rows stored before threading existed have no
+    /// thread id; they are reported as `t<id>`, the same fallback the Hub's
+    /// `Email` objects use.
+    pub fn threads(&self, account_id: i64, ids: &[String]) -> Result<Vec<ThreadInfo>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().expect("poisoned");
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 1);
+        args.push(rusqlite::types::Value::Integer(account_id));
+        args.extend(ids.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(m.thread_id, 't' || m.id), m.id, COALESCE(m.sent_at, 0)
+             FROM messages m
+             WHERE m.account_id = ?1
+               AND COALESCE(m.thread_id, 't' || m.id) IN ({placeholders})
+               AND EXISTS (
+                   SELECT 1 FROM message_locations l
+                   JOIN mailboxes b ON b.id = l.mailbox_id
+                   WHERE l.message_id = m.id AND b.missing_at IS NULL)
+             ORDER BY COALESCE(m.sent_at, 0), m.id"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut collected = Vec::new();
+        for row in rows {
+            collected.push(row?);
+        }
+        Ok(group_threads(collected, None))
+    }
+
+    /// Every live thread of an account, most recently active first.
+    pub fn list_threads(&self, account_id: i64, limit: i64) -> Result<Vec<ThreadInfo>> {
+        let conn = self.conn.lock().expect("poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(m.thread_id, 't' || m.id), m.id, COALESCE(m.sent_at, 0)
+             FROM messages m
+             WHERE m.account_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM message_locations l
+                   JOIN mailboxes b ON b.id = l.mailbox_id
+                   WHERE l.message_id = m.id AND b.missing_at IS NULL)
+             ORDER BY COALESCE(m.sent_at, 0), m.id",
+        )?;
+        let rows = stmt.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut collected = Vec::new();
+        for row in rows {
+            collected.push(row?);
+        }
+        Ok(group_threads(collected, Some(limit)))
+    }
+
+    /// Message row carrying one account-wide `Message-ID`, if stored.
+    pub fn message_by_message_id(&self, account_id: i64, message_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT id FROM messages WHERE account_id = ?1 AND message_id = ?2",
+                params![account_id, message_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Message row occupying one `(mailbox, uid)` slot, if any.
+    pub fn message_at(&self, mailbox_id: i64, uid: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().expect("poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT message_id FROM message_locations WHERE mailbox_id = ?1 AND uid = ?2",
+                params![mailbox_id, uid],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn local_uids(&self, mailbox_id: i64) -> Result<std::collections::HashSet<i64>> {
@@ -2162,40 +2379,70 @@ fn upsert_message(
         )
         .optional()?
     };
+    let in_reply_to = msg
+        .in_reply_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-    let message_row =
-        match existing {
-            Some(id) => {
-                tx.execute(
+    let message_row = match existing {
+        Some(id) => {
+            let thread_id =
+                thread_for_message(tx, account_id, msg.message_id.as_deref(), in_reply_to, id)?;
+            tx.execute(
                 "UPDATE messages SET subject = COALESCE(?2, subject), from_json = ?3, to_json = ?4,
                         sent_at = COALESCE(?5, sent_at), size = COALESCE(?6, size),
-                        snippet = COALESCE(?7, snippet)
+                        snippet = COALESCE(?7, snippet),
+                        in_reply_to = COALESCE(in_reply_to, ?8),
+                        thread_id = COALESCE(thread_id, ?9)
                  WHERE id = ?1",
-                params![id, msg.subject, from_json, to_json, msg.sent_at, msg.size, msg.snippet],
+                params![
+                    id,
+                    msg.subject,
+                    from_json,
+                    to_json,
+                    msg.sent_at,
+                    msg.size,
+                    msg.snippet,
+                    in_reply_to,
+                    thread_id
+                ],
             )?;
-                id
+            id
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO messages (account_id, message_id, in_reply_to, subject, from_json,
+                        to_json, sent_at, size, snippet)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    account_id,
+                    msg.message_id,
+                    in_reply_to,
+                    msg.subject,
+                    from_json,
+                    to_json,
+                    msg.sent_at,
+                    msg.size,
+                    msg.snippet
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            let thread_id =
+                thread_for_message(tx, account_id, msg.message_id.as_deref(), in_reply_to, id)?;
+            tx.execute(
+                "UPDATE messages SET thread_id = ?2 WHERE id = ?1",
+                params![id, thread_id],
+            )?;
+            // A reply can arrive before the message it answers; when the
+            // parent shows up, fold the waiting subtree into its thread.
+            if let Some(mid) = msg.message_id.as_deref() {
+                adopt_descendants(tx, account_id, mid, &thread_id)?;
             }
-            None => {
-                tx.execute(
-                    "INSERT INTO messages (account_id, message_id, subject, from_json, to_json,
-                        sent_at, size, snippet)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        account_id,
-                        msg.message_id,
-                        msg.subject,
-                        from_json,
-                        to_json,
-                        msg.sent_at,
-                        msg.size,
-                        msg.snippet
-                    ],
-                )?;
-                let id = tx.last_insert_rowid();
-                rewrite_fts(tx, id)?;
-                id
-            }
-        };
+            rewrite_fts(tx, id)?;
+            id
+        }
+    };
 
     tx.execute(
         "INSERT INTO message_locations (message_id, mailbox_id, uid, flags)
@@ -2216,6 +2463,63 @@ fn upsert_message(
         },
     )?;
     Ok(usize::from(existing.is_none()))
+}
+
+/// Thread a message belongs to: the thread of the message it replies to when
+/// that message is already stored, otherwise a thread rooted at its own
+/// `Message-ID`. Messages without a `Message-ID` get a local-only id.
+fn thread_for_message(
+    tx: &Transaction<'_>,
+    account_id: i64,
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    row_id: i64,
+) -> Result<String> {
+    if let Some(parent) = in_reply_to {
+        // `message_id` is stored in whatever form the protocol produced:
+        // IMAP keeps the angle brackets, POP3 strips them.
+        for candidate in [parent.to_string(), format!("<{parent}>")] {
+            let found: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT thread_id FROM messages
+                     WHERE account_id = ?1 AND message_id = ?2 LIMIT 1",
+                    params![account_id, candidate],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(thread) = found {
+                // A row stored before threading existed has no thread id; its
+                // own Message-ID is the thread it names.
+                return Ok(thread.unwrap_or(candidate));
+            }
+        }
+    }
+    let message_id = message_id.map(str::trim).filter(|value| !value.is_empty());
+    Ok(message_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("t{row_id}")))
+}
+
+/// Re-threads already stored replies once their parent arrives out of order.
+fn adopt_descendants(
+    tx: &Transaction<'_>,
+    account_id: i64,
+    parent: &str,
+    thread_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "WITH RECURSIVE subtree(id, message_id) AS (
+             SELECT id, message_id FROM messages
+             WHERE account_id = ?1 AND (in_reply_to = ?2 OR in_reply_to = ?3)
+             UNION
+             SELECT m.id, m.message_id FROM messages m
+             JOIN subtree s ON m.in_reply_to = s.message_id
+             WHERE m.account_id = ?1 AND s.message_id IS NOT NULL
+         )
+         UPDATE messages SET thread_id = ?4 WHERE id IN (SELECT id FROM subtree)",
+        params![account_id, parent, format!("<{parent}>"), thread_id],
+    )?;
+    Ok(())
 }
 
 /// One message as the full-text index needs it: subject, address JSON, snippet
@@ -2403,6 +2707,69 @@ fn release_blob(tx: &Transaction<'_>, hash: &[u8]) -> Result<()> {
         [hash],
     )?;
     Ok(())
+}
+
+/// Drops uploads older than [`UPLOAD_TTL_SECONDS`], releasing the blob
+/// reference each row held. Uploads that a message already references keep
+/// their bytes through the message part.
+fn purge_stale_uploads(tx: &Transaction<'_>, now: i64) -> Result<usize> {
+    let cutoff = now - UPLOAD_TTL_SECONDS;
+    let hashes: Vec<Vec<u8>> = {
+        let mut stmt = tx.prepare("SELECT hash FROM uploads WHERE created_at < ?1")?;
+        let rows = stmt.query_map([cutoff], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    tx.execute("DELETE FROM uploads WHERE created_at < ?1", [cutoff])?;
+    let removed = hashes.len();
+    for hash in hashes {
+        release_blob(tx, &hash)?;
+    }
+    Ok(removed)
+}
+
+/// Groups `(thread id, message id, sent_at)` rows into threads. Rows arrive in
+/// `sent_at` order, so each thread's emails stay oldest first; with `limit`
+/// the most recently active threads come first.
+fn group_threads(rows: Vec<(String, i64, i64)>, limit: Option<i64>) -> Vec<ThreadInfo> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, (i64, Vec<i64>)> = HashMap::new();
+    for (thread, email, sent_at) in rows {
+        let entry = groups.entry(thread.clone()).or_insert_with(|| {
+            order.push(thread);
+            (sent_at, Vec::new())
+        });
+        entry.0 = entry.0.max(sent_at);
+        entry.1.push(email);
+    }
+    let mut latest = Vec::with_capacity(order.len());
+    let mut threads = Vec::with_capacity(order.len());
+    for id in order {
+        let (last, emails) = groups.remove(&id).unwrap_or((0, Vec::new()));
+        latest.push(last);
+        threads.push(ThreadInfo {
+            id,
+            email_ids: emails,
+        });
+    }
+    match limit {
+        Some(limit) => {
+            let mut ranked: Vec<usize> = (0..threads.len()).collect();
+            ranked.sort_by(|left, right| {
+                latest[*right]
+                    .cmp(&latest[*left])
+                    .then_with(|| threads[*left].id.cmp(&threads[*right].id))
+            });
+            ranked
+                .into_iter()
+                .take(limit as usize)
+                .map(|index| threads[index].clone())
+                .collect()
+        }
+        None => threads,
+    }
 }
 
 /// Deletes messages no mailbox references any more, releasing their blobs and
@@ -2630,6 +2997,7 @@ CREATE TABLE IF NOT EXISTS messages (
   account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   message_id  TEXT,
   thread_id   TEXT,
+  in_reply_to TEXT,
   subject     TEXT,
   from_json   TEXT NOT NULL DEFAULT '[]',
   to_json     TEXT NOT NULL DEFAULT '[]',
@@ -2711,6 +3079,16 @@ CREATE TABLE IF NOT EXISTS attachments (
   blob_hash    BLOB,
   PRIMARY KEY (message_id, part)
 );
+
+-- Blobs uploaded through the Hub (/upload) before a message references them.
+CREATE TABLE IF NOT EXISTS uploads (
+  account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  hash         BLOB NOT NULL,
+  content_type TEXT NOT NULL,
+  size         INTEGER NOT NULL,
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY (account_id, hash)
+);
 "#;
 
 /// FTS5 cannot add a column, so the body index is a separate statement that
@@ -2756,6 +3134,98 @@ mod migration_tests {
         ))
     }
 
+    /// A database written before threading and uploads (v7) must gain the
+    /// column, the index and the uploads table without losing its messages.
+    #[test]
+    fn threading_and_uploads_upgrade_an_existing_database() {
+        let path = temp_path("migrate-v8");
+        let key = DbKey::from_bytes(&[4u8; 32]).expect("key");
+        let (account, inbox) = {
+            let store = Store::open(&path, &key).expect("store");
+            let account = store
+                .create_account(
+                    "imap",
+                    "v7@example.com",
+                    None,
+                    "account:v7@example.com",
+                    &serde_json::json!({}),
+                )
+                .expect("account");
+            let inbox = store
+                .ensure_mailbox(account, "INBOX", Some("inbox"))
+                .expect("mailbox")
+                .id;
+            {
+                let conn = store.conn.lock().expect("poisoned");
+                conn.execute_batch(
+                    "DROP INDEX IF EXISTS messages_account_in_reply_to;
+                     ALTER TABLE messages DROP COLUMN in_reply_to;
+                     DROP TABLE uploads;
+                     PRAGMA user_version = 7;",
+                )
+                .expect("downgrade");
+            }
+            (account, inbox)
+        };
+
+        let store = Store::open(&path, &key).expect("reopen");
+        {
+            let conn = store.conn.lock().expect("poisoned");
+            let version: i64 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+
+        let reply = NewMessage {
+            uid: 2,
+            message_id: Some("<reply@example.com>".to_string()),
+            in_reply_to: Some("<root@example.com>".to_string()),
+            subject: Some("re".to_string()),
+            from: vec!["a@example.com".to_string()],
+            to: vec!["v7@example.com".to_string()],
+            sent_at: Some(2),
+            size: Some(10),
+            flags: vec![],
+            snippet: None,
+        };
+        store
+            .apply_fetch(
+                account,
+                inbox,
+                &[NewMessage {
+                    uid: 1,
+                    message_id: Some("<root@example.com>".to_string()),
+                    in_reply_to: None,
+                    subject: Some("root".to_string()),
+                    from: vec!["a@example.com".to_string()],
+                    to: vec!["v7@example.com".to_string()],
+                    sent_at: Some(1),
+                    size: Some(10),
+                    flags: vec![],
+                    snippet: None,
+                }],
+                &[],
+            )
+            .expect("root");
+        store
+            .apply_fetch(account, inbox, std::slice::from_ref(&reply), &[])
+            .expect("reply");
+        let threads = store
+            .threads(account, &["<root@example.com>".to_string()])
+            .expect("threads");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].email_ids.len(), 2);
+
+        let blob_id = store
+            .store_upload(account, "message/rfc822", b"Subject: x\r\n\r\n")
+            .expect("upload");
+        assert!(store
+            .upload_for_account(account, &blob_id)
+            .unwrap()
+            .is_some());
+    }
+
     /// Rolls a fresh database back to the pre-body-index shape: four-column
     /// FTS table, no `body_text`, and one message whose body sits in the blob
     /// cache but not in the index.
@@ -2784,6 +3254,7 @@ mod migration_tests {
                     &[NewMessage {
                         uid: 1,
                         message_id: Some("<m1@example.com>".to_string()),
+                        in_reply_to: None,
                         subject: Some("legacy subject".to_string()),
                         from: vec!["a@example.com".to_string()],
                         to: vec!["m@example.com".to_string()],

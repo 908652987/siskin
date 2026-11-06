@@ -44,6 +44,7 @@ impl Pop3SyncEngine {
             messages.push(NewMessage {
                 uid,
                 message_id: parsed.message_id,
+                in_reply_to: parsed.in_reply_to,
                 subject: parsed.subject,
                 from: parsed.from,
                 to: parsed.to,
@@ -91,6 +92,7 @@ struct Headers {
     from: Vec<String>,
     to: Vec<String>,
     message_id: Option<String>,
+    in_reply_to: Option<String>,
     sent_at: Option<i64>,
 }
 
@@ -127,6 +129,9 @@ fn parse_headers(raw: &str) -> Headers {
             "to" => push_address(&mut headers.to, &value),
             "message-id" => {
                 headers.message_id = Some(value.trim_matches(['<', '>']).to_string());
+            }
+            "in-reply-to" => {
+                headers.in_reply_to = Some(value.trim_matches(['<', '>']).to_string());
             }
             "date" => headers.sent_at = parse_date(&value),
             _ => {}

@@ -300,6 +300,7 @@ fn to_new_message(msg: &FetchedMessage) -> NewMessage {
     NewMessage {
         uid: i64::from(msg.uid),
         message_id: msg.message_id.clone(),
+        in_reply_to: msg.in_reply_to.clone(),
         subject: msg.subject.as_deref().map(mail_parse::decode_encoded_words),
         from: msg
             .from
@@ -397,6 +398,7 @@ mod tests {
             flags: flags.iter().map(|f| f.to_string()).collect(),
             subject: subject.map(str::to_string),
             message_id: Some(format!("<{uid}@test>")),
+            in_reply_to: None,
             from: vec!["a@test".into()],
             to: vec!["b@test".into()],
             sent_at: Some(1_700_000_000 + uid as i64),

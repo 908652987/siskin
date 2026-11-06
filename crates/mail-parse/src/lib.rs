@@ -247,6 +247,14 @@ pub fn snippet(text: &str) -> String {
     out
 }
 
+/// Value of one header from a complete RFC 5322 message, with continuation
+/// lines folded into a single line. Header names are case-insensitive.
+pub fn raw_header_value(raw: &[u8], name: &str) -> Option<String> {
+    let (headers, _) = split_headers_body(raw);
+    let parsed = parse_headers(headers);
+    header(&parsed, &name.trim().to_ascii_lowercase()).map(str::to_string)
+}
+
 /// Parse a complete RFC 822 message (used for POP3, where no BODYSTRUCTURE
 /// exists).
 ///

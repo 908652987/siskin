@@ -178,7 +178,8 @@ CREATE TABLE messages (
   id            INTEGER PRIMARY KEY,
   account_id    INTEGER NOT NULL,
   message_id    TEXT,                   -- RFC 5322 Message-ID
-  thread_id     TEXT,
+  thread_id     TEXT,                   -- 线程根：父邮件的 thread_id，否则自身 Message-ID
+  in_reply_to   TEXT,                   -- RFC 5322 In-Reply-To，入线程时使用
   subject       TEXT,
   from_json     TEXT NOT NULL,
   to_json       TEXT NOT NULL,
@@ -217,6 +218,16 @@ CREATE TABLE message_parts (
   is_html      INTEGER NOT NULL DEFAULT 0,
   blob_hash    BLOB,
   PRIMARY KEY (message_id, part)
+);
+
+-- Hub 上传但尚未被消息引用的字节；一天未使用即回收
+CREATE TABLE uploads (
+  account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  hash         BLOB NOT NULL,           -- 指向 blobs.hash
+  content_type TEXT NOT NULL,
+  size         INTEGER NOT NULL,
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY (account_id, hash)
 );
 
 -- 附件元数据；blob_hash 为空表示尚未按需下载
@@ -396,13 +407,14 @@ CREATE VIRTUAL TABLE message_fts USING fts5(
 | POST | `/jmap` | JMAP 请求体：`{using, methodCalls}` |
 | POST | `/pair` | 用配对码换取设备令牌（只返回一次） |
 | GET | `/eventsource/` | SSE 状态变更（`types`、`closeafter`、`ping`） |
-| POST | `/upload/{accountId}/` | 附件上传（未实现，返回 501） |
+| POST | `/upload/{accountId}` | 上传字节（`message/rfc822` 等），返回内容寻址 `blobId`；24 h 未引用即回收 |
 | GET | `/download/{accountId}/{blobId}/{name}` | 正文/附件下载（blobId 为缓存散列 hex） |
 
 已实现的 method：`Mailbox/get`、`Mailbox/changes`、`Email/query`、`Email/get`、
-`Email/changes`、`Email/set`（仅更新 `keywords` 与 `mailboxIds`）；
-其余（`Email/import`、`Thread/get`、`Core/echo`、日历与身份）返回
-`unknownMethod`。`Email/set` 的 `create`/`destroy` 按对象返回 `notSupported`。
+`Email/changes`、`Email/set`（仅更新 `keywords` 与 `mailboxIds`）、
+`Email/import`、`Thread/get`；
+其余（`Core/echo`、日历与身份）返回 `unknownMethod`。
+`Email/set` 的 `create`/`destroy` 按对象返回 `notSupported`。
 客户端不在支持范围内的筛选/排序条件返回 `unsupportedFilter` /
 `unsupportedSort`，不做静默忽略。
 

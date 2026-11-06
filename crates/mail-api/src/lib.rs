@@ -2,10 +2,11 @@
 //!
 //! Transport-agnostic: the Hub owns HTTP, authentication and network access.
 //! Implemented methods are `Mailbox/get`, `Mailbox/changes`, `Email/query`,
-//! `Email/get`, `Email/changes` and `Email/set`; everything else returns a JMAP
-//! `unknownMethod` error. Bodies are read from the store and fetched through
-//! [`BodySource`]; writes go through [`WriteSink`] so this crate keeps the
-//! `mail-api -> mail-store` dependency edge.
+//! `Email/get`, `Email/changes`, `Email/set`, `Email/import` and `Thread/get`;
+//! everything else returns a JMAP `unknownMethod` error. Bodies are read from
+//! the store and fetched through [`BodySource`]; writes go through
+//! [`WriteSink`] so this crate keeps the `mail-api -> mail-store` dependency
+//! edge.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -29,6 +30,8 @@ pub const MAX_OBJECTS_IN_GET: usize = 256;
 pub const MAX_OBJECTS_IN_SET: usize = 64;
 pub const MAX_MESSAGES_PER_QUERY: i64 = 1_000;
 pub const MAX_CHANGES: i64 = 1_000;
+/// Largest blob a client may upload; also advertised as `maxSizeUpload`.
+pub const MAX_UPLOAD_BYTES: i64 = 50 * 1024 * 1024;
 
 /// Keywords the store can round-trip to IMAP flags.
 pub const SUPPORTED_KEYWORDS: [&str; 5] =
@@ -139,6 +142,16 @@ pub trait WriteSink: Send + Sync {
         message_id: i64,
         mailbox_id: i64,
     ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>>;
+
+    /// Files raw RFC 5322 bytes into `mailbox_id` and returns the new message
+    /// id. The sink owns the server round trip: this crate never sees IMAP.
+    fn import_message<'a>(
+        &'a self,
+        account_id: i64,
+        mailbox_id: i64,
+        raw: Vec<u8>,
+        keywords: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>>;
 }
 
 pub struct Jmap {
@@ -196,8 +209,8 @@ impl Jmap {
         Ok(json!({
             "capabilities": {
                 CORE_CAPABILITY: {
-                    "maxSizeUpload": 0,
-                    "maxConcurrentUpload": 0,
+                    "maxSizeUpload": MAX_UPLOAD_BYTES,
+                    "maxConcurrentUpload": if self.writes.is_some() { 4 } else { 0 },
                     "maxSizeRequest": 10_000_000,
                     "maxConcurrentRequests": 4,
                     "maxCallsInRequest": MAX_CALLS_IN_REQUEST,
@@ -283,6 +296,8 @@ impl Jmap {
             "Email/get" => self.email_get(args).await,
             "Email/changes" => self.changes(args, "message"),
             "Email/set" => self.email_set(args).await,
+            "Email/import" => self.email_import(args).await,
+            "Thread/get" => self.thread_get(args),
             other => Err(ApiError::UnknownMethod(other.to_string())),
         }
     }
@@ -625,6 +640,193 @@ impl Jmap {
         }))
     }
 
+    /// `Email/import` files bytes a client uploaded earlier. The server round
+    /// trip lives in the sink; per-object failures stay in `notCreated`.
+    async fn email_import(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let old_state = self.store.latest_change_seq(account_id)?.to_string();
+        if let Some(value) = args.get("ifInState") {
+            if !value.is_null() && value.as_str() != Some(old_state.as_str()) {
+                return Err(ApiError::StateMismatch);
+            }
+        }
+        let emails = optional_object(args, "emails")?.ok_or(ApiError::InvalidArguments)?;
+        if emails.len() > MAX_OBJECTS_IN_SET {
+            return Err(ApiError::InvalidArguments);
+        }
+
+        let mut created = Map::new();
+        let mut not_created = Map::new();
+        let sink = match self.writes.as_ref() {
+            Some(sink) => sink,
+            None => {
+                for creation_id in emails.keys() {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({"type": "notSupported", "description": "writing is disabled"}),
+                    );
+                }
+                return Ok(json!({
+                    "accountId": account_id.to_string(),
+                    "oldState": old_state,
+                    "newState": old_state,
+                    "created": created,
+                    "notCreated": not_created,
+                }));
+            }
+        };
+
+        let mut order: Vec<&String> = emails.keys().collect();
+        order.sort();
+        for creation_id in order {
+            let object = emails[creation_id.as_str()]
+                .as_object()
+                .ok_or(ApiError::InvalidArguments)?;
+            let blob_id = match object.get("blobId").and_then(Value::as_str) {
+                Some(blob_id) => blob_id,
+                None => {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({"type": "invalidProperties", "description": "blobId is required"}),
+                    );
+                    continue;
+                }
+            };
+            let upload = match self.store.upload_for_account(account_id, blob_id) {
+                Ok(Some(upload)) => upload,
+                Ok(None) => {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({
+                            "type": "blobNotFound",
+                            "description": format!("blob {blob_id} is not an upload of this account"),
+                        }),
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    not_created.insert(
+                        creation_id.clone(),
+                        write_error_object(&WriteError::Server(err.to_string())),
+                    );
+                    continue;
+                }
+            };
+            if upload.size > MAX_UPLOAD_BYTES {
+                not_created.insert(
+                    creation_id.clone(),
+                    json!({"type": "tooLarge", "description": "upload exceeds maxSizeUpload"}),
+                );
+                continue;
+            }
+            let mailbox_id = match import_mailbox(object.get("mailboxIds")) {
+                Ok(mailbox_id) => mailbox_id,
+                Err(err) => {
+                    not_created.insert(creation_id.clone(), write_error_object(&err));
+                    continue;
+                }
+            };
+            let keywords = match import_keywords(object.get("keywords")) {
+                Ok(keywords) => keywords,
+                Err(err) => {
+                    not_created.insert(creation_id.clone(), write_error_object(&err));
+                    continue;
+                }
+            };
+            match sink
+                .import_message(account_id, mailbox_id, upload.bytes, keywords)
+                .await
+            {
+                Ok(message_id) => {
+                    created.insert(
+                        creation_id.clone(),
+                        json!({
+                            "id": message_id.to_string(),
+                            "blobId": blob_id,
+                            "threadId": self.thread_id_of(account_id, message_id)?,
+                            "size": upload.size,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    not_created.insert(creation_id.clone(), write_error_object(&err));
+                }
+            }
+        }
+
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "oldState": old_state,
+            "newState": self.store.latest_change_seq(account_id)?.to_string(),
+            "created": created,
+            "notCreated": not_created,
+        }))
+    }
+
+    /// `Thread/get` over the threads the store assigned while syncing.
+    fn thread_get(&self, args: &Map<String, Value>) -> Result<Value, ApiError> {
+        let account_id = self.account_id(args)?;
+        let (threads, not_found) = match args.get("ids") {
+            None | Some(Value::Null) => (
+                self.store
+                    .list_threads(account_id, MAX_OBJECTS_IN_GET as i64)?,
+                Vec::new(),
+            ),
+            Some(Value::Array(ids)) => {
+                if ids.len() > MAX_OBJECTS_IN_GET {
+                    return Err(ApiError::InvalidArguments);
+                }
+                let mut wanted = Vec::with_capacity(ids.len());
+                for id in ids {
+                    wanted.push(id.as_str().ok_or(ApiError::InvalidArguments)?.to_string());
+                }
+                let found = self.store.threads(account_id, &wanted)?;
+                let seen: HashSet<&str> = found.iter().map(|thread| thread.id.as_str()).collect();
+                let not_found = wanted
+                    .iter()
+                    .filter(|id| !seen.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                (found, not_found)
+            }
+            Some(_) => return Err(ApiError::InvalidArguments),
+        };
+        let list: Vec<Value> = threads
+            .iter()
+            .map(|thread| {
+                json!({
+                    "id": thread.id,
+                    "emailIds": thread
+                        .email_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "accountId": account_id.to_string(),
+            "state": self.store.latest_change_seq(account_id)?.to_string(),
+            "list": list,
+            "notFound": not_found,
+        }))
+    }
+
+    fn thread_id_of(&self, account_id: i64, message_id: i64) -> Result<Value, ApiError> {
+        let found = self
+            .store
+            .messages_with_locations(account_id, &[message_id])?;
+        Ok(found
+            .first()
+            .map(|message| {
+                json!(message
+                    .thread_id
+                    .clone()
+                    .unwrap_or_else(|| format!("t{}", message.id)))
+            })
+            .unwrap_or(Value::Null))
+    }
+
     async fn email_update(
         &self,
         account_id: i64,
@@ -909,6 +1111,62 @@ fn optional_array<'a>(
         Some(Value::Array(values)) => Ok(Some(values)),
         _ => Err(ApiError::InvalidArguments),
     }
+}
+
+/// `mailboxIds` of one import: exactly one live mailbox, which is all the
+/// store can move a message into today.
+fn import_mailbox(value: Option<&Value>) -> Result<i64, WriteError> {
+    let map = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| WriteError::NotSupported("mailboxIds must be an object".to_string()))?;
+    let mut ids = Vec::new();
+    for (raw, present) in map {
+        if present.as_bool() == Some(true) {
+            ids.push(
+                raw.parse::<i64>()
+                    .map_err(|_| WriteError::NotSupported(format!("bad mailbox id {raw}")))?,
+            );
+        }
+    }
+    match ids.as_slice() {
+        [id] => Ok(*id),
+        [] => Err(WriteError::NotSupported(
+            "mailboxIds must name one mailbox".to_string(),
+        )),
+        _ => Err(WriteError::NotSupported(
+            "importing into several mailboxes is not supported".to_string(),
+        )),
+    }
+}
+
+fn import_keywords(value: Option<&Value>) -> Result<Vec<String>, WriteError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let map = value
+        .as_object()
+        .ok_or_else(|| WriteError::NotSupported("keywords must be an object".to_string()))?;
+    let mut out = Vec::new();
+    for (keyword, present) in map {
+        match present.as_bool() {
+            Some(true) => {
+                if !SUPPORTED_KEYWORDS.contains(&keyword.as_str()) {
+                    return Err(WriteError::NotSupported(format!(
+                        "keyword {keyword} is not supported"
+                    )));
+                }
+                out.push(keyword.clone());
+            }
+            Some(false) => {}
+            None => {
+                return Err(WriteError::NotSupported(
+                    "keyword values must be booleans".to_string(),
+                ))
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn write_error_object(err: &WriteError) -> Value {

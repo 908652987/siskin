@@ -63,6 +63,8 @@ pub enum CoreError {
     UnknownKeyword(String),
     #[error("unknown mailbox: {0}")]
     MailboxNotFound(i64),
+    #[error("imported message could not be located in mailbox {0}")]
+    ImportNotLocated(String),
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;
@@ -1474,6 +1476,77 @@ impl Core {
             saved_to,
             save_error,
         })
+    }
+
+    /// Uploads raw RFC 5322 bytes into one mailbox with `APPEND`, then syncs
+    /// that mailbox so the new message gets a local row, and returns its id.
+    ///
+    /// POP3 cannot add messages, so imports need an IMAP account.
+    pub async fn import_message(
+        &self,
+        email: &str,
+        mailbox_id: i64,
+        raw: &[u8],
+        keywords: &[String],
+    ) -> Result<i64> {
+        let account = self.account(email)?;
+        let settings = settings_of(&account)?;
+        if settings.protocol != ReceiveProtocol::Imap {
+            return Err(CoreError::Unsupported("importing needs an IMAP account"));
+        }
+        let mailbox = self
+            .store
+            .mailbox_by_id(mailbox_id)?
+            .filter(|mailbox| mailbox.account_id == account.id && mailbox.missing_at.is_none())
+            .ok_or(CoreError::MailboxNotFound(mailbox_id))?;
+
+        let mut flags = Vec::with_capacity(keywords.len());
+        for keyword in keywords {
+            flags.push(keyword_flag(keyword)?);
+        }
+        let flags = flags.join(",");
+
+        let mut session = self.connect_imap(&account).await?;
+        let appended = session
+            .append(
+                &mailbox.remote_name,
+                (!flags.is_empty()).then_some(flags.as_str()),
+                raw,
+            )
+            .await;
+        if let Err(err) = appended {
+            session.logout().await;
+            return Err(err.into());
+        }
+
+        let before = self.store.local_uids(mailbox_id)?;
+        let engine = SyncEngine::new(Arc::clone(&self.store));
+        let synced = engine
+            .sync_mailbox(account.id, &mut session, &mailbox.remote_name)
+            .await;
+        session.logout().await;
+        synced?;
+        self.compact_account(account.id)?;
+
+        // The server assigns the UID, so identify the message by the id it
+        // carries; fall back to the single new UID when it has none.
+        if let Some(message_id) = mail_parse::raw_header_value(raw, "message-id") {
+            let trimmed = message_id.trim();
+            for candidate in [trimmed.to_string(), format!("<{trimmed}>")] {
+                if let Some(id) = self.store.message_by_message_id(account.id, &candidate)? {
+                    return Ok(id);
+                }
+            }
+        }
+        let after = self.store.local_uids(mailbox_id)?;
+        let mut new_uids: Vec<i64> = after.difference(&before).copied().collect();
+        new_uids.sort_unstable();
+        if let [uid] = new_uids[..] {
+            if let Some(id) = self.store.message_at(mailbox_id, uid)? {
+                return Ok(id);
+            }
+        }
+        Err(CoreError::ImportNotLocated(mailbox.remote_name))
     }
 
     fn password(&self, account: &Account) -> Result<String> {

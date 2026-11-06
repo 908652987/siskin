@@ -11,6 +11,7 @@ fn msg(uid: i64, message_id: &str) -> NewMessage {
     NewMessage {
         uid,
         message_id: Some(message_id.to_string()),
+        in_reply_to: None,
         subject: Some(format!("subject {message_id}")),
         from: vec!["Sender <sender@test>".to_string()],
         to: vec!["me@test".to_string()],

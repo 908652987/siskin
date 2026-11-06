@@ -546,6 +546,7 @@ mod tests {
         NewMessage {
             uid,
             message_id: Some(format!("<{uid}@example.com>")),
+            in_reply_to: None,
             subject: Some(subject.to_string()),
             from: vec!["Alice <alice@example.com>".to_string()],
             to: vec!["me@example.com".to_string()],

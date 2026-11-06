@@ -47,6 +47,7 @@ fn message(uid: i64, subject: &str) -> NewMessage {
     NewMessage {
         uid,
         message_id: Some(format!("<{uid}@example.com>")),
+        in_reply_to: None,
         subject: Some(subject.to_string()),
         from: vec!["Alice <alice@example.com>".to_string()],
         to: vec![ACCOUNT_EMAIL.to_string()],
@@ -445,7 +446,7 @@ async fn unsupported_inputs_fail_explicitly() {
     .await;
     assert_eq!(response[1]["type"], json!("unsupportedSort"));
 
-    let response = call(&jmap, "Thread/get", json!({"accountId": account})).await;
+    let response = call(&jmap, "Identity/get", json!({"accountId": account})).await;
     assert_eq!(response[1]["type"], json!("unknownMethod"));
 }
 
@@ -492,6 +493,16 @@ impl WriteSink for StoreWrites {
     ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn import_message<'a>(
+        &'a self,
+        _account_id: i64,
+        _mailbox_id: i64,
+        _raw: Vec<u8>,
+        _keywords: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
+        Box::pin(async { Err(WriteError::NotSupported("import is not wired here".into())) })
+    }
 }
 
 /// Records move calls without touching the store.
@@ -524,6 +535,16 @@ impl WriteSink for RecordingWrites {
                 .push((message_id, mailbox_id));
             Ok(())
         })
+    }
+
+    fn import_message<'a>(
+        &'a self,
+        _account_id: i64,
+        _mailbox_id: i64,
+        _raw: Vec<u8>,
+        _keywords: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
+        Box::pin(async { Err(WriteError::NotSupported("import is not wired here".into())) })
     }
 }
 
@@ -749,4 +770,300 @@ async fn email_get_exposes_blob_ids_for_cached_parts() {
         .unwrap()
         .expect("blob");
     assert_eq!(blob.bytes, b"hello body");
+}
+
+#[tokio::test]
+async fn thread_get_groups_replies_and_reports_missing_ids() {
+    let fixture = setup();
+    let mut reply = message(2, "re: hello");
+    reply.in_reply_to = Some("<1@example.com>".to_string());
+    fixture
+        .store
+        .apply_fetch(
+            fixture.account,
+            fixture.inbox,
+            &[message(1, "hello"), reply],
+            &[],
+        )
+        .expect("fetch");
+    let jmap = Jmap::new(Arc::clone(&fixture.store));
+
+    let ids: Vec<String> = fixture
+        .store
+        .list_messages(fixture.account, 10, 0)
+        .unwrap()
+        .into_iter()
+        .map(|message| message.id.to_string())
+        .collect();
+    let got = result(
+        &call(
+            &jmap,
+            "Email/get",
+            json!({"accountId": fixture.account.to_string(), "ids": ids, "properties": ["threadId"]}),
+        )
+        .await,
+    );
+    let first = got["list"][0]["threadId"].clone();
+    assert_eq!(first, json!("<1@example.com>"));
+    assert_eq!(got["list"][1]["threadId"], first);
+
+    let threads = result(
+        &call(
+            &jmap,
+            "Thread/get",
+            json!({"accountId": fixture.account.to_string(), "ids": ["<1@example.com>", "nope"]}),
+        )
+        .await,
+    );
+    assert_eq!(threads["list"].as_array().expect("list").len(), 1);
+    assert_eq!(threads["list"][0]["id"], json!("<1@example.com>"));
+    assert_eq!(
+        threads["list"][0]["emailIds"]
+            .as_array()
+            .expect("emailIds")
+            .len(),
+        2
+    );
+    assert_eq!(threads["notFound"], json!(["nope"]));
+
+    let all = result(
+        &call(
+            &jmap,
+            "Thread/get",
+            json!({"accountId": fixture.account.to_string()}),
+        )
+        .await,
+    );
+    assert_eq!(all["list"].as_array().expect("list").len(), 1);
+
+    let bad = call(
+        &jmap,
+        "Thread/get",
+        json!({"accountId": fixture.account.to_string(), "ids": "nope"}),
+    )
+    .await;
+    assert_eq!(bad[1]["type"], json!("invalidArguments"));
+}
+
+/// Files imported bytes into the store the way `mail-core` does after APPEND.
+struct ImportWrites {
+    store: Arc<Store>,
+    next_uid: AtomicUsize,
+}
+
+impl WriteSink for ImportWrites {
+    fn set_keywords<'a>(
+        &'a self,
+        _account_id: i64,
+        _message_id: i64,
+        _add: Vec<String>,
+        _remove: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn move_message<'a>(
+        &'a self,
+        _account_id: i64,
+        _message_id: i64,
+        _mailbox_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WriteError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn import_message<'a>(
+        &'a self,
+        account_id: i64,
+        mailbox_id: i64,
+        raw: Vec<u8>,
+        keywords: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let message_id = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Message-ID: "))
+                .map(|value| value.trim().to_string());
+            let uid = self.next_uid.fetch_add(1, Ordering::SeqCst) as i64 + 1;
+            let flags = keywords
+                .iter()
+                .map(|keyword| match keyword.as_str() {
+                    "$seen" => "\\Seen".to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            self.store
+                .apply_fetch(
+                    account_id,
+                    mailbox_id,
+                    &[NewMessage {
+                        uid,
+                        message_id,
+                        in_reply_to: None,
+                        subject: Some("imported".to_string()),
+                        from: vec!["Bob <bob@example.com>".to_string()],
+                        to: vec![ACCOUNT_EMAIL.to_string()],
+                        sent_at: Some(1_700_100_000),
+                        size: Some(raw.len() as i64),
+                        flags,
+                        snippet: Some("imported".to_string()),
+                    }],
+                    &[],
+                )
+                .map_err(|err| WriteError::Server(err.to_string()))?;
+            self.store
+                .message_at(mailbox_id, uid)
+                .map_err(|err| WriteError::Server(err.to_string()))?
+                .ok_or_else(|| WriteError::Server("imported message vanished".to_string()))
+        })
+    }
+}
+
+fn writing_jmap(fixture: &Fixture) -> Jmap {
+    Jmap::new(Arc::clone(&fixture.store)).with_writes(Arc::new(ImportWrites {
+        store: Arc::clone(&fixture.store),
+        next_uid: AtomicUsize::new(0),
+    }))
+}
+
+#[tokio::test]
+async fn email_import_files_an_uploaded_message() {
+    let fixture = setup();
+    let raw = b"Message-ID: <import@example.com>\r\nSubject: imported\r\n\r\nbody";
+    let blob_id = fixture
+        .store
+        .store_upload(fixture.account, "message/rfc822", raw)
+        .expect("upload");
+    let jmap = writing_jmap(&fixture);
+
+    let response = result(
+        &call(
+            &jmap,
+            "Email/import",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "emails": {
+                    "k1": {
+                        "blobId": blob_id,
+                        "mailboxIds": { fixture.inbox.to_string(): true },
+                        "keywords": {"$seen": true},
+                    }
+                },
+            }),
+        )
+        .await,
+    );
+    assert!(response["notCreated"]
+        .as_object()
+        .expect("notCreated")
+        .is_empty());
+    let created = response["created"]["k1"].clone();
+    let id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(created["threadId"], json!("<import@example.com>"));
+
+    let stored = fixture
+        .store
+        .messages_with_locations(fixture.account, &[id.parse().unwrap()])
+        .expect("lookup");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].locations[0].mailbox_id, fixture.inbox);
+    assert_eq!(stored[0].locations[0].flags, vec!["\\Seen".to_string()]);
+    assert_eq!(
+        response["newState"].as_str().unwrap(),
+        fixture
+            .store
+            .latest_change_seq(fixture.account)
+            .unwrap()
+            .to_string()
+    );
+}
+
+#[tokio::test]
+async fn email_import_rejects_unknown_blobs_and_bad_mailboxes() {
+    let fixture = setup();
+    let raw = b"Subject: imported\r\n\r\nbody";
+    let blob_id = fixture
+        .store
+        .store_upload(fixture.account, "message/rfc822", raw)
+        .expect("upload");
+    let jmap = writing_jmap(&fixture);
+
+    let response = result(
+        &call(
+            &jmap,
+            "Email/import",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "emails": {
+                    "missing": {
+                        "blobId": "0".repeat(64),
+                        "mailboxIds": { fixture.inbox.to_string(): true },
+                    },
+                    "two": {
+                        "blobId": blob_id,
+                        "mailboxIds": {
+                            fixture.inbox.to_string(): true,
+                            fixture.sent.to_string(): true,
+                        },
+                    },
+                    "custom": {
+                        "blobId": blob_id,
+                        "mailboxIds": { fixture.inbox.to_string(): true },
+                        "keywords": {"$urgent": true},
+                    },
+                },
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        response["notCreated"]["missing"]["type"],
+        json!("blobNotFound")
+    );
+    assert_eq!(response["notCreated"]["two"]["type"], json!("notSupported"));
+    assert_eq!(
+        response["notCreated"]["custom"]["type"],
+        json!("notSupported")
+    );
+    assert!(response["created"].as_object().expect("created").is_empty());
+    // Nothing was filed: the store still has no messages.
+    assert_eq!(fixture.store.count_messages(fixture.account).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn email_import_without_a_sink_reports_not_supported() {
+    let fixture = setup();
+    let blob_id = fixture
+        .store
+        .store_upload(fixture.account, "message/rfc822", b"Subject: x\r\n\r\n")
+        .expect("upload");
+    let jmap = Jmap::new(Arc::clone(&fixture.store));
+
+    let response = result(
+        &call(
+            &jmap,
+            "Email/import",
+            json!({
+                "accountId": fixture.account.to_string(),
+                "emails": {"k1": {"blobId": blob_id, "mailboxIds": { fixture.inbox.to_string(): true }}},
+            }),
+        )
+        .await,
+    );
+    assert_eq!(response["notCreated"]["k1"]["type"], json!("notSupported"));
+}
+
+#[tokio::test]
+async fn session_advertises_the_upload_limit() {
+    let fixture = setup();
+    let jmap = writing_jmap(&fixture);
+    let session = jmap.session().expect("session");
+    assert_eq!(
+        session["capabilities"][CORE_CAPABILITY]["maxSizeUpload"],
+        json!(mail_api::MAX_UPLOAD_BYTES)
+    );
+    assert_eq!(
+        session["capabilities"][CORE_CAPABILITY]["maxConcurrentUpload"],
+        json!(4)
+    );
 }

@@ -148,6 +148,8 @@ pub struct FetchedMessage {
     pub from: Vec<String>,
     pub to: Vec<String>,
     pub message_id: Option<String>,
+    /// `In-Reply-To` from the envelope, for threading.
+    pub in_reply_to: Option<String>,
     pub sent_at: Option<i64>,
 }
 
@@ -624,6 +626,10 @@ fn convert_fetch(item: &async_imap::types::Fetch) -> FetchedMessage {
             .map(|v| String::from_utf8_lossy(v).to_string());
         out.message_id = env
             .message_id
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v).to_string());
+        out.in_reply_to = env
+            .in_reply_to
             .as_ref()
             .map(|v| String::from_utf8_lossy(v).to_string());
         out.from = env

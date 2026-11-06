@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -27,7 +27,9 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use futures::stream;
-use mail_api::{BodySource, FetchedBody, Jmap, RequestError, WriteError, WriteSink};
+use mail_api::{
+    BodySource, FetchedBody, Jmap, RequestError, WriteError, WriteSink, MAX_UPLOAD_BYTES,
+};
 use mail_core::{Core, CoreError};
 use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Device, Store};
@@ -100,7 +102,16 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/jmap", post(jmap))
         .route("/pair", post(pair))
         .route("/download/{account_id}/{blob_id}/{name}", get(download))
-        .route("/upload/{account_id}", post(unsupported))
+        // The Session advertises `/upload/{accountId}/`; clients substitute the
+        // id and usually keep the trailing slash, so both forms are routed.
+        .route(
+            "/upload/{account_id}",
+            post(upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize)),
+        )
+        .route(
+            "/upload/{account_id}/",
+            post(upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize)),
+        )
         .route("/eventsource/", get(eventsource))
         .with_state(state)
 }
@@ -162,14 +173,53 @@ async fn pair(State(state): State<Arc<AppState>>, Json(request): Json<PairReques
     }
 }
 
-/// Push and blob transfer are not implemented yet; answer explicitly instead
-/// of leaving clients to guess from a 404.
-async fn unsupported() -> Response {
-    problem(
-        StatusCode::NOT_IMPLEMENTED,
-        "urn:ietf:params:jmap:error:serverFail",
-        "this Hub endpoint is not implemented",
-    )
+/// Stores bytes for later `Email/import`. The id is content addressed, so a
+/// retry of the same body returns the same `blobId`.
+async fn upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(account_id): Path<i64>,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = authenticate(&headers, &state) {
+        return auth_error(err);
+    }
+    match state.store.account_by_id(account_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "urn:ietf:params:jmap:error:notFound",
+                "account not found",
+            )
+        }
+        Err(err) => return server_error(err),
+    }
+    if body.len() as i64 > MAX_UPLOAD_BYTES {
+        return problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "urn:ietf:params:jmap:error:limit",
+            "upload exceeds maxSizeUpload",
+        );
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    match state.store.store_upload(account_id, &content_type, &body) {
+        Ok(blob_id) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "accountId": account_id.to_string(),
+                "blobId": blob_id,
+                "type": content_type,
+                "size": body.len(),
+            })),
+        )
+            .into_response(),
+        Err(err) => server_error(err),
+    }
 }
 
 /// Serves a cached body part or attachment. The blob id is scoped to the
@@ -520,6 +570,22 @@ impl WriteSink for CoreWrites {
                 .map_err(core_write_error)
         })
     }
+
+    fn import_message<'a>(
+        &'a self,
+        account_id: i64,
+        mailbox_id: i64,
+        raw: Vec<u8>,
+        keywords: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, WriteError>> + Send + 'a>> {
+        Box::pin(async move {
+            let email = self.email(account_id)?;
+            self.core
+                .import_message(&email, mailbox_id, &raw, &keywords)
+                .await
+                .map_err(core_write_error)
+        })
+    }
 }
 
 fn core_write_error(err: CoreError) -> WriteError {
@@ -677,6 +743,7 @@ mod tests {
                 &[NewMessage {
                     uid: 1,
                     message_id: Some("<1@example.com>".to_string()),
+                    in_reply_to: None,
                     subject: Some("hello".to_string()),
                     from: vec!["Alice <alice@example.com>".to_string()],
                     to: vec!["me@example.com".to_string()],
@@ -756,6 +823,115 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(&bytes[..], b"hello blob");
+    }
+
+    #[tokio::test]
+    async fn upload_stores_bytes_and_download_serves_them() {
+        let state = state();
+        let account = state
+            .store
+            .create_account("imap", "me@example.com", None, "secret", &json!({}))
+            .expect("account");
+        let other = state
+            .store
+            .create_account("imap", "other@example.com", None, "secret", &json!({}))
+            .expect("account");
+        let raw = b"Message-ID: <up@example.com>\r\nSubject: hi\r\n\r\nbody";
+
+        let anonymous = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/upload/{account}"))
+                    .header(header::CONTENT_TYPE, "message/rfc822")
+                    .body(Body::from(raw.to_vec()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let token = paired_token(&state).await;
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/upload/{account}"))
+                    .header(header::CONTENT_TYPE, "message/rfc822")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(raw.to_vec()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let payload = body_json(response).await;
+        assert_eq!(payload["accountId"], json!(account.to_string()));
+        assert_eq!(payload["type"], json!("message/rfc822"));
+        assert_eq!(payload["size"], json!(raw.len()));
+        let blob_id = payload["blobId"].as_str().expect("blobId").to_string();
+
+        // The advertised uploadUrl keeps its trailing slash.
+        let with_slash = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/upload/{account}/"))
+                    .header(header::CONTENT_TYPE, "message/rfc822")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(raw.to_vec()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(with_slash.status(), StatusCode::CREATED);
+
+        let download = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/download/{account}/{blob_id}/message.eml"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(download.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(download.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&bytes[..], raw);
+
+        let foreign = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/download/{other}/{blob_id}/message.eml"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_unknown_accounts() {
+        let state = state();
+        let token = paired_token(&state).await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload/999")
+                    .header(header::CONTENT_TYPE, "message/rfc822")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from("Subject: x\r\n\r\n"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
