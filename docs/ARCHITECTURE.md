@@ -117,7 +117,7 @@ flowchart LR
   subgraph SRV[服务端主机]
     PROXY[TLS 反向代理<br/>示例 18443]
     HUB[mail-hub 单进程<br/>JMAP/SSE + 内核<br/>示例 18080]
-    SYNC[同步任务<br/>待补]
+    SYNC[同步任务<br/>IDLE 池 + 扫尾<br/>同进程]
     DB[(SQLCipher 库<br/>持久卷)]
     KEY[主密钥 / 邮箱凭据<br/>KMS 或 0600 文件]
   end
@@ -138,10 +138,10 @@ flowchart LR
 分布原则：
 
 - **客户端**只保存服务端地址与设备令牌；地址含端口（示例 `https://host:18443`），远程模式不直连 IMAP/SMTP。
-- **Hub 单进程**：HTTP API、内核、后台同步任务在同一进程；不要拆成两个进程共享一个 SQLite 文件。当前 Hub **没有后台同步**，必须补同步任务（IDLE 池 + 扫尾），否则库只会在手动 `mail-cli sync` 时更新。
+- **Hub 单进程**：HTTP API、内核、后台同步任务在同一进程；不要拆成两个进程共享一个 SQLite 文件。后台同步已实现（每账户 `watch_account`：IDLE 池 + 扫尾，`EYRIE_HUB_SYNC` 可关），库不再依赖外部 `mail-cli sync` 更新。
 - **每用户一份**：一个 Hub 实例、一个 SQLCipher 库、一个持久卷。多用户不共用一个库 + 全权令牌；配对时把设备令牌绑定到单个账户（`hub_devices.account_id`），Session 与所有 JMAP 方法只在该账户内生效。
 - **主密钥与库分开放**：库放持久卷，主密钥/邮箱凭据放 KMS 或 0600 文件；分开备份，主密钥丢失则数据不可恢复。
-- **容器密钥后端**：无头容器通常没有系统钥匙串；服务端使用 KMS/文件后端，不把开发用 `FileStore` 直接当生产。
+- **容器密钥后端**：无头容器通常没有系统钥匙串；服务端使用文件后端（`EYRIE_HUB_SECRET_DIR`，0600 文件，主密钥与账户密码同目录）或由部署注入主密钥（`EYRIE_HUB_MASTER_KEY_FILE`），不依赖系统钥匙串。开发期同名的 `EYRIE_DEV_SECRET_DIR` 仍被接受。
 - **网络**：Hub 只绑定回环或容器网络，对外只暴露 TLS 入口；SSE 需关闭代理缓冲，读超时大于 `ping` 间隔。
 - **推送**：桌面用 SSE；手机后续由 Hub 转 APNs/FCM，载荷只含"有新变更"。
 
@@ -170,13 +170,13 @@ flowchart LR
 
 远程模式上线前置（缺一不可；✅ 已实现）：
 
-1. Hub 内置同步任务（当前缺失）。
+1. ✅ Hub 内置同步任务（每账户 `watch_account`：IDLE 池 + 扫尾）。
 2. TLS 终止（反代或 Hub 内置 rustls）。
-3. 服务端密钥后端（KMS/文件）与备份说明。
+3. ✅ 服务端密钥后端（文件后端 + 主密钥注入）与备份说明。
 4. ✅ 令牌绑定账户，Session 只返回该设备可见账户（`hub_devices.account_id`，方法级 `accountId` 校验）。
 5. ✅ 发送提交端点（`Identity/get` + `EmailSubmission/set`，客户端上传 RFC 822，服务端负责 SMTP 与 Sent 归档）。
-6. `/healthz`、DB 快照备份、日志脱敏。
-7. Hub 镜像与部署脚本（当前没有 Dockerfile，只有直接运行二进制）。
+6. ✅ `/healthz`；DB 快照备份、日志脱敏仍待补。
+7. ✅ Hub 镜像（仓库根 `Dockerfile`）；部署脚本仍待补。
 
 ---
 

@@ -5,17 +5,27 @@
 //! Configuration is environment-only:
 //! - `EYRIE_HUB_DB` (default `hub.db`)
 //! - `EYRIE_HUB_BIND` (default `127.0.0.1:8080`)
-//! - `EYRIE_DEV_SECRET_DIR` (development file store; the keychain is default)
+//! - `EYRIE_HUB_SECRET_DIR` (file-backed secret store for headless/container
+//!   deployments; the platform keychain is the default)
+//! - `EYRIE_DEV_SECRET_DIR` (older name for the same file store, kept for
+//!   development scripts)
+//! - `EYRIE_HUB_MASTER_KEY_FILE` (optional base64 master key; imported before
+//!   the database opens so the key can live outside the database volume)
 //! - `EYRIE_HUB_PAIRING_CODE` (fixed pairing code; otherwise one is generated
 //!   per process and printed to stdout)
+//! - `EYRIE_HUB_SYNC` (`0`/`false`/`off` disables the background sync task)
+//! - `EYRIE_HUB_SWEEP_SECONDS` (default 120)
+//! - `EYRIE_HUB_IDLE_SESSIONS` (default 4)
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -32,7 +42,7 @@ use mail_api::{
     SubmissionSink, WriteError, WriteSink, MAX_UPLOAD_BYTES,
 };
 use mail_core::compose::{derive_envelope, strip_bcc_header};
-use mail_core::{Core, CoreError};
+use mail_core::{Core, CoreError, WatchOptions};
 use mail_crypto::{FileStore, KeyringStore, SecretStore};
 use mail_store::{Device, Store};
 use rand::RngCore;
@@ -48,6 +58,124 @@ pub struct AppState {
     jmap: Arc<Jmap>,
     store: Arc<Store>,
     pairing_code: String,
+    health: Arc<Health>,
+}
+
+/// Process and background-sync counters served by `/healthz`. Holds no
+/// secrets: only timestamps, counts, and the sync configuration.
+struct Health {
+    started_at: SystemTime,
+    sync: Option<SyncHealth>,
+}
+
+struct SyncHealth {
+    idle_sessions: usize,
+    sweep_seconds: u64,
+    watchers: AtomicUsize,
+    events: AtomicU64,
+    last_event_at: AtomicI64,
+}
+
+impl Health {
+    fn new(sync: Option<SyncConfig>) -> Self {
+        Self {
+            started_at: SystemTime::now(),
+            sync: sync.map(|config| SyncHealth {
+                idle_sessions: config.idle_sessions,
+                sweep_seconds: config.sweep_seconds,
+                watchers: AtomicUsize::new(0),
+                events: AtomicU64::new(0),
+                last_event_at: AtomicI64::new(0),
+            }),
+        }
+    }
+
+    fn uptime_seconds(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(self.started_at)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn watcher_started(&self) {
+        if let Some(sync) = self.sync.as_ref() {
+            sync.watchers.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_event(&self) {
+        if let Some(sync) = self.sync.as_ref() {
+            sync.events.fetch_add(1, Ordering::Relaxed);
+            sync.last_event_at.store(now_unix(), Ordering::Relaxed);
+        }
+    }
+
+    fn sync_json(&self) -> Value {
+        let Some(sync) = self.sync.as_ref() else {
+            return json!({ "enabled": false });
+        };
+        let last_event_at = sync.last_event_at.load(Ordering::Relaxed);
+        json!({
+            "enabled": true,
+            "watchers": sync.watchers.load(Ordering::Relaxed),
+            "events": sync.events.load(Ordering::Relaxed),
+            "lastEventAt": if last_event_at > 0 { json!(last_event_at) } else { Value::Null },
+            "sweepSeconds": sync.sweep_seconds,
+            "idleSessions": sync.idle_sessions,
+        })
+    }
+}
+
+/// Background sync mirrors `mail-cli watch`: one IDLE pool per account plus a
+/// sweep connection for mailboxes that cannot push.
+#[derive(Clone, Copy)]
+struct SyncConfig {
+    idle_sessions: usize,
+    sweep_seconds: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        let defaults = WatchOptions::default();
+        Self {
+            idle_sessions: defaults.idle_sessions,
+            sweep_seconds: defaults.sweep_seconds,
+        }
+    }
+}
+
+impl SyncConfig {
+    /// `None` disables the background task; accounts then only sync when a
+    /// client asks for data through JMAP or a CLI runs `sync`.
+    fn from_env() -> Option<Self> {
+        let disabled = std::env::var("EYRIE_HUB_SYNC").ok().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        });
+        if disabled {
+            return None;
+        }
+        let defaults = Self::default();
+        Some(Self {
+            idle_sessions: env_number("EYRIE_HUB_IDLE_SESSIONS").unwrap_or(defaults.idle_sessions),
+            sweep_seconds: env_number("EYRIE_HUB_SWEEP_SECONDS")
+                .unwrap_or(defaults.sweep_seconds)
+                .max(1),
+        })
+    }
+}
+
+fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -64,7 +192,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse()?;
 
-    let core = Arc::new(Core::open(&db, secret_store()?)?);
+    let secrets = secret_store()?;
+    import_master_key_from_file(secrets.as_ref(), &db)?;
+    let core = Arc::new(Core::open(&db, secrets)?);
     let store = core.store();
     let jmap = Jmap::new(Arc::clone(&store))
         .with_bodies(Arc::new(CoreBodies {
@@ -89,16 +219,140 @@ async fn main() -> anyhow::Result<()> {
             code
         }
     };
+    let sync_config = SyncConfig::from_env();
+    let health = Arc::new(Health::new(sync_config));
+    match sync_config {
+        Some(config) => {
+            info!(
+                sweep_seconds = config.sweep_seconds,
+                idle_sessions = config.idle_sessions,
+                "background sync enabled"
+            );
+            spawn_sync(
+                Arc::clone(&core),
+                Arc::clone(&store),
+                Arc::clone(&health),
+                config,
+            );
+        }
+        None => info!("background sync disabled by EYRIE_HUB_SYNC"),
+    }
+
     let state = Arc::new(AppState {
         jmap: Arc::new(jmap),
         store,
         pairing_code,
+        health,
     });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, %db, "hub listening");
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+/// Starts one watcher task per account. Accounts can be added while the Hub
+/// runs (the CLI writes to the same database), so the watcher set is resolved
+/// again on every pass instead of being fixed at startup.
+fn spawn_sync(core: Arc<Core>, store: Arc<Store>, health: Arc<Health>, config: SyncConfig) {
+    tokio::spawn(async move {
+        let mut watched: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+        loop {
+            watched.retain(|_, handle| !handle.is_finished());
+            match store.list_accounts() {
+                Ok(accounts) => {
+                    for account in accounts {
+                        if watched.contains_key(&account.email) {
+                            continue;
+                        }
+                        info!(account = %account.email, "starting background sync");
+                        let email = account.email.clone();
+                        let handle = tokio::spawn(watch_account_forever(
+                            Arc::clone(&core),
+                            Arc::clone(&health),
+                            email.clone(),
+                            config,
+                        ));
+                        watched.insert(email, handle);
+                    }
+                }
+                Err(err) => warn!(%err, "listing accounts for background sync failed"),
+            }
+            tokio::time::sleep(Duration::from_secs(SYNC_RESOLVE_SECONDS)).await;
+        }
+    });
+}
+
+/// `watch_account` reconnects on its own; this loop only restarts it when the
+/// watcher returns (event budget, missing account, or a fatal setup error).
+async fn watch_account_forever(
+    core: Arc<Core>,
+    health: Arc<Health>,
+    email: String,
+    config: SyncConfig,
+) {
+    health.watcher_started();
+    let mut backoff = 1u64;
+    loop {
+        let sink = Arc::clone(&health);
+        let result = core
+            .watch_account(
+                &email,
+                usize::MAX,
+                WatchOptions {
+                    idle_sessions: config.idle_sessions,
+                    sweep_seconds: config.sweep_seconds,
+                },
+                move |_outcome| sink.record_event(),
+            )
+            .await;
+        match result {
+            Ok(()) => warn!(account = %email, "background sync stopped, restarting"),
+            Err(err) => warn!(account = %email, %err, "background sync failed, retrying"),
+        }
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(60);
+    }
+}
+
+const SYNC_RESOLVE_SECONDS: u64 = 30;
+
+/// Unauthenticated liveness/readiness probe. Reports the database and the
+/// background task; it deliberately does not dial the mail servers, because a
+/// transient IMAP outage must not mark the Hub itself unhealthy.
+async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    let accounts = match state.store.list_accounts() {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            warn!(%err, "health check: database unavailable");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "urn:ietf:params:jmap:error:serverFail",
+                "database unavailable",
+            );
+        }
+    };
+    let mut last_sync_at: Option<i64> = None;
+    for account in &accounts {
+        match state.store.list_mailboxes(account.id) {
+            Ok(mailboxes) => {
+                for mailbox in mailboxes {
+                    last_sync_at = last_sync_at.max(mailbox.last_sync_at);
+                }
+            }
+            Err(err) => warn!(%err, account_id = account.id, "health check: mailbox query failed"),
+        }
+    }
+    let body = json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptimeSeconds": state.health.uptime_seconds(),
+        "database": "ok",
+        "accounts": accounts.len(),
+        "lastSyncAt": last_sync_at,
+        "sync": state.health.sync_json(),
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Routes are split out so tests can drive the same handlers without a socket.
@@ -119,6 +373,7 @@ fn router(state: Arc<AppState>) -> Router {
             post(upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize)),
         )
         .route("/eventsource/", get(eventsource))
+        .route("/healthz", get(healthz))
         .with_state(state)
 }
 
@@ -587,11 +842,37 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
+/// Headless deployments have no platform keychain, so a 0600 file store on a
+/// mounted volume is the supported server backend. The directory holds the
+/// master key and every account password; keep it on a separate volume from
+/// the database and back both up independently.
 fn secret_store() -> anyhow::Result<Arc<dyn SecretStore>> {
-    match std::env::var("EYRIE_DEV_SECRET_DIR") {
+    let dir =
+        std::env::var("EYRIE_HUB_SECRET_DIR").or_else(|_| std::env::var("EYRIE_DEV_SECRET_DIR"));
+    match dir {
         Ok(dir) => Ok(Arc::new(FileStore::new(dir)?)),
         Err(_) => Ok(Arc::new(KeyringStore::new(SECRET_SERVICE))),
     }
+}
+
+/// Imports a master key supplied by the deployment (Docker/Kubernetes secret)
+/// before the database opens. The key is validated against an existing
+/// database first, so a wrong secret aborts startup instead of replacing the
+/// key that protects the data.
+fn import_master_key_from_file(secrets: &dyn SecretStore, db: &str) -> anyhow::Result<()> {
+    let path = std::env::var("EYRIE_HUB_MASTER_KEY_FILE")
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty());
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let encoded =
+        std::fs::read_to_string(&path).map_err(|err| anyhow::anyhow!("reading {path}: {err}"))?;
+    let updated =
+        mail_core::import_master_key(secrets, encoded.trim(), Some(FsPath::new(db)), true)?;
+    info!(path, updated, "imported master key file");
+    Ok(())
 }
 
 /// Fetches bodies through `mail-core` so the Hub can serve uncached messages.
@@ -778,6 +1059,7 @@ mod tests {
             jmap,
             store,
             pairing_code: "pair-me".to_string(),
+            health: Arc::new(Health::new(Some(SyncConfig::default()))),
         })
     }
 
@@ -1247,5 +1529,29 @@ mod tests {
         .expect("body");
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("ping") || text.contains("StateChange"));
+    }
+
+    #[tokio::test]
+    async fn healthz_is_anonymous_and_reports_database_state() {
+        let state = state();
+        seed_account(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = body_json(response).await;
+        assert_eq!(payload["status"], json!("ok"));
+        assert_eq!(payload["database"], json!("ok"));
+        assert_eq!(payload["accounts"], json!(1));
+        assert_eq!(payload["lastSyncAt"], Value::Null);
+        assert_eq!(payload["sync"]["enabled"], json!(true));
+        assert_eq!(payload["sync"]["watchers"], json!(0));
     }
 }

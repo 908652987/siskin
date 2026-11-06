@@ -163,10 +163,11 @@ flowchart LR
 ## 5.2 Hub 与 JMAP 子集
 
 - 分层：`mail-api` 只做 JMAP 语义（Session、请求/响应、错误映射），不依赖 HTTP；`mail-hub` 是 axum 二进制，负责配对、鉴权、路由与按需拉正文。依赖方向保持 `mail-hub → mail-api, mail-core`，`mail-api → mail-store`。
-- 进程形态：`mail-hub` 是**单进程**二进制，HTTP 路由、`mail-core` 内核与同一个 SQLCipher 库都在同一进程；**没有 Web 页面/静态资源**，也没有可单独执行的内核进程。仓库暂无 Hub 的 Dockerfile，目前只能直接运行二进制或自行构建镜像。
-- **Hub 没有后台同步**：启动后不跑 `sync`/`watch`，只读库并在正文请求时按需访问远端；库的更新依赖外部 `mail-cli sync`/`watch` 或后续内置同步任务。远程模式上线前必须补内置同步，否则数据不会自行刷新。
+- 进程形态：`mail-hub` 是**单进程**二进制，HTTP 路由、`mail-core` 内核、后台同步任务与同一个 SQLCipher 库都在同一进程；**没有 Web 页面/静态资源**，也没有可单独执行的内核进程。仓库根 `Dockerfile` 是多阶段镜像（rust 构建 → debian slim 运行，非 root UID 10001，`HEALTHCHECK` 轮询 `/healthz`），`.dockerignore` 排除 `target/`、`apps/` 与生成物。
+- **后台同步**：启动后按账户各起一个 `watch_account` 任务（IDLE 池 + 扫尾，默认 4 条 IDLE / 120 s），每 30 s 重新解析账户集合，任务异常退出按 1→60 s 退避重启；`EYRIE_HUB_SYNC=0|false|off` 关闭，`EYRIE_HUB_SWEEP_SECONDS`/`EYRIE_HUB_IDLE_SESSIONS` 调参。事件只更新 `/healthz` 计数，不重复写库——同步本身由内核写变更日志，SSE 读库游标。
+- **部署密钥**：`EYRIE_HUB_SECRET_DIR` 指向 0600 文件存储（主密钥 + 账户密码，容器内挂在数据库卷之外）；`EYRIE_HUB_MASTER_KEY_FILE` 在开库前导入主密钥，导入会先用现有库校验，缺 key/错 key 直接启动失败。`EYRIE_DEV_SECRET_DIR` 仍作为同名后端的兼容名。
 - 认证：配对码（`EYRIE_HUB_PAIRING_CODE`，未设置则每进程随机生成并打印一次）换 32 字节随机令牌；库中 `hub_devices` 只存 SHA-256 哈希与 `last_seen_at`，令牌只在配对响应里出现一次。**令牌绑定账户**：`/pair` 接受 `accountId`（单账户库可省略，多账户必填），设备行保存 `account_id`；旧库迁移时只有恰好一个账户才回填，未绑定的设备一律 403 要求重新配对。
-- 端点：`GET /.well-known/jmap`（Session）、`POST /jmap`、`POST /pair`、`GET /eventsource/`（SSE）、`GET /download/{accountId}/{blobId}/{name}`、`POST /upload/{accountId}`（带不带尾斜杠都路由）。上传按内容寻址写入 `blobs` + `uploads`，`maxSizeUpload` 50 MiB，`uploads` 行 24 小时未使用即回收（引用它的消息仍可读）。所有入口都以绑定账户为边界：Session 只列该账户，upload/download 的路径 id 与 SSE 只认该账户，JMAP 每个方法调用的 `accountId` 不符时该调用返回 `accountNotFound`。
+- 端点：`GET /.well-known/jmap`（Session）、`POST /jmap`、`POST /pair`、`GET /eventsource/`（SSE）、`GET /download/{accountId}/{blobId}/{name}`、`POST /upload/{accountId}`（带不带尾斜杠都路由）、`GET /healthz`（匿名；库可读返回 200 与 `accounts/lastSyncAt/sync`，库打不开返回 503，不主动拨号邮件服务器）。上传按内容寻址写入 `blobs` + `uploads`，`maxSizeUpload` 50 MiB，`uploads` 行 24 小时未使用即回收（引用它的消息仍可读）。所有入口都以绑定账户为边界：Session 只列该账户，upload/download 的路径 id 与 SSE 只认该账户，JMAP 每个方法调用的 `accountId` 不符时该调用返回 `accountNotFound`。
 - 已实现 method：`Mailbox/get`（角色映射、`totalEmails`/`unreadEmails`、`myRights` 随写入能力切换）、`Mailbox/changes`、`Email/query`（`inMailbox`、`text`、`hasKeyword`/`notKeyword` 的 `$seen`/`$flagged`、`before`/`after`、position/limit，`total` 与分页一致）、`Email/get`（`mailboxIds` 为全部在线位置并集、keywords 为位置并集、附件元数据与 `blobId`、`bodyValues`）、`Email/changes`、`Email/set`（`create` 从上传 blob 建信、`destroy` 永久删除、`keywords`/`mailboxIds` 更新）、`Email/import`、`Thread/get`、`Thread/changes`、`Identity/get`、`EmailSubmission/get`、`EmailSubmission/set`。Session 广告 `urn:ietf:params:jmap:submission`（`maxDelayedSend=0`）。
 - `Email/set create`：与 `Email/import` 共用同一校验与落库路径（本账户 blob、单邮箱、已知关键字、50 MiB 上限），响应里的 `created.<id>` 是完整 Email 对象；`Email/import` 仍返回精简的 `{id, blobId, threadId, size}`。`destroy` 按 RFC 8621 §4.6 永久删除所有副本（`STORE \Deleted` + `UID EXPUNGE`），删除到 Trash 应改用 `mailboxIds` 更新。
 - `Email/import`：只接受本账户 `/upload` 产生的 blob（未知或他人 blob 返回 `blobNotFound`），每次导入一个邮箱、只支持已知关键字；Hub 用 `mail-core::import_message` 执行 `APPEND`（带关键字对应的标志），成功后同步该邮箱取得本地行，响应里的 `id`/`threadId` 就是本地消息；多邮箱与自定义关键字返回 `notSupported`。
@@ -280,9 +281,16 @@ cargo run -p mail-cli -- --db /tmp/mail.db import-key --value '<base64>' --force
 
 # 9) Hub（JMAP 子集）：与 mail-cli 共用同一个库与密钥存储
 # 示例端口 18080；Hub 默认 8080，可用 EYRIE_HUB_BIND 覆盖，起服务前用 lsof 检查
+# 后台同步默认开启（每账户 IDLE 池 + 扫尾）；EYRIE_HUB_SYNC=0 关闭
 EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 EYRIE_HUB_DB=/tmp/mail.db EYRIE_HUB_BIND=127.0.0.1:18080 \
-EYRIE_HUB_PAIRING_CODE=dev-code cargo run -p mail-hub
+EYRIE_HUB_PAIRING_CODE=dev-code EYRIE_HUB_SWEEP_SECONDS=120 cargo run -p mail-hub
+curl -s http://127.0.0.1:18080/healthz          # 匿名；库打不开返回 503
+# 容器部署：库与密钥分开挂卷，UID 10001 需可写；主密钥可由 secret 文件注入
+docker build -t siskin-hub .
+docker run --rm -p 127.0.0.1:18080:8080 -v /srv/siskin/data:/data \
+  -v /srv/siskin/secrets:/secrets -e EYRIE_HUB_SECRET_DIR=/secrets \
+  -e EYRIE_HUB_PAIRING_CODE=dev-code siskin-hub
 # 配对 → 拿 token → 带 Authorization: Bearer <token> 访问
 curl -s -X POST http://127.0.0.1:18080/pair -H 'Content-Type: application/json' \
   -d '{"code":"dev-code","name":"phone","accountId":"1"}'
@@ -324,7 +332,7 @@ cargo test --workspace
 14. **JMAP 写操作覆盖面**。已实现已读/标志、多副本移动、上传、`Email/import`、`Email/set create/destroy`、`Thread/get|changes`；未做自定义关键字、`Email/query` 的 `operator`/`conditions` 组合过滤与升序排序、`Email/set create` 的多邮箱落库、APNs/FCM。导入/创建只走 IMAP 账户。`Thread/changes` 只覆盖本次构建之后写入的线程变更，升级前的历史消息不会补发（客户端先 `Thread/get`）。设备吊销已提供 `mail-cli revoke-device`。
 15. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。
 16. **Hub 正文拉取是串行且同步的**。一次 `Email/get` 请求内逐封拉取，未做并发限流；多封大邮件会让单次请求变慢。
-17. **远程模式（D13）前置未完成**。Hub 只有明文 HTTP、无发送提交端点、配对令牌可访问库内全部账户；客户端侧也还没有模式选择、JMAP 适配层与可清除的独立缓存。远程模式在此之前只能本机回环演示。
+17. ~~**远程模式（D13）前置未完成**~~。Hub 已内置后台同步（IDLE 池 + 扫尾）、`/healthz`、容器镜像、卷内文件密钥后端与主密钥注入；发送提交端点与令牌绑定账户此前已完成。剩余：TLS 仍由反代终止、DB 快照备份；客户端侧的模式选择、JMAP 适配层与可清除缓存仍未开始。
 
 ---
 
@@ -333,7 +341,7 @@ cargo test --workspace
 按依赖顺序：
 
 1. ~~Hub 补齐：`Mailbox/changes`、设备吊销、`Email/set`（已读/移动/创建/销毁）、多副本移动、SSE 推送、附件下载、上传与 `Email/import`、`Thread/get|changes`~~（完成；APNs/FCM 仍缺凭据）
-2. Hub 远程模式前置：HTTPS、发送提交端点、令牌按账户授权（D13 的远程模式依赖这三项）
+2. ~~Hub 远程模式前置：HTTPS、发送提交端点、令牌按账户授权（D13 的远程模式依赖这三项）~~（发送与按账户授权完成；后台同步、`/healthz`、镜像与密钥后端完成；TLS 仍由反代终止）
 3. 客户端双模式（D13）：首次运行选择本地/远程、远程地址 + 令牌配置、JMAP 适配层、独立缓存与清缓存
 4. 移动端薄客户端（依赖 Hub 推送与 APNs/FCM 凭据）
 5. 发信补齐：~~附件~~（完成；To/Cc/Bcc + multipart/mixed）、HTML 正文、草稿、Sent 去重（Gmail 会自动归档）

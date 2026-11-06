@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（含 `create`/`destroy`）、`Email/import`、`Thread/get|changes`、多副本移动、`/upload`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM 未做）；**macOS 客户端已可收发**：列表/阅读/搜索、撰写（To/Cc/Bcc + 多附件，`mail-ffi::send`）与 `dist/Siskin.app` 打包完成，通知未做；Linux 桌面 UI 技术栈定为 Slint（D12），Windows UI、日历、手机客户端尚未开始。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（含 `create`/`destroy`）、`Email/import`、`Thread/get|changes`、多副本移动、`/upload`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM 未做；**Hub 已内置后台同步**（IDLE 池 + 扫尾，进程内按账户启动/重连）、`/healthz`、容器镜像与卷内文件密钥后端/主密钥注入）；**macOS 客户端已可收发**：列表/阅读/搜索、撰写（To/Cc/Bcc + 多附件，`mail-ffi::send`）与 `dist/Siskin.app` 打包完成，通知未做；Linux 桌面 UI 技术栈定为 Slint（D12），Windows UI、日历、手机客户端尚未开始。
 
 ---
 
@@ -61,7 +61,8 @@
 | HTML 渲染 | 未开始 | 净化器已就绪（`mail-parse::sanitize_html`），UI WebView 段未做 |
 | JMAP 子集（读写） | 完成 | `mail-api`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（create/destroy）、`Email/import`、`Thread/get|changes`、`Identity/get`、`EmailSubmission/get|set`、`BodySource` 按需正文、`WriteSink`/`SubmissionSink` 写路径、账户作用域 `session_for`/`handle_for_account`；32 个 API 测试；Dovecot 实跑 |
 | Hub 服务端与设备配对 | 完成 | `mail-hub`（axum）：配对码换令牌、库中只存哈希、Bearer 鉴权、`/eventsource`、`/download`；`mail-cli devices`/`revoke-device`（`devices` 显示绑定账户）；10 个路由测试 + 实跑 |
-| Hub 远程模式前置（HTTPS / 发送 / 账户授权） | 部分完成 | 设备令牌已绑定账户（`hub_devices.account_id`，Session/upload/download/SSE/方法级 `accountId` 全部校验）；发送走标准 `Identity/get` + `EmailSubmission/set`（create）；**剩余**：HTTPS 仍由反代终止、Hub 无后台同步任务 |
+| Hub 远程模式前置（HTTPS / 发送 / 账户授权） | 完成（TLS 仍由反代终止） | 设备令牌已绑定账户（`hub_devices.account_id`，Session/upload/download/SSE/方法级 `accountId` 全部校验）；发送走标准 `Identity/get` + `EmailSubmission/set`（create）；后台同步与 `/healthz` 已内置；**剩余**：TLS 仍由反代终止（Dockerfile 注释与 ARCHITECTURE §3.2 的清单） |
+| Hub 后台同步与部署底线 | 完成 | `mail-hub` 进程内按账户启动 `watch_account`（IDLE 池 + 扫尾，默认 4/120 s，`EYRIE_HUB_SYNC` 可关）；`GET /healthz`（匿名）：库可读、账户数、`lastSyncAt`、watchers/events；`Dockerfile`（多阶段、非 root、`HEALTHCHECK`）+ `.dockerignore`；文件密钥后端 `EYRIE_HUB_SECRET_DIR` 与 `EYRIE_HUB_MASTER_KEY_FILE` 注入；Dovecot 实跑：不跑 CLI 时投递 4 s 内 `Email/query` total 10026→10027，master key 空目录+key 文件可开库，缺 key 启动报 `database key does not match`；容器实跑：`/healthz` 200、`docker inspect` healthy、投递后 total 10027→10028 |
 | 客户端双模式（本地 / 远程） | 未开始 | macOS 目前只有本地直连（FFI → `mail-core`）；无 JMAP 客户端、无远程配置入口、无独立缓存与清缓存 |
 | Hub 写操作与 SSE | 完成 | `Email/set` 已读/标志/移动（含多副本）/创建/永久删除、`Mailbox/changes`、SSE 状态事件、blob 下载；Dovecot 实跑（`\Seen` 置/清、移动、计数、下载、token 吊销后 401） |
 | Hub 发送（EmailSubmission） | 完成 | `Identity/get`（每账户一个身份）、`EmailSubmission/get|set`（create、`onSuccessUpdateEmail` 隐式 `Email/set`、`sendAt` 拒绝、`undoStatus=final`）；原始报文随 `Email/import|create` 入库（`messages.raw_blob_hash`）；服务端推导 envelope、投递前剥除 `Bcc` 头；Dovecot + 本地 SMTP sink 实跑：3 个 RCPT（含 Bcc）、服务端副本无 Bcc、Sent +1 |
@@ -87,8 +88,10 @@
 ## 4. 代码地图
 
 ```
+Dockerfile                 Hub 镜像（多阶段；非 root UID 10001；HEALTHCHECK /healthz）
+.dockerignore              构建上下文排除 target/apps/generated
 crates/
-  mail-crypto/src/lib.rs   SecretStore trait、KeyringStore、FileStore（仅开发）、MemoryStore、
+  mail-crypto/src/lib.rs   SecretStore trait、KeyringStore、FileStore（dev/服务端文件后端）、MemoryStore、
                            MasterKey（HKDF 发送子密钥）、seal/open（XChaCha20-Poly1305 + AAD）
   mail-store/src/lib.rs    SQLCipher 打开（PRAGMA key + 错密钥/明文库拒绝）、schema、
                            迁移（v6 重建 FTS 并从 blob 回填正文；v8 加 in_reply_to
@@ -263,9 +266,16 @@ cargo run --release -p mail-cli -- --db /tmp/smoke.db import-key --value '<base6
 
 # 4.1) Hub：与 mail-cli 共用同一个库与密钥存储
 # 示例用 18080 覆盖默认 8080；端口由 EYRIE_HUB_BIND 决定，起服务前用 lsof 查占用
+# 后台同步默认开启：每账户一个 watch_account（IDLE 池 + 扫尾）；
+# EYRIE_HUB_SYNC=0 关闭，EYRIE_HUB_SWEEP_SECONDS / EYRIE_HUB_IDLE_SESSIONS 调整参数
 EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets EYRIE_HUB_DB=/tmp/smoke.db \
 EYRIE_HUB_BIND=127.0.0.1:18080 EYRIE_HUB_PAIRING_CODE=dev-code \
+EYRIE_HUB_SWEEP_SECONDS=120 EYRIE_HUB_IDLE_SESSIONS=4 \
 cargo run -p mail-hub --release
+# 匿名健康检查：库可读、账户数、lastSyncAt、同步任务状态；库打不开返回 503
+curl -s http://127.0.0.1:18080/healthz
+# {"status":"ok","database":"ok","accounts":1,"lastSyncAt":...,"sync":{"enabled":true,
+#  "watchers":1,"events":N,"lastEventAt":...,"sweepSeconds":120,"idleSessions":4}}
 TOKEN=$(curl -s -X POST http://127.0.0.1:18080/pair -H 'Content-Type: application/json' \
   -d '{"code":"dev-code","name":"phone","accountId":"1"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
 # 单账户库可省略 accountId；多账户时必须给出，否则 400。令牌只在该账户内有效。
@@ -334,6 +344,16 @@ curl -s -X POST http://127.0.0.1:18080/jmap -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[["EmailSubmission/get",{"accountId":"1","ids":["1"]},"c0"]]}'
 # 只接受客户端上传/导入过的消息（有原始报文）；同步来的邮件提交返回 invalidEmail
+# 4.1.2) 容器部署（仓库根 Dockerfile；TLS 仍由前置反代终止）
+docker build -t siskin-hub .
+# 库放 /data 卷；密钥目录（主密钥 + 账户密码）单独挂卷，UID 10001 需可写
+docker run --rm -p 127.0.0.1:18080:8080 \
+  -v /srv/siskin/data:/data -v /srv/siskin/secrets:/secrets \
+  -e EYRIE_HUB_SECRET_DIR=/secrets -e EYRIE_HUB_PAIRING_CODE=dev-code \
+  siskin-hub
+# 主密钥也可由 Docker secret 注入（key 文件与库不同卷）；缺 key/错 key 启动即失败：
+#   EYRIE_HUB_MASTER_KEY_FILE=/run/secrets/master-key
+# 镜像内 HEALTHCHECK 轮询 /healthz；绑定 0.0.0.0 只在容器网络内，对外只暴露反代端口
 # 设备管理（与 Hub 共用库）
 cargo run -p mail-cli -- --db /tmp/smoke.db devices
 cargo run -p mail-cli -- --db /tmp/smoke.db revoke-device --id <deviceId>
@@ -388,7 +408,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | cargo 源 | `~/.cargo/config.toml` 替换为 rsproxy 稀疏索引。**该文件不在仓库内**，换机需重建 |
 | Swift | 6.4（Command Line Tools）。**没有 Xcode**：无 `xcodebuild`、无 iOS 模拟器工程模板；`swiftc` 可编译 AppKit/SwiftUI 命令行程序 |
 | .NET | 未安装。Windows 验证与 C# 绑定必须换机 |
-| Docker | 29.1.3；镜像 `mail-spike-dovecot`（Debian + Dovecot 2.3.19.1，apt 走 USTC 镜像） |
+| Docker | 29.1.3；镜像 `mail-spike-dovecot`（Debian + Dovecot 2.3.19.1，apt 走 USTC 镜像）。Hub 镜像在仓库根 `Dockerfile`：`docker build --network=host -t siskin-hub .`（本机网络下 buildkit 默认网络访问 Debian 源会 502，host 网络正常；Dockerfile 内已把 Debian 源换成 USTC）。构建需 `libdbus-1-dev`/`pkg-config`（keyring 依赖链接 libdbus），运行镜像装 `libdbus-1-3` |
 | 测试数据 | `spike/data/Maildir` 10,000 封合成邮件（gitignored，可重新生成） |
 | 钥匙串 | `keyring` crate 必须启用特性 `apple-native / windows-native / sync-secret-service / crypto-rust`，否则写入静默失效、读取为空（已踩过） |
 | SQLCipher | `rusqlite` 特性 `bundled-sqlcipher-vendored-openssl`；首次构建会编译 vendored OpenSSL（本机约 20 s），不依赖系统 openssl |
@@ -474,6 +494,10 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | macOS 阅读（id=711） | HTML 正文与附件 `note.txt` 正确渲染；附件经 FFI 下载 17 字节；操作按钮显示“标为未读 / 加星标 / 移动到” |
 | macOS 快照 | `SISKIN_SNAPSHOT` 应用内渲染 2240×1520 PNG；修复前发现工具栏不可见、文字白底白字、HSplitView 底对齐、头部被英文按钮挤裁，均已修复 |
 | RRULE | 22 例 21 通过，失败项为夏令时空洞时间，需归一化 |
+| Hub 后台同步（Dovecot） | 不跑任何 CLI：投递一封后 ≤4 s（含 4 s 等待）`Email/query` total 10026→10027，`/healthz` 的 `sync.events` 8→9 |
+| Hub `/healthz` | 匿名 200；字段 `status/database/accounts/lastSyncAt/sync{enabled,watchers,events,sweepSeconds,idleSessions}` |
+| Hub 主密钥注入 | 空密钥目录 + `EYRIE_HUB_MASTER_KEY_FILE` 打开已有库：`healthz` 200、账户 1；不带 key 启动退出码 1，`database key does not match this file` |
+| Hub 容器（Dockerfile） | 镜像构建成功；容器内 `/healthz` 200、`docker inspect` 显示 `healthy`；仓库外挂 `/data` + `/secrets` 后后台同步自动生效，投递一封不跑 CLI：`Email/query` total 10027→10028 |
 
 完整方法与命令见 `docs/SPIKE-REPORT.md`。
 
@@ -498,8 +522,8 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 15. **macOS 通知、草稿与多账户切换未做**。列表/阅读/搜索/同步/标已读/标星/移动/HTML/附件/分页/i18n/撰写（To/Cc/Bcc + 附件）/`.app` 打包已接通。剩余：新邮件通知（需 FFI 事件流 + `UNUserNotificationCenter`）、草稿保存、真实多账户切换。**验收**：新邮件可触发系统通知；**未验证**：真实 Gmail/QQ/88 账户投递（§10），通知权限与签名分发。
 16. **Hub 写操作覆盖面**。已完成 `keywords`/`mailboxIds` 更新、多副本移动、`/upload`、`Email/import`、`Email/set` 的 `create`/`destroy`、`Thread/get|changes`、`Identity/get`、`EmailSubmission/get|set`（create）；自定义关键字、APNs/FCM、`Email/query` 的 `operator`/`conditions` 组合过滤与升序排序、`EmailSubmission` 的 update/destroy/delayed send 未做；导入/创建只支持 IMAP 账户与单邮箱；一次 `Email/get` 内正文串行拉取；`Thread/changes` 只覆盖本构建之后的变更（升级前历史线程不补发，客户端先 `Thread/get`）。**验收**：客户端可导入、按线程展示、永久删除并发送（已完成）；APNs/FCM 待凭据。
 17. **UIDVALIDITY 重建不逐封报 destroyed**。`reset_mailbox` 不写逐消息变更，JMAP 客户端依赖重新全量加载；正常增量删除已覆盖。**验收**：重建后客户端能收到 `cannotCalculateChanges` 或完整 destroyed 列表。
-18. **客户端双模式未实现（D13，下一项）**。Hub 侧前置已完成：设备令牌绑定账户、标准 `EmailSubmission/set` 发送。剩余前置：Hub 仍无后台同步任务（库只在手动 `sync` 时更新）、对外 HTTPS 依赖反代。客户端适配层（模式选择、地址 + 令牌配置、JMAP 客户端、独立缓存与清除）未开始。**验收**：同一 `.app` 首次运行可选两种模式；远程模式在断网时仍能打开上次缓存的列表，清缓存后可重新加载；客户端不保存邮箱密码。
-19. **Hub 部署底线未补**。无 `/healthz`、无 Dockerfile、无容器密钥后端（`FileStore` 仅开发）、无同步任务调度；TLS 未内置（按 `docs/ARCHITECTURE.md` §3.2 由反代终止）。**验收**：容器内起 Hub 后不跑 CLI 也能收到新邮件（同步任务）；`curl /healthz` 200；反代 TLS 下远程模式连通。
+18. **客户端双模式未实现（D13，下一项）**。Hub 侧前置已完成：设备令牌绑定账户、标准 `EmailSubmission/set` 发送、后台同步（IDLE 池 + 扫尾）、`/healthz` 与容器镜像。剩余前置：对外 HTTPS 依赖反代（按 `docs/ARCHITECTURE.md` §3.2）。客户端适配层（模式选择、地址 + 令牌配置、JMAP 客户端、独立缓存与清除）未开始。**验收**：同一 `.app` 首次运行可选两种模式；远程模式在断网时仍能打开上次缓存的列表，清缓存后可重新加载；客户端不保存邮箱密码。
+19. ~~**Hub 部署底线未补**~~。已补：进程内后台同步（每账户 `watch_account`，`EYRIE_HUB_SYNC`/`EYRIE_HUB_SWEEP_SECONDS`/`EYRIE_HUB_IDLE_SESSIONS`）、匿名 `GET /healthz`（库不可读 503）、仓库根 `Dockerfile`（多阶段、非 root UID 10001、`HEALTHCHECK`）与 `.dockerignore`、文件密钥后端 `EYRIE_HUB_SECRET_DIR` 及主密钥 `EYRIE_HUB_MASTER_KEY_FILE` 注入（缺 key/错 key 启动即失败）。**未做**：TLS 仍由反代终止；快照备份脚本。**验收结果**：Dovecot 实跑不跑 CLI 时投递自动入库（10026→10027）；容器内同样自动同步（10027→10028）、`/healthz` 200 且 `HEALTHCHECK` 为 healthy；缺 key 启动失败。
 
 ---
 
@@ -518,7 +542,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 ### 第 4 段：服务端与移动（进行中）
 
-6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**读写子集、SSE、附件下载、设备吊销、上传、`Email/import`、`Email/set create/destroy`、多副本移动、`Thread/get|changes`、令牌绑定账户、`Identity/get`、`EmailSubmission/get|set` 完成**（2026-11-06）；剩余：APNs/FCM 推送（缺凭据）、Hub 后台同步任务与部署底线（`/healthz`、Dockerfile、容器密钥后端、TLS 反代）。
+6. Hub（axum + JMAP 子集 + 设备配对 + APNs/FCM）。**读写子集、SSE、附件下载、设备吊销、上传、`Email/import`、`Email/set create/destroy`、多副本移动、`Thread/get|changes`、令牌绑定账户、`Identity/get`、`EmailSubmission/get|set`、后台同步（IDLE 池 + 扫尾）、`/healthz`、容器镜像与密钥后端完成**（2026-11-06）；剩余：APNs/FCM 推送（缺凭据）、TLS 反代与备份脚本。
 7. iOS/Android 薄客户端（依赖 Hub 推送凭据）。
 
 ### 第 5 段：日历与翻译
@@ -539,7 +563,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 - 每用户一个 Hub 实例、一个库、一个持久卷；主密钥与库分开放、分开备份；容器内用 KMS/文件密钥后端，不依赖系统钥匙串。
 - 桌面用 SSE；手机后续由 Hub 转 APNs/FCM（载荷只含"有新变更"）。
 - 端口：默认使用标准端口，且全部可通过变量/配置覆盖——Hub API `EYRIE_HUB_BIND`、TLS 反代站点配置、客户端地址自带端口、Dovecot `-p`、开发 SMTP sink 环境变量；默认端口被占用时用覆盖值（如 18080/18443），不改代码常量，部署前用 `lsof` 现查。
-- 上线前置：Hub 内置同步任务（当前缺失）、TLS、服务端密钥后端、令牌绑定账户、发送提交端点、`/healthz` 与备份、Hub 镜像/部署脚本（当前没有 Dockerfile）。
+- 上线前置：~~Hub 内置同步任务~~、~~服务端密钥后端~~、~~令牌绑定账户~~、~~发送提交端点~~、~~`/healthz`~~、~~Hub 镜像~~（均已完成）；剩余 TLS（反代终止）、DB 快照备份、APNs/FCM 凭据。
 - 详细原则、场景表与上线清单见 `docs/ARCHITECTURE.md` §3.2。
 
 ---
@@ -668,7 +692,8 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 - 发送成功但 Sent 归档失败只体现在 `saveError`/`savedTo`；Sent 的服务端副本要等下一次 `sync` 才进本地库，提交后立刻 `Email/get` 可能只看到 Drafts 位置（本地 `send` 同样如此）。
 - `mailboxIds/<id>: null` 与 `mailboxIds/<id>: true` 同时出现表示 JMAP 的移动，后端用 IMAP `MOVE` 满足；只删不加、或删除多个邮箱都不支持，返回 `notSupported`。
 - `EmailSubmission` 没有变更日志：`oldState`/`newState` 取该账户最新提交 id（`e<id>`）；不要把提交写入 `changes`，否则 `Email/changes` 的游标语义会被污染。
-- Hub 仍然是明文 HTTP、默认绑定 `127.0.0.1:8080`，且没有后台同步任务。远程模式对外开放前必须有反代 TLS 与同步任务（见 §8-19）；端口默认用标准值，但必须能通过 `EYRIE_HUB_BIND`、反代配置或客户端地址覆盖，不要在代码里改常量。
+- Hub 默认仍是明文 HTTP、绑定 `127.0.0.1:8080`；后台同步已内置（默认开启），TLS 仍由反代终止。远程模式对外开放前必须有 TLS 入口；容器内绑定 `0.0.0.0` 只代表容器网络，不要直接把 8080 暴露到公网。端口默认用标准值，但必须能通过 `EYRIE_HUB_BIND`、反代配置或客户端地址覆盖，不要在代码里改常量。
+- Hub 的密钥目录（`EYRIE_HUB_SECRET_DIR`，含主密钥与账户密码）与数据库分开挂卷；主密钥文件经 `EYRIE_HUB_MASTER_KEY_FILE` 注入时，必须挂只读。缺 key 或错 key 会让启动直接失败（`database key does not match`），不要为了“能启动”删库重建。
 - 远程模式的“清除缓存”只清客户端缓存与对应 state，绝不调用服务端删除；清完后从 `state=0` 重新拉当前窗口，不能把 `cannotCalculateChanges` 当成清缓存。
 - 列表允许全量元数据缓存，正文/附件按需；不要为了“列表本地”在客户端预先拉全量正文，也不要为了“不全量”把列表改成每次都走网络。
 

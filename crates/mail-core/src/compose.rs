@@ -454,7 +454,7 @@ mod tests {
         let message = OutgoingMessage {
             to: vec!["a@example.com".into()],
             cc: vec!["b@example.com".into()],
-            bcc: vec!["c@example.com".into()],
+            bcc: vec!["hidden@example.com".into()],
             subject: "hi".into(),
             body_text: "body".into(),
             ..OutgoingMessage::default()
@@ -464,13 +464,13 @@ mod tests {
         assert!(raw.contains("To: a@example.com\r\n"));
         assert!(raw.contains("Cc: b@example.com\r\n"));
         assert!(!raw.contains("Bcc:"));
-        assert!(!raw.contains("c@example.com"));
+        assert!(!raw.contains("hidden@example.com"));
         assert_eq!(
             composed.envelope,
             vec![
                 "a@example.com".to_string(),
                 "b@example.com".to_string(),
-                "c@example.com".to_string()
+                "hidden@example.com".to_string()
             ]
         );
     }

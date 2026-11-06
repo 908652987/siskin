@@ -1,0 +1,12 @@
+target
+dist
+apps
+docs
+spike/data
+spike/ffi-probe/gen*
+spike/swift
+spike/scripts
+*.db
+*.db-*
+*.eml
+.git
