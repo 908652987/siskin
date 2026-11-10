@@ -141,6 +141,8 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
 当前核心依赖：`tokio`、`async-imap`、`rustls`/`tokio-rustls`、`rusqlite`（SQLCipher）、`serde`、`thiserror`、`keyring`、`chacha20poly1305`、`hkdf`/`sha2`、`ammonia`（HTML 净化）、`encoding_rs`（字符集）、`quoted_printable`（正文解码）、`axum`（仅 `mail-hub` 的 HTTP 服务，MIT；`tower` 只作为其测试依赖）。
 
+UI 依赖单独管理：`slint`（GPL-3.0；AGPL-3.0 依 §13 可组合，仅允许出现在 `apps/desktop`）；`egui`/`eframe`（MIT/Apache-2.0）只作为 Slint 验证失败后的备选，未采用前不引入。UI 工具链不得进入 `crates/`。
+
 ---
 
 ## 11. 注释与文档

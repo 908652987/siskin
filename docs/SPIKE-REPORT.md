@@ -2,7 +2,7 @@
 
 日期：2026-10-28
 环境：macOS 27.0.1 (arm64)、Rust 1.99.1、Swift 6.4、Dovecot 2.3.19.1（Docker）、Python 3 + dateutil 2.9
-范围：S1 IMAP、S2 macOS 列表、S3 UniFFI、S4 HTML 安全、S5 日历重复规则
+范围：S1 IMAP、S2 macOS 列表、S3 Windows UI（待执行）、S4 HTML 安全、S5 日历重复规则
 
 **未使用任何真实邮箱凭据**；真实提供商只做了未登录的能力探测。
 
@@ -14,7 +14,7 @@
 |---|---|---|
 | S1 IMAP 同步 | **通过（有条件）** | 1 万封头部同步 1.10 s（9,116 封/秒），峰值内存 7.0 MB，IDLE 通知 1.32 s |
 | S2 macOS 十万封列表 | **通过** | 10 万行 RSS 97 MB，滚动单步 p95 0.74 ms，建窗口 28.6 ms |
-| S3 UniFFI 跨语言 | **部分通过** | Swift 侧 50 行/次调用 73.5 µs；Kotlin 绑定可生成；**Windows 未验证** |
+| S3-FFI UniFFI 跨语言 | **部分通过** | Swift 侧 50 行/次调用 73.5 µs；Kotlin 绑定可生成；Windows 改 Slint 同进程（见 §10） |
 | S4 邮件 HTML 安全 | **通过（需一条修正）** | 9 组攻击样本 0 失败；净化后外部请求 0，未净化页面会加载追踪像素 |
 | S5 日历重复规则 | **通过（需一条修正）** | 22 例对 dateutil 21 通过，1 例为夏令时空洞时间 |
 
@@ -74,7 +74,7 @@
 
 ---
 
-## 4. S3：UniFFI
+## 4. S3-FFI：UniFFI 跨语言调用（Apple/Android）
 
 | 指标 | 结果 |
 |---|---|
@@ -83,9 +83,9 @@
 | 25 万行跨语言传输 | 368 ms |
 | 进程 RSS | 6.5 MB |
 | Kotlin 绑定 | 生成成功（未接 Android 工程编译） |
-| C# / WinUI | **未验证**：本机无 dotnet SDK，也没有 Windows 主机 |
+| Windows Slint | **未执行**：见 §10；WinUI 3 + C# 方案已作废（D11） |
 
-结论：FFI 单页调用比 1 ms 预算低一个数量级，分页 50 条的设计成立。Windows 侧仍需在真机上验证 `uniffi-bindgen-cs` + WinUI 3 的链接与内存。
+结论：FFI 单页调用比 1 ms 预算低一个数量级，分页 50 条的设计成立。Windows 侧改为 Slint 同进程调用（D11），仍需在真机上验证内存、CPU、输入法、无障碍与 WebView2 嵌入（见 §10）。
 
 ---
 
@@ -157,7 +157,7 @@ python3 spike/scripts/http_probe_server.py spike/data/web spike/data/web-request
 swiftc -O -framework AppKit spike/swift/ListBench.swift -o spike/swift/listbench
 ./spike/swift/listbench 100000
 
-# S3
+# S3-FFI
 cargo build --release -p ffi-probe
 cargo run --release --bin uniffi-bindgen -- generate \
   --library target/release/libffi_probe.dylib --language swift --out-dir spike/ffi-probe/gen
@@ -171,7 +171,7 @@ cargo run --release --bin uniffi-bindgen -- generate \
 |---|---|---|
 | Gmail 能力与同步 | 本机到 `imap.gmail.com:993` 的 TLS 被中断 | 换网络或代理后重跑 `probe_providers.py` |
 | 真实账户的 UIDVALIDITY 重建、草稿去重、Gmail 标签 | 无凭据 | 一个测试邮箱 + 应用专用密码 |
-| Windows WinUI 3 + UniFFI + 内存 | 无 Windows 主机与 dotnet SDK | Windows 11 开发机 |
+| Windows Slint 内存/CPU、输入法、无障碍、WebView2 | Windows 开发机无 Rust 工具链与 MSVC Build Tools | Windows 11 + Rust MSVC 工具链（见 §10） |
 | Android/iOS 后台与推送 | 未搭移动工程 | 两台真机 + APNs/FCM 凭据 |
 | 日历 CalDAV/Graph 实际同步 | 未接真实账户 | 测试日历账户 |
 
@@ -183,4 +183,34 @@ cargo run --release --bin uniffi-bindgen -- generate \
 2. iCloud 账户默认 60 s 轮询，UI 明确标注“非实时”；移动端仍由 Hub 推送。
 3. 净化器规则改为“默认全部阻断，仅放行 `cid:` 与光栅 data URI”；补相对路径与 `srcset`。
 4. `.ics` 解析增加 DST 空洞时间归一化。
-5. Windows 实施方案保持不变，但把 WinUI 3 + UniFFI 的验证前置为 Windows 开工第一件事。
+5. Windows 改为 Slint 同进程调用（D11），先执行 §10 的 Spike，再开始 UI 实现；WinUI 3 + UniFFI 方案作废。
+
+---
+
+## 10. S3-Windows：Slint 桌面（待执行）
+
+状态：**环境已就绪，最小窗口基线已测，完整 S3 待执行**（2026-11-10）。Windows 11 x64、Rust stable MSVC、VS 2022 Build Tools、Windows SDK、WebView2 Runtime。
+
+### 10.1 已测基线
+
+探针：`spike/windows-ui`（`siskin-windows-spike`），Slint 1.18.1，release，900×600，软件渲染 + 系统字体 + 无障碍，`CN=Siskin Dev` 签名。
+
+| 指标 | 结果 |
+|---|---|
+| 首窗（`Start-Process` 到 `MainWindowHandle`） | 220 ms |
+| 私有工作集（Task Manager Memory，10 s / 500 ms） | 4.6 MB |
+| 私有提交 | 5.4 MB |
+| 工作集 | 24.3 MB |
+| 空闲 CPU（10 s） | 0.0% |
+| 对照：femtovg/OpenGL 后端 | 118.9 MB 私有工作集（同一最小窗口，默认特性临时探针） |
+
+软件渲染避开了 OpenGL/显卡驱动的私有分配；静态窗口空闲 CPU 为 0。**这不是 S3 通过**：10 万行虚拟列表滚动、WebView2 阅读、中文输入法、Narrator/UIA 尚未测。
+
+方法：
+
+1. 安装 Rust MSVC 工具链与 Visual Studio Build Tools 的 C++ 工作负载；用 `powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/check-windows-ui-prereqs.ps1` 复查（默认 Restricted 执行策略会拒绝未签名脚本）。
+2. 建 `apps/desktop` 最小 Slint 骨架：10 万行虚拟列表（模型只持有当前页 50 条），另加单封 HTML 阅读（WebView2，JS 关闭，池化 1 个）。
+3. 用 `powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/measure-windows-process.ps1 -ProcessName siskin-desktop -Seconds 60` 采样：私有工作集、工作集、CPU、`msedgewebview2.exe` 子进程（默认包含后代进程）。
+4. 人工验证：微软拼音组合、Narrator/UIA、125/150/200% DPI、剪贴板与文本选择；Slint 默认渲染后端启动与回退。
+
+通过标准：主进程私有工作集 ≤100 MB；空闲 CPU ≤0.5%；冷启动首帧 ≤1.5 s；10 万行滚动 ≥55 fps；WebView2 子进程 ≤150 MB 且关闭阅读后回落。

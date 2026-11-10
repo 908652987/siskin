@@ -15,6 +15,7 @@ members = [
   "spike/rrule-probe",
   "spike/html-probe",
   "spike/ffi-probe",
+  "spike/windows-ui",
 ]
 
 [workspace.metadata]
@@ -48,6 +49,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
+
+# UI spike only; apps/desktop will use the same features. The software renderer
+# avoids the OpenGL driver's private allocations on Windows (docs/SPIKE-REPORT.md §10).
+slint = { version = "1.18.1", default-features = false, features = [
+  "std",
+  "backend-winit",
+  "renderer-software",
+  "software-renderer-systemfonts",
+  "accessibility",
+  "compat-1-18",
+] }
+slint-build = "1.18.1"
 
 [profile.release]
 lto = "thin"

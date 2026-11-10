@@ -1,0 +1,11 @@
+[package]
+name = "siskin-windows-spike"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+slint = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

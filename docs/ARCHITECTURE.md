@@ -29,7 +29,7 @@
 | # | 决策 | 理由 | 代价 |
 |---|---|---|---|
 | D1 | 核心用 Rust，单份代码被四端调用 | 无 GC、内存可预测、交叉编译、IMAP/MIME/加密生态完整 | 团队需要 Rust 能力 |
-| D2 | UI 全部原生（SwiftUI / WinUI 3 / Compose） | 内存与手感优先，接受多套 UI | 3 套 UI 代码，工期约翻倍 |
+| D2 | UI 按平台：SwiftUI（macOS/iOS）、Slint（Windows/Linux 桌面）、Compose（Android） | 内存与 CPU 优先；Windows/Linux 共用一套纯 Rust UI，桌面端不引入 CLR 或 WebView 框架 | 3 套 UI 代码；Slint 的中文输入法、无障碍与 WebView2 嵌入需 Windows 真机验证 |
 | D3 | 客户端与 Hub 之间用 JMAP 子集（RFC 8620/8621） | 增量同步、状态字符串、SSE 推送已有标准语义，不自创协议 | JSON 体积略大，需要实现子集 |
 | D4 | 桌面支持"本地直连"与"连 Hub"两种模式，共用同一核心 | 隐私与多端一致各取所需；手机端只做薄客户端 | 核心需抽象 provider |
 | D5 | 存储统一 SQLite + FTS5（SQLCipher 加密） | 单文件、事务、全文检索、可跨平台打包 | 并发写需串行化 |
@@ -38,8 +38,8 @@
 | D8 | AGPL-3.0 | 自托管产品防闭源白嫖；与 GPL-3 代码可组合 | 商业客户敏感 |
 | D9 | 组件策略：优先平台官方与成熟库，只有同步状态机与 HTML 净化自研 | 减少自研面，降低长期维护成本 | 依赖较多，需做许可与维护状态审查 |
 | D10 | 首发平台 macOS + Windows（同一里程碑，先后实现） | 覆盖主要桌面用户 | 移动端与 Linux 延后 |
-| D11 | Windows 内存路线：先 WinUI 3（目标 110–130 MB），不满意再评估 C++/WinRT 或 Slint | 先用最省事的原生栈验证内存目标 | 未在 Windows 上验证 |
-| D12 | Linux 桌面 UI 用 Slint（纯 Rust，单进程直连 `mail-core`） | 无 WebView、无 GTK/Qt 运行时依赖，内存与启动开销可控；macOS 上即可编译运行同一份代码，验证不受 Linux 机器限制 | 第四套 UI 代码；Slint DSL 与三端原生 UI 不共享布局 |
+| D11 | Windows 桌面 UI 用 Slint（纯 Rust，单进程直连 `mail-core`），与 Linux 共用一套 UI；不再先做 WinUI 3 | WinUI 3 空闲 110–160 MB（同类业务应用实测约 155 MB），.NET 运行时本身 40–60 MB，与低内存目标冲突；MDM 在 Windows 用 egui 实测 70 MB 私有工作集（含显卡驱动共享约 120 MB、托盘 <10 MB），证明纯 Rust UI 可达标；Slint 与 D12 合并后桌面端只需一套 UI | 中文输入法、UIA 无障碍、WebView2 子窗口嵌入需真机验证；Windows 开发机需 Rust MSVC 工具链 |
+| D12 | Linux 与 Windows 桌面 UI 共用 Slint（纯 Rust，单进程直连 `mail-core`） | 无 CLR / WebView 框架 / GTK / Qt 运行时依赖；内存与启动开销可控；macOS 上即可编译运行同一份代码，验证不受 Linux 机器限制；Windows 由 Rust 直接调用核心，不需要 UniFFI | 两平台共享 `.slint` 与视图模型，平台差异集中在 `src/platform/`；Slint 控件外观与 Windows 原生有差距，中文输入法与无障碍需实测 |
 | D13 | 客户端首次运行选择"本地模式"或"远程模式"；远程模式只填服务端地址 + 设备令牌，邮箱凭据只留在服务端；客户端缓存列表元数据与已打开的正文/附件，可随时清除；服务端地址必须 HTTPS（回环例外） | 把 D4 落成可操作的产品形态：远程模式不接触邮箱密码，缓存可丢弃重建；正文不全量落客户端 | 客户端需要 JMAP 适配层与独立缓存；服务端提交端点与令牌按账户授权已实现；HTTPS 与后台同步仍待部署 |
 
 ---
@@ -71,7 +71,7 @@ flowchart TB
 
   subgraph Clients[客户端]
     MAC[macOS SwiftUI]
-    WIN[Windows WinUI 3]
+    WIN[Windows/Linux Slint]
     IOS[iOS SwiftUI]
     AND[Android Compose]
   end
@@ -83,7 +83,8 @@ flowchart TB
   PARSE <--> SYNC
   STORE <--> XLATE
   FFI <--> STORE
-  FFI <--> MAC & WIN & IOS & AND
+  WIN <--> Core
+  FFI <--> MAC & IOS & AND
   STORE <--> API
   API --> PUSH --> IOS & AND
   API <--> MAC & WIN
@@ -92,7 +93,7 @@ flowchart TB
 
 ### 3.1 两种运行形态（D4 / D13）
 
-- **本地模式（桌面默认）**：UI 通过 UniFFI 调用进程内核心，核心直连 IMAP/CalDAV；邮箱凭据存客户端钥匙串。首次运行的默认选项。
+- **本地模式（桌面默认）**：Slint 桌面（Windows/Linux）以同进程 Rust 调用 `mail-core`；Apple 与 Android 经 UniFFI 调用同一核心。核心直连 IMAP/CalDAV；邮箱凭据存客户端钥匙串。首次运行的默认选项。
 - **远程模式（Hub）**：核心在服务端运行，客户端通过 JMAP 子集读写；客户端只保存 Hub 地址与设备令牌，不保存邮箱密码，也不直连 IMAP/SMTP。手机只支持此模式。
 
 远程模式的客户端约定：
@@ -198,10 +199,9 @@ flowchart LR
 │   ├── mail-hub/               # 服务端二进制
 ├── apps/                       # 各平台 UI 一律放这里，不混进 crates/
 │   ├── macos/                  # SwiftUI
-│   ├── windows/                # WinUI 3 + C#
+│   ├── desktop/                # Slint（Windows/Linux 共用，workspace 成员，未创建）
 │   ├── ios/                    # SwiftUI
-│   ├── android/                # Kotlin + Compose
-│   └── linux/                  # Slint（Rust 二进制，workspace 成员，未创建）
+│   └── android/                # Kotlin + Compose
 ├── docs/
 └── tests/
     ├── conformance/            # IMAP/CalDAV 兼容矩阵
@@ -217,14 +217,15 @@ mail-core → mail-sync → mail-proto, mail-parse（仅头部解码）
          → mail-crypto
          → mail-translate
 mail-ffi → mail-core, mail-parse
-apps/linux → mail-core
+apps/desktop → mail-core
 mail-api → mail-store
 mail-hub → mail-api, mail-core
 ```
 
 `mail-parse` 不得依赖网络；`mail-store` 不得依赖 UI；`mail-api` 不得依赖 IMAP 类型；
-`apps/linux` 是唯一允许引入 Slint 的 workspace 成员，其余 crate 不得依赖 UI 工具链；
-它与其他平台的 UI 一样只通过门面（`mail-core`，未来是 `mail-ffi`）访问核心。
+`apps/desktop` 是唯一允许引入 Slint 的 workspace 成员；Windows 与 Linux 共用 `.slint`
+与视图模型，平台差异集中在 `src/platform/{windows,linux}.rs`。其余 crate 不得依赖 UI
+工具链；桌面 UI 与移动 UI 一样只通过门面（`mail-core`；Apple/Android 经 `mail-ffi`）访问核心。
 
 ---
 
@@ -571,14 +572,15 @@ pub trait Translator: Send + Sync {
 |---|---|---|
 | 安装包（桌面） | ≤ 25 MB | 超出则排查依赖 |
 | 冷启动 | ≤ 1.5 s | 首帧 |
-| 空闲内存 | macOS ≤ 120 MB；Windows ≤ 160 MB | 私有内存 |
+| 空闲内存 | macOS ≤ 120 MB；Windows ≤ 100 MB（Slint 主进程） | 私有工作集；WebView2 子进程单列 |
+| 读信内存 | 单个 WebView2 实例 ≤ 150 MB | 池化 1 个，切走即释放 |
 | 空闲 CPU | ≤ 0.5% | IDLE/SSE，无轮询 |
 | 列表滚动 | 10 万封 ≥ 55 fps | 回收复用行 |
 | 搜索 | P95 ≤ 150 ms | 10 万封，FTS5 |
 | FFI 往返 | ≤ 1 ms/次，单次批量 ≤ 200 条 | 禁止逐行调用 |
 | 增量同步 | ≤ 2 s 端到端 | Hub 推送 |
 
-Windows 的 .NET 运行时本身占 40–60 MB，160 MB 是常规实现的下限；更低内存的可行路线见 §15。
+Windows 目标从 160 MB 下调到 100 MB：WinUI 3 的 .NET/XAML 运行时本身占 40–60 MB，常规实现下限约 155 MB；Slint 是纯 Rust 单进程，不需要 CLR。WebView2 只在打开正文时存在，按子进程单独计量，不计入 UI 主进程。依据与验证门槛见 §15。
 
 ---
 
@@ -602,11 +604,11 @@ CI 门禁：`fmt`、`clippy -D warnings`、`test`、`deny`、`bench`、产物体
 |---|---|---|---|
 | S1 | Rust 能稳定覆盖主流 IMAP 行为 | 连接 5 类账户，跑增量同步与 IDLE | 无卡死/丢信，10k 封同步 < 60s |
 | S2 | macOS SwiftUI 能撑住 10 万封列表 | UniFFI 分页 + NSTableView | 滚动 ≥ 55 fps，内存 ≤ 120 MB |
-| S3 | Windows 能用 UniFFI 调 Rust | `uniffi-bindgen-cs` + WinUI 3 空壳 | 调用成功，内存 ≤ 160 MB |
+| S3 | Windows 能用 Slint 直连 Rust 核心 | `apps/desktop` 空壳 + 10 万行虚拟列表 | 私有工作集 ≤ 100 MB，空闲 CPU ≤ 0.5%，滚动 ≥ 55 fps |
 | S4 | HTML 邮件可安全渲染 | 净化 + JS 禁用 WebView + 追踪像素拦截 | 无脚本执行，无外部请求 |
 | S5 | 日历重复规则正确 | 20 组刁钻 RRULE + 时区用例 | 与 Google Calendar 展开结果一致 |
 
-实测结果见 `docs/SPIKE-REPORT.md`。任一不通过，按下列顺序降级：S3 失败 → Hub 走本地 HTTP/IPC；S2 失败 → 列表分页粒度改小并复用行；S1 失败 → 自写 IMAP 连接层（基于 `imap-proto`）。
+实测结果见 `docs/SPIKE-REPORT.md`。任一不通过，按下列顺序降级：S3 失败 → 退回 egui（MDM 已验证）；若仍不达标且产品接受 150 MB 级内存，再评估 WinUI 3。S2 失败 → 列表分页粒度改小并复用行。S1 失败 → 自写 IMAP 连接层（基于 `imap-proto`）。
 
 ---
 
@@ -683,16 +685,16 @@ CI 门禁：`fmt`、`clippy -D warnings`、`test`、`deny`、`bench`、产物体
 
 | 功能 | macOS / iOS | Windows | Android |
 |---|---|---|---|
-| 基础控件 | SwiftUI + AppKit（NSTableView / NSOutlineView / NSTextView） | WinUI 3 + CommunityToolkit.WinUI（MVVM Toolkit、ItemsRepeater、SettingsCard） | Jetpack Compose + Material 3（LazyColumn） |
-| 长列表（10 万封） | NSDiffableDataSource + 行复用 | ItemsRepeater + x:Bind 编译绑定 | LazyColumn + key 复用 |
-| 富文本撰写 | NSTextView / UITextView（attributed string） | RichEditBox | Compose Rich Editor（`com.github.MohamedRejeb.Compose-Rich-Editor`） |
-| 邮件正文渲染 | WKWebView（禁用 JS） | WebView2（禁用脚本、离屏池化） | WebView（禁用 JS） |
-| 通知 | UNUserNotificationCenter | WinRT Toast | NotificationManager |
-| 钥匙串 | Security.framework | Windows Credential Locker / DPAPI | Android Keystore |
-| OAuth 浏览器 | ASWebAuthenticationSession | WebAuthenticationBroker | Custom Tabs |
-| 自动更新 | Sparkle | MSIX + App Installer | Play 商店 |
-| 崩溃上报 | Sentry Cocoa | Sentry .NET | Sentry Android |
-| 测试 | XCTest | xUnit | JUnit |
+| 基础控件 | SwiftUI + AppKit（NSTableView / NSOutlineView / NSTextView） | Slint std-widgets + 少量自绘（纯 Rust，无 CLR） | Jetpack Compose + Material 3（LazyColumn） |
+| 长列表（10 万封） | NSDiffableDataSource + 行复用 | Slint `ListView` + Rust 模型只持有当前页（50 条） | LazyColumn + key 复用 |
+| 富文本撰写 | NSTextView / UITextView（attributed string） | Slint `TextEdit`（先纯文本；富文本编辑器待选型） | Compose Rich Editor（`com.github.MohamedRejeb.Compose-Rich-Editor`） |
+| 邮件正文渲染 | WKWebView（禁用 JS） | WebView2（禁用脚本、池化 1 个、切走释放） | WebView（禁用 JS） |
+| 通知 | UNUserNotificationCenter | Windows Toast（`windows` crate） | NotificationManager |
+| 钥匙串 | Security.framework | keyring（Windows Credential Manager） | Android Keystore |
+| OAuth 浏览器 | ASWebAuthenticationSession | 系统浏览器 + 回环回调 | Custom Tabs |
+| 自动更新 | Sparkle | 安装器 + 发布签名校验（MSIX/WiX 待定） | Play 商店 |
+| 崩溃上报 | Sentry Cocoa | Sentry Rust（待定） | Sentry Android |
+| 测试 | XCTest | Rust 单测 + Slint 快照（待定） | JUnit |
 
 ### 13.2 核心与服务端
 
@@ -747,24 +749,42 @@ CI 门禁：`fmt`、`clippy -D warnings`、`test`、`deny`、`bench`、产物体
 
 ---
 
-## 15. Windows 内存路线
+## 15. Windows UI 栈与内存路线
 
-现状：.NET XAML 应用的空闲内存有一层运行时成本，实测同类业务应用 WinUI 3 约 155 MB、WPF 约 185 MB。Native AOT 主要改善启动速度与体积，对工作集的削减视应用而定（微软官方措辞）。
+结论（D11）：Windows 与 Linux 共用 Slint（纯 Rust，`apps/desktop`），不采用 WinUI 3。
 
-| 方案 | 预期空闲内存 | 相对 WinUI 3 的工期增量 | 风险 |
+### 15.1 依据
+
+- WinUI 3 的空闲内存有一层 CLR/XAML 运行时成本：同类业务应用实测约 155 MB，WPF 约 185 MB；.NET 运行时本身 40–60 MB。即便 Native AOT，预期也只到 90–130 MB，且 AOT 仍受限。
+- 纯 Rust UI 的 Windows 实测：MDM（egui/eframe）窗口打开、无下载时约 70 MB 私有工作集，含显卡驱动共享约 120 MB；托盘 <10 MB；程序 38 MB；发布 86 种语言。它证明 Rust UI + GPU 渲染 + 系统字体在 Windows 上可以长期发布。
+- Slint 与 egui 同属纯 Rust；Slint 是保留模式声明式 UI，文本选择、输入法、无障碍与表格虚拟化不需要像 egui 那样全部自绘。Siskin 没有维护 egui/winit fork 的预算。
+- Windows/Linux 共用一套 `.slint` 与视图模型后，桌面 UI 从两套变一套，也不再需要 C# / `uniffi-bindgen-cs`。
+
+| 方案 | 预期空闲内存 | 工期（相对 WinUI 3） | 结论 |
 |---|---|---|---|
-| WinUI 3 + .NET（常规） | 110–160 MB | 基准 | 低 |
-| WinUI 3 + Native AOT + 调优 | 90–130 MB | +3~4 周 | 中（AOT 仍为预览，反射受限） |
-| C++/WinRT（无 CLR） | 50–90 MB | +3~4 个月 | 高（C++ 内存安全、跨语言边界） |
-| Rust + Slint（与核心同语言） | 50–90 MB | +2~3 个月 | 中高（控件、无障碍、中文输入法需验证） |
+| WinUI 3 + .NET | 110–160 MB（同类实测约 155） | 基准 | 放弃 |
+| WinUI 3 + Native AOT | 90–130 MB | +3~4 周 | 放弃：仍高于目标，AOT 受限 |
+| C++/WinRT | 50–90 MB | +3~4 个月 | 不做：C++ 内存安全与边界成本 |
+| **Rust + Slint** | **50–90 MB（待实测）** | **+2~3 个月** | **采用（D11/D12）** |
+| Rust + egui（参照） | 约 70 MB（MDM 实测） | 需自绘全部控件 | 备选：Slint 验证失败时的退路 |
 
-调优清单（在任一方案下均适用）：
+### 15.2 内存账
 
-- 单进程；WebView2 不预加载，按需创建并池化 1–2 个实例。
-- 所有列表用虚拟化容器，禁止把整表绑定到内存集合。
-- 数据分页从核心取，单页 50 条，FFI 批量返回。
-- 图片按显示尺寸解码；附件不预载。
-- 关闭 Mica/Acrylic 与高开销动画（设置项可开）。
-- 发布用 ReadyToRun 起步，AOT 作为可选通道验证后再切换。
+- **UI 主进程**：Slint + 布局 + 当前页 50 条元数据，目标 ≤100 MB 私有工作集。
+- **WebView2**：只在打开正文时创建，池化 1 个，禁用 JS 与外部资源；切走即释放。按 `msedgewebview2.exe` 子进程单独计量，目标单实例 ≤150 MB。
+- **核心**：SQLCipher 连接与分页查询在 UI 进程内，沿用 §9 预算；不因 UI 栈变化。
 
-决策建议：先用 WinUI 3 做到 110–130 MB，验证阶段实测；若不能接受，再在 Windows 客户端开工前整体切 C++/WinRT 或 Slint。**不要一开始就上 C++/WinRT**——那会把主要风险从"产品能否做成"变成"能否写完"。
+### 15.3 验收门槛（Windows 11 真机，Spike S3）
+
+1. 空壳 + 10 万封虚拟列表：私有工作集 ≤100 MB；空闲 CPU ≤0.5%（60 s 平均）；冷启动首帧 ≤1.5 s；滚动 ≥55 fps。
+2. 单封 HTML 正文（WebView2，JS 关闭）：主进程增量 ≤30 MB；`msedgewebview2.exe` 全部子进程 ≤150 MB；关闭阅读后回落到基线。
+3. 中文输入法（微软拼音）、Narrator/UIA、高 DPI 125/150/200%、剪贴板与文本选择。
+4. Slint 渲染后端：Windows 默认后端启动成功；失败时可回退且不崩溃；空闲 CPU 达标。
+5. 测量脚本：`powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/measure-windows-process.ps1`（私有工作集、工作集、CPU、WebView2 子进程）。
+
+### 15.4 风险与未验证
+
+- Slint 在 Windows 的中文输入法组合、UIA 树与 WebView2 子窗口嵌入未在本仓库验证，是选型成立的前提。
+- Slint 的 GPL-3.0 与 AGPL-3.0 组合可用（AGPL §13），仍需在依赖政策中登记并核对具体版本。
+- Windows 开发构建必须签名：未签名 exe 从 Explorer 启动会触发 Windows 的“未知发布者”提示，进程挂起等待放行；使用 `spike/scripts/build-windows-ui.ps1` 构建并签名。发布给用户的包必须用受信任的代码签名证书；见 `docs/HANDOFF.md` §6.1/§11。
+- 若 Slint 在 S3 任一项不达标，退回 egui（MDM 已验证），不回 WinUI 3。

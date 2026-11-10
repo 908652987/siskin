@@ -1,4 +1,5 @@
 /target
+/tmp
 /spike/data
 /spike/swift/listbench
 /spike/swift/webview-probe

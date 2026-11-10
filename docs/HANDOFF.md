@@ -1,6 +1,6 @@
 # 交接存档
 
-更新日期：2026-11-06
+更新日期：2026-11-10
 分支：`main`　许可：AGPL-3.0
 用途：任何人（或下一次会话）读完本文件即可继续开发，无需回溯聊天记录。
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（含 `create`/`destroy`）、`Email/import`、`Thread/get|changes`、多副本移动、`/upload`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM 未做；**Hub 已内置后台同步**（IDLE 池 + 扫尾，进程内按账户启动/重连）、`/healthz`、容器镜像与卷内文件密钥后端/主密钥注入）；**macOS 客户端已可收发**：列表/阅读/搜索、撰写（To/Cc/Bcc + 多附件，`mail-ffi::send`）与 `dist/Siskin.app` 打包完成，通知未做；Linux 桌面 UI 技术栈定为 Slint（D12），Windows UI、日历、手机客户端尚未开始。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（含 `create`/`destroy`）、`Email/import`、`Thread/get|changes`、多副本移动、`/upload`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM 未做；**Hub 已内置后台同步**（IDLE 池 + 扫尾，进程内按账户启动/重连）、`/healthz`、容器镜像与卷内文件密钥后端/主密钥注入）；**macOS 客户端已可收发**：列表/阅读/搜索、撰写（To/Cc/Bcc + 多附件，`mail-ffi::send`）与 `dist/Siskin.app` 打包完成，通知未做；Linux 与 Windows 桌面 UI 统一 Slint（D11/D12；`apps/desktop` 未创建），Windows 先做 Spike S3；日历、手机客户端尚未开始。
 
 ---
 
@@ -17,7 +17,7 @@
 | # | 决策 | 选择 | 说明 |
 |---|---|---|---|
 | D1 | 核心语言 | Rust | 四端共用一份同步/解析/加密核心 |
-| D2 | 界面 | 全原生：SwiftUI（macOS/iOS）、WinUI 3（Windows）、Compose（Android） | 用户明确选择低内存优先，接受三套 UI |
+| D2 | 界面 | SwiftUI（macOS/iOS）、Slint（Windows/Linux 桌面）、Compose（Android） | 用户明确选择低内存优先；桌面两端共用一套纯 Rust UI |
 | D3 | 客户端与 Hub 协议 | JMAP 子集（RFC 8620/8621） | 不自创协议 |
 | D4 | 部署形态 | 桌面可单机直连；手机与跨设备走自建 Hub | 手机端只做薄客户端 |
 | D5 | 存储 | SQLite + FTS5；目标加密 SQLCipher | SQLCipher 已接入，密钥由钥匙串主密钥 HKDF 派生 |
@@ -26,8 +26,8 @@
 | D8 | 许可 | AGPL-3.0 | 与 GPL-3 代码可组合 |
 | D9 | 组件策略 | 优先平台官方与成熟库，只有同步状态机与 HTML 净化自研 | |
 | D10 | 首发平台 | macOS + Windows（同一里程碑，先后实现） | |
-| D11 | Windows 内存路线 | 先 WinUI 3（目标 110–130 MB），若不接受再评估 C++/WinRT 或 Slint | 未在 Windows 上验证 |
-| D12 | Linux 桌面 UI 技术栈 | Slint（纯 Rust，单进程直连 `mail-core`） | 无 WebView / GTK / Qt 运行时依赖；macOS 上即可编译运行验证。代价：第四套 UI，Windows 若也转 Slint 需重评 D11 |
+| D11 | Windows 桌面 UI | Slint（纯 Rust，单进程直连 `mail-core`），与 Linux 共用 `apps/desktop`；不做 WinUI 3 | WinUI 3 同类实测约 155 MB、.NET 运行时 40–60 MB；MDM 的 egui 在 Windows 实测 70 MB 私有工作集，证明纯 Rust UI 可达标 |
+| D12 | Linux/Windows 桌面 UI | 共用 Slint（`apps/desktop`，workspace 成员） | 无 CLR / GTK / Qt 运行时；Windows 不需要 UniFFI；代价是输入法、无障碍、WebView2 嵌入需真机验证 |
 | D13 | 客户端双模式形态 | 首次运行选择本地模式或远程模式；远程模式只填服务端地址 + 设备令牌，邮箱凭据只在服务端；客户端缓存列表元数据与已打开正文/附件，可一键清除；服务端地址必须 HTTPS（回环例外），令牌按账户授权 | 把 D4 落成可操作产品形态；远程模式客户端不接触邮箱密码；列表可全量缓存，正文/附件按需；服务端提交端点与令牌按账户授权已实现，客户端适配层待做 |
 
 完整理由与代价见 `docs/ARCHITECTURE.md` §2。
@@ -79,8 +79,9 @@
 | macOS 撰写 | 完成 | `ComposeView` + `mail-ffi::send`：To/Cc/Bcc、主题、纯文本正文、多附件（NSOpenPanel + UTType MIME）、发送失败保留草稿；⌘N / 工具栏入口；Dovecot + 本地 SMTP sink 实发，`Sent` 归档 |
 | macOS `.app` 打包 | 完成 | `apps/macos/package.sh`：release 静态链接 + `Info.plist`（`com.eyrie.siskin`）+ 资源 bundle + ad-hoc 签名；`dist/Siskin.app` 直接启动并渲染撰写快照 |
 | macOS 通知 | 未开始 | 需要 FFI 事件流与通知权限，单独一段 |
-| Windows / Linux / 移动 UI | 未开始 | Linux 栈已定 Slint（D12）；Windows/iOS/Android 仍按 D2 |
-| Windows / 移动端验证 | 未开始 | 本机无 Windows、无 .NET SDK |
+| Windows / Linux 桌面 UI | 未开始（栈已定） | D11/D12：Slint 单进程直连 `mail-core`；`apps/desktop` 未创建；先做 Spike S3 |
+| iOS / Android UI | 未开始 | 按 D2；依赖 Hub 推送凭据 |
+| Windows UI 验证 | 工具链就绪，基线已测（2026-11-10） | Rust stable MSVC + VS 2022 Build Tools + Windows SDK + WebView2；Slint 1.18.1 最小窗口（软件渲染）首窗 220 ms、私有工作集 4.6 MB、工作集 24.3 MB、空闲 CPU 0.0%；完整 S3 待测 |
 | 代码规范与风格固化 | 完成 | `AGENTS.md` + `docs/CONVENTIONS.md` + rustfmt/clippy/CI |
 
 ---
@@ -418,6 +419,51 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | UI 工具链 | Slint 为纯 Rust 依赖，本机可编译运行；**无 pkg-config、GTK、Qt 开发库**，GTK4/Tauri 方案在本机无法编译验证（D12 据此选定 Slint） |
 | Hub 端口 | 默认标准端口，全部可覆盖：Hub API 用 `EYRIE_HUB_BIND`（代码默认 `127.0.0.1:8080`）、TLS 反代用站点配置、客户端地址自带端口；Dovecot 用 `docker -p ${DOVECOT_PORT:-31143}:143`；起服务前 `lsof -nP -iTCP:<port> -sTCP:LISTEN` 现查 |
 
+### 6.1 Windows 开发环境
+
+| 项 | 要求 |
+|---|---|
+| 系统 | Windows 11 x64 |
+| Rust | stable MSVC 工具链（`x86_64-pc-windows-msvc`） |
+| C++ | Visual Studio 2022 Build Tools：`VCTools` 工作负载 + Windows SDK |
+| WebView2 | Evergreen Runtime |
+| 构建 | `spike/scripts/build-windows-ui.ps1`（构建后自动签名） |
+| 首次准备 | 每台机器执行一次 `spike/scripts/setup-dev-signing.ps1` |
+
+任一 Windows 开发机首次拉取后：
+
+1. 安装 Rust（MSVC 工具链）与 VS Build Tools 的 C++ 工作负载。
+2. **双击 `build-windows.cmd`**：首次运行会自动准备本机签名证书，然后编译并签名。
+3. **双击 `target\release\siskin-windows-spike.exe`**：直接启动，不再有安全提示。
+
+`setup-windows.cmd` 仍保留，用于只检查环境/只准备证书；正常构建不需要单独运行。
+
+也可以手动运行等价命令：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/setup-dev-signing.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/build-windows-ui.ps1
+```
+
+不要直接用 `cargo build` 后双击：新 exe 未签名，提示会再次出现。构建脚本签名后还会把 exe 的完整性级别设为 Medium；若 exe 由沙箱/CI 以 Low 完整性创建，即使签名有效，Explorer 仍会弹“无法验证发布者”。换机后重复第 2、3 步；把 exe 拷到另一台电脑时，对方必须信任签它的证书，或使用 CA 签名（见 §6.2）。
+
+签名证书的三种用法：
+
+- **每台机器各自生成**（推荐开发）：`setup-dev-signing.ps1` 在每台机器创建独立的本地证书，互不共享私钥。
+- **团队共享一张开发证书**：把 PFX 放进团队密钥库，导入 `Cert:\CurrentUser\My`，并把对应 CER 加入 `TrustedPublisher` 与 `Root`；私钥不入库、不进仓库。
+- **发布给最终用户**：本地自签名证书在别人的电脑上不受信任，发布包必须用 CA 签发的代码签名证书；否则用户仍会看到“未知发布者”。
+
+### 6.2 Windows 发布签名
+
+开发证书只在本机受信任，不能随安装包分发。发布给用户的 exe 必须用 CA 签发的代码签名证书：
+
+1. 申请 OV/EV 代码签名证书；开源项目可评估公益代码签名服务。
+2. 在 CI 中从密钥库读取 PFX/密钥，用 `signtool sign /fd SHA256 /tr <RFC 3161 时间戳> /td SHA256` 签名；私钥不入库、不进仓库。
+3. 发布前对每个产物运行 `signtool verify /pa /all`；失败不得发布。
+4. EV 证书或商店分发可减少系统对新程序的名誉等待。
+
+没有受信任签名的 exe，Windows 一定显示“未知发布者”；这是系统安全行为，代码无法绕过。签名后的 exe 才能在任何 Windows 上直接双击启动。
+
 ---
 
 ## 7. 实测数据（摘要）
@@ -512,7 +558,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 5. **B/C 档未实跑**。**验收**：iCloud（C 档）账户实际同步，移动邮件走 COPY+删除；B 档需一台不广告 CONDSTORE 的服务器。
 6. ~~**重连未做故障注入**~~。已在 `watch_account` 下实测：4 个 IDLE 会话在 Dovecot 重启时同时断线，按 1/2/4 s 退避重连，恢复后新邮件正常入库且无重复行。未覆盖：网络分区（连接挂起而非断开）与「重连后服务端丢了 UIDVALIDITY」之外的乱序响应。
 7. **中文 1–2 字搜索走 LIKE 扫描**，现在同时扫正文列。10k 封（正文约 3,800 字/封）实测 2 字查询 137 ms；10 万封按线性外推约 1.4 s，**未验证**。**验收**：10 万封下 2 字查询 P95 < 150 ms（需要专门的分词/前缀索引，不能靠 LIKE）。
-8. **Windows/移动端零验证**。**验收**：WinUI 3 调 Rust（uniffi-bindgen-cs），空闲内存 ≤ 160 MB。
+8. **Windows/移动端零验证**。**验收**：Slint 主进程空闲私有工作集 ≤ 100 MB、空闲 CPU ≤ 0.5%、10 万封滚动 ≥ 55 fps；单 WebView2 实例 ≤ 150 MB（子进程单列）；中文输入法与 Narrator/UIA 可用。详见 `docs/ARCHITECTURE.md` §15.3。
 9. **POP3 语义受限**。无文件夹、无标志位、无 IDLE；本地删除仅影响本地，服务器删除通过 UIDL 列表消失检测；UIDL 以 63 位哈希映射为数字 uid。**验收**：真实 POP3 账户同步与删除行为符合预期。
 10. **发信能力窄**。仅纯文本 UTF-8；无附件、HTML、草稿；Sent 归档仅在 IMAP 账户尝试。**验收**：真实账户收到邮件，Sent 归档或明确报错。
 11. **明文端口需显式开关**。`--security plaintext` 或 `--smtp-security plaintext` 必须同时给 `--insecure-plaintext true`；QQ 的 143/110 不提供 STARTTLS。
@@ -554,8 +600,7 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 10. 客户端双模式（D13）：首次运行选择本地/远程；远程填服务端地址 + 设备令牌（配对时绑定账户）；抽象 UI 数据源（FFI 本地 / JMAP 远程）；独立缓存与清缓存。远程发送已就绪（标准 `EmailSubmission/set`），客户端需在 FFI 侧暴露「按 compose 字段生成 RFC 822 + envelope」的助手，避免 Swift 再写一套 MIME。
 11. macOS SwiftUI：列表/阅读/搜索/同步/标已读/撰写（To/Cc/Bcc + 附件）/`.app` 打包完成；剩余通知、草稿、真实多账户切换。
-12. Windows WinUI 3（复用 Rust 核心）。
-13. Linux Slint（`apps/linux`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定，实现未开始。
+12. Windows/Linux Slint（`apps/desktop`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定（D11/D12），实现未开始。**第一步是 Spike S3**：用 `check-windows-ui-prereqs.ps1` 复查环境；构建必须走 `spike/scripts/build-windows-ui.ps1`（构建后自动签名，避免 Windows 附件管理器拦截）；再用 `measure-windows-process.ps1 -ProcessName siskin-windows-spike` 记录内存/CPU。首窗、空闲内存/CPU 基线已测，10 万行滚动、WebView2、输入法与无障碍仍待测；达标后开始 UI。
 
 ### 远程模式部署分布（D13，推荐）
 
@@ -575,7 +620,8 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | 一个 Gmail 测试账户（应用专用密码，需开启 2FA 与 IMAP） | Gmail 能力与标签映射验证 | 未提供则 Gmail 路径未实测 |
 | 一个 QQ 或 88 测试账户（授权码/专用密码） | 真实预设同步 + POP3/IMAP/SMTP 验收 | 未提供则真实收发未实测 |
 | 一个 iCloud 账户（应用专用密码） | C 档与 COPY+删除路径实测 | 阻塞 §8-5 的 C 档验证 |
-| 一台 Windows 11 机器 + .NET SDK | WinUI 3 + UniFFI 内存验证 | 阻塞 Windows UI 段 |
+| ~~Windows 11 机器 + Rust MSVC 工具链~~ | Slint 内存/CPU、中文输入法、无障碍、WebView2 验证 | 已具备（2026-11-10） |
+| CA 代码签名证书（OV/EV） | Windows 发布包双击无“未知发布者”提示 | 未提供则发布包仍会提示 |
 | APNs / FCM 凭据 | 手机推送 | 阻塞移动端 |
 | 自建 Hub 的域名与 TLS 证书（或明确只在内网/回环使用） | 远程模式连通与安全验收 | 未提供则远程模式只能本机回环验证 |
 | ~~是否先做 Hub 还是先做桌面 UI~~ | 排序 | 已定：先做 Hub（第 4 段），桌面 UI 顺延 |
@@ -584,6 +630,9 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 
 ## 11. 风险与陷阱（已踩过，勿重犯）
 
+- **Windows 未签名 exe 启动提示**：从 Explorer 双击未签名的构建会弹“打开文件 - 安全警告 / 未知发布者”，进程挂起等待“运行”；每次重建都会因哈希变化再次触发。处理：每台开发机执行一次 `spike/scripts/setup-dev-signing.ps1`，构建统一走 `spike/scripts/build-windows-ui.ps1`（自动签名）。不要关闭系统安全提示。
+- **exe 为 Low 完整性级别时同样会弹“无法验证发布者”**：签名有效、证书已进 `CurrentUser\Root` 与 `TrustedPublisher`、`signtool verify /pa` 通过也不够；Agent 沙箱或 CI 创建的文件会继承 `Mandatory Label\Low`，Explorer 仍按不可信文件处理。`sign-windows-exe.ps1` 在验签后执行 `icacls "$exe" /setintegritylevel Medium`，不要删掉这一步。排查：`icacls <exe>` 看 mandatory label；`signtool verify /pa /v` 只验证签名链，不验证完整性级别。
+- Windows 桌面 UI 已定 Slint（D11）：不要再引入 WinUI 3 / `uniffi-bindgen-cs` / .NET，也不要让 Slint 出现在 `apps/desktop` 之外。Windows 与 Linux 共用 `.slint`，平台差异放 `src/platform/`。
 - `keyring` 缺平台特性会静默不存，必须检查实际钥匙串。
 - SQLCipher 原始密钥只能写成 `PRAGMA key = "x'<hex>'"`；`PRAGMA key = x'<hex>'`（裸 blob 字面量）是语法错误。
 - 主密钥条目名 `master-key` 与账户密码条目 `account:<email>:password` 不同；`MASTER_KEY_REF` 或 HKDF info（`eyrie/sqlite/v1`）一旦变更，既有库永久打不开。
