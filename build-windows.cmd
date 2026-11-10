@@ -8,7 +8,7 @@ echo.
 if not "%EXITCODE%"=="0" (
     echo Build FAILED.
 ) else (
-    echo Build OK: %~dp0target\release\siskin-windows-spike.exe
+    echo Build OK: %~dp0target\release\siskin-desktop.exe
     echo Double-click that exe to start it.
 )
 

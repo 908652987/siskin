@@ -1,8 +1,8 @@
 # 开工前验证报告
 
-日期：2026-10-28
-环境：macOS 27.0.1 (arm64)、Rust 1.99.1、Swift 6.4、Dovecot 2.3.19.1（Docker）、Python 3 + dateutil 2.9
-范围：S1 IMAP、S2 macOS 列表、S3 Windows UI（待执行）、S4 HTML 安全、S5 日历重复规则
+日期：2026-10-28（S3-Windows 补充于 2026-11-10）
+环境：macOS 27.0.1 (arm64)、Rust 1.99.1、Swift 6.4、Dovecot 2.3.19.1（Docker）、Python 3 + dateutil 2.9；Windows 11 x64、Rust 1.99.1 MSVC、VS 2022 Build Tools、Windows SDK 10.0.26100、WebView2 Evergreen
+范围：S1 IMAP、S2 macOS 列表、S3 Windows UI、S3-FFI、S4 HTML 安全、S5 日历重复规则
 
 **未使用任何真实邮箱凭据**；真实提供商只做了未登录的能力探测。
 
@@ -14,6 +14,7 @@
 |---|---|---|
 | S1 IMAP 同步 | **通过（有条件）** | 1 万封头部同步 1.10 s（9,116 封/秒），峰值内存 7.0 MB，IDLE 通知 1.32 s |
 | S2 macOS 十万封列表 | **通过** | 10 万行 RSS 97 MB，滚动单步 p95 0.74 ms，建窗口 28.6 ms |
+| S3-Windows Slint 桌面 | **通过** | 主进程私有工作集 5.59 MB、空闲 CPU 0%、首窗 63–80 ms、10 万行滚动 258.8 fps、WebView2 84 MB（见 §10） |
 | S3-FFI UniFFI 跨语言 | **部分通过** | Swift 侧 50 行/次调用 73.5 µs；Kotlin 绑定可生成；Windows 改 Slint 同进程（见 §10） |
 | S4 邮件 HTML 安全 | **通过（需一条修正）** | 9 组攻击样本 0 失败；净化后外部请求 0，未净化页面会加载追踪像素 |
 | S5 日历重复规则 | **通过（需一条修正）** | 22 例对 dateutil 21 通过，1 例为夏令时空洞时间 |
@@ -83,9 +84,9 @@
 | 25 万行跨语言传输 | 368 ms |
 | 进程 RSS | 6.5 MB |
 | Kotlin 绑定 | 生成成功（未接 Android 工程编译） |
-| Windows Slint | **未执行**：见 §10；WinUI 3 + C# 方案已作废（D11） |
+| Windows Slint | **S3 通过**（见 §10）；WinUI 3 + C# 方案已作废（D11） |
 
-结论：FFI 单页调用比 1 ms 预算低一个数量级，分页 50 条的设计成立。Windows 侧改为 Slint 同进程调用（D11），仍需在真机上验证内存、CPU、输入法、无障碍与 WebView2 嵌入（见 §10）。
+结论：FFI 单页调用比 1 ms 预算低一个数量级，分页 50 条的设计成立。Windows 侧改为 Slint 同进程调用（D11），内存、CPU、滚动、WebView2 嵌入与 UIA 已通过 S3；输入法与高 DPI 仍待人工验收（见 §10）。
 
 ---
 
@@ -187,30 +188,48 @@ cargo run --release --bin uniffi-bindgen -- generate \
 
 ---
 
-## 10. S3-Windows：Slint 桌面（待执行）
+## 10. S3-Windows：Slint 桌面（通过，2026-11-10）
 
-状态：**环境已就绪，最小窗口基线已测，完整 S3 待执行**（2026-11-10）。Windows 11 x64、Rust stable MSVC、VS 2022 Build Tools、Windows SDK、WebView2 Runtime。
+状态：**通过**。探针即 `apps/desktop`（`siskin-desktop`）：Slint 1.18.1、wry 0.57.2（WebView2 子窗口）、release、软件渲染 + 系统字体 + 无障碍，1000×680，`CN=Siskin Dev` 签名且完整性级别 Medium。
 
-### 10.1 已测基线
+环境：Windows 11 x64（10.0.26100）、Rust 1.99.1 MSVC、VS 2022 Build Tools、Windows SDK 10.0.26100、WebView2 Evergreen。
 
-探针：`spike/windows-ui`（`siskin-windows-spike`），Slint 1.18.1，release，900×600，软件渲染 + 系统字体 + 无障碍，`CN=Siskin Dev` 签名。
+### 10.1 实测
 
-| 指标 | 结果 |
-|---|---|
-| 首窗（`Start-Process` 到 `MainWindowHandle`） | 220 ms |
-| 私有工作集（Task Manager Memory，10 s / 500 ms） | 4.6 MB |
-| 私有提交 | 5.4 MB |
-| 工作集 | 24.3 MB |
-| 空闲 CPU（10 s） | 0.0% |
-| 对照：femtovg/OpenGL 后端 | 118.9 MB 私有工作集（同一最小窗口，默认特性临时探针） |
+| 指标 | 结果 | 门槛 |
+|---|---|---|
+| 首窗（CreateProcess → `MainWindowHandle`，3 次） | 80 / 63 / 63 ms | ≤1.5 s |
+| 主进程私有工作集（Task Manager Memory，60 s） | min 5.52 / avg 5.59 / max 5.62 MB | ≤100 MB |
+| 主进程私有提交 | avg 6.35 MB | — |
+| 主进程工作集 | avg 26.7 MB | — |
+| 空闲 CPU（60 s 平均） | 0.0%（max 0%） | ≤0.5% |
+| 10 万行滚动 | 258.8 fps（均值 3.86 ms，p95 4.46 ms，300 帧；另一次 260.0 fps / 3.85 ms / 4.50 ms） | ≥55 fps |
+| 单封 HTML 阅读（WebView2） | 6 个子进程，Private WS 84.05 MB @15 s | ≤150 MB |
+| 阅读时主进程增量 | 私有工作集 +0.82 MB（6.41 vs 5.59），工作集 +7.25 MB | ≤30 MB |
+| 关闭阅读 | `msedgewebview2` 后代 0；主进程回到 6.36 MB | 回落 |
+| UIA 树 | 根 Window + 37 个节点，按钮与行文本可枚举 | 可用 |
 
-软件渲染避开了 OpenGL/显卡驱动的私有分配；静态窗口空闲 CPU 为 0。**这不是 S3 通过**：10 万行虚拟列表滚动、WebView2 阅读、中文输入法、Narrator/UIA 尚未测。
+方法说明：
 
-方法：
+- 首窗时间按 CreateProcess 到 `MainWindowHandle` 出现计，作为冷启动代理指标；首帧实际绘制完成未单独计时。
+- 软件渲染不支持 `Window::set_rendering_notifier`（返回 “The rendering backend does not support rendering notifiers”）。滚动帧率改用 `Window::take_snapshot()` 做 300 帧离屏渲染计时，覆盖布局、行回收与绘制，不含窗口呈现/vsync；对软件后端这是主要成本。
+- WebView2 内存按 `siskin-desktop` 后代进程中 `msedgewebview2.exe` 的 `WorkingSetPrivate` 汇总；主进程同样取 `WorkingSetPrivate`。
+- 10 万行模型只缓存当前 50 行，其余按需生成；接入真实 `mail-core` 数据后需复测。
+- 早期最小窗口对照：femtovg/OpenGL 后端私有工作集 118.9 MB，软件渲染 4.6 MB（同一窗口、默认特性临时探针）。
 
-1. 安装 Rust MSVC 工具链与 Visual Studio Build Tools 的 C++ 工作负载；用 `powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/check-windows-ui-prereqs.ps1` 复查（默认 Restricted 执行策略会拒绝未签名脚本）。
-2. 建 `apps/desktop` 最小 Slint 骨架：10 万行虚拟列表（模型只持有当前页 50 条），另加单封 HTML 阅读（WebView2，JS 关闭，池化 1 个）。
-3. 用 `powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/measure-windows-process.ps1 -ProcessName siskin-desktop -Seconds 60` 采样：私有工作集、工作集、CPU、`msedgewebview2.exe` 子进程（默认包含后代进程）。
-4. 人工验证：微软拼音组合、Narrator/UIA、125/150/200% DPI、剪贴板与文本选择；Slint 默认渲染后端启动与回退。
+### 10.2 未验证（需人工/真机）
 
-通过标准：主进程私有工作集 ≤100 MB；空闲 CPU ≤0.5%；冷启动首帧 ≤1.5 s；10 万行滚动 ≥55 fps；WebView2 子进程 ≤150 MB 且关闭阅读后回落。
+- 首帧绘制完成的精确时间未测（只测到窗口句柄出现）。
+- 微软拼音组合与候选窗、Narrator 实际朗读、125/150/200% DPI、剪贴板与文本选择：探针已放入 `TextEdit` 与 WebView2 正文，尚未逐项人工验收。
+- 渲染后端回退：当前构建只含 software renderer，未测 femtovg 失败后的回退路径。
+- 真实 10 万封库的滚动（当前为合成行）；接入 `mail-core` 后按同一脚本复测。
+
+### 10.3 命令
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/build-windows-ui.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/measure-windows-process.ps1 -ProcessName siskin-desktop -Seconds 60 -RootOnly
+$env:SISKIN_S3_AUTOMATION="bench"; .\target\release\siskin-desktop.exe
+$env:SISKIN_S3_AUTOMATION="reading"; $env:SISKIN_S3_READING_SECONDS="30"; .\target\release\siskin-desktop.exe
+Get-Content target\release\siskin-s3-probe.log
+```

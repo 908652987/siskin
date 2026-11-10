@@ -8,7 +8,7 @@
 
 ## 1. 一句话状态
 
-邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（含 `create`/`destroy`）、`Email/import`、`Thread/get|changes`、多副本移动、`/upload`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM 未做；**Hub 已内置后台同步**（IDLE 池 + 扫尾，进程内按账户启动/重连）、`/healthz`、容器镜像与卷内文件密钥后端/主密钥注入）；**macOS 客户端已可收发**：列表/阅读/搜索、撰写（To/Cc/Bcc + 多附件，`mail-ffi::send`）与 `dist/Siskin.app` 打包完成，通知未做；Linux 与 Windows 桌面 UI 统一 Slint（D11/D12；`apps/desktop` 未创建），Windows 先做 Spike S3；日历、手机客户端尚未开始。
+邮箱同步内核已完成并通过实测（10,002 封全量 1.0 s、增量 5 ms、IDLE 新邮件 43 ms），本地库已切 SQLCipher 加密；接收支持 IMAP 与 POP3，发送支持 SMTP，三者均支持 TLS/STARTTLS（明文需显式开关）；正文与附件已按需拉取（IMAP 走 BODYSTRUCTURE + `BODY.PEEK`，POP3 整封解析），HTML 经 ammonia 净化后入库，二次打开纯离线命中，**正文前 4,000 字已进全文索引**；**`watch` 已覆盖账户下全部可选邮箱**（IDLE 会话池 + 轮询扫尾，只推送真实变更）；IMAP 账户可遍历全部可选邮箱并按 SPECIAL-USE 映射角色，服务器删掉的邮箱进入本地回收站（默认保留 90 天，可配、自动清理）；提供 Gmail/QQ/88/自定义预设；认证为密码/应用专用密码：**Outlook 不接**（微软已禁用密码登录且需 OAuth2 应用身份），**Gmail 走应用专用密码**（待真实账户验证）；变更日志已做快照压缩（默认超过 20,000 行触发，水位不倒退）；**Hub JMAP 子集已到读写**（`mail-api` + `mail-hub`：Session、`Mailbox/get|changes`、`Email/query|get|changes|set`（含 `create`/`destroy`）、`Email/import`、`Thread/get|changes`、多副本移动、`/upload`、SSE、附件下载、设备吊销、配对与 Bearer 鉴权，正文按需拉取；APNs/FCM 未做；**Hub 已内置后台同步**（IDLE 池 + 扫尾，进程内按账户启动/重连）、`/healthz`、容器镜像与卷内文件密钥后端/主密钥注入）；**macOS 客户端已可收发**：列表/阅读/搜索、撰写（To/Cc/Bcc + 多附件，`mail-ffi::send`）与 `dist/Siskin.app` 打包完成，通知未做；Linux 与 Windows 桌面 UI 统一 Slint（D11/D12），Windows 的 S3 已通过（`apps/desktop` 探针：10 万行离屏 258.8 fps、主进程私有工作集 5.59 MB、WebView2 84 MB），正式 UI 未开始；日历、手机客户端尚未开始。
 
 ---
 
@@ -79,9 +79,9 @@
 | macOS 撰写 | 完成 | `ComposeView` + `mail-ffi::send`：To/Cc/Bcc、主题、纯文本正文、多附件（NSOpenPanel + UTType MIME）、发送失败保留草稿；⌘N / 工具栏入口；Dovecot + 本地 SMTP sink 实发，`Sent` 归档 |
 | macOS `.app` 打包 | 完成 | `apps/macos/package.sh`：release 静态链接 + `Info.plist`（`com.eyrie.siskin`）+ 资源 bundle + ad-hoc 签名；`dist/Siskin.app` 直接启动并渲染撰写快照 |
 | macOS 通知 | 未开始 | 需要 FFI 事件流与通知权限，单独一段 |
-| Windows / Linux 桌面 UI | 未开始（栈已定） | D11/D12：Slint 单进程直连 `mail-core`；`apps/desktop` 未创建；先做 Spike S3 |
+| Windows / Linux 桌面 UI | S3 通过，正式 UI 未开始 | D11/D12：Slint 单进程直连 `mail-core`；S3 探针在 `apps/desktop`（100k 虚拟列表 + WebView2 阅读），数据见 §7 |
 | iOS / Android UI | 未开始 | 按 D2；依赖 Hub 推送凭据 |
-| Windows UI 验证 | 工具链就绪，基线已测（2026-11-10） | Rust stable MSVC + VS 2022 Build Tools + Windows SDK + WebView2；Slint 1.18.1 最小窗口（软件渲染）首窗 220 ms、私有工作集 4.6 MB、工作集 24.3 MB、空闲 CPU 0.0%；完整 S3 待测 |
+| Windows UI 验证 | **S3 通过（2026-11-10）** | Slint 1.18.1 + wry 0.57.2；首窗 63–80 ms、主进程私有工作集 5.59 MB、空闲 CPU 0%、10 万行离屏渲染 258.8 fps、WebView2 84 MB；UIA 树可用；输入法/Narrator 朗读/高 DPI 仍待人工 |
 | 代码规范与风格固化 | 完成 | `AGENTS.md` + `docs/CONVENTIONS.md` + rustfmt/clippy/CI |
 
 ---
@@ -186,6 +186,11 @@ apps/
   macos/build.sh          编译 mail-ffi → 生成 Swift 绑定 → swift build（debug，开发用）
   macos/package.sh        同上 + release 构建 → Siskin.app（Info.plist、资源 bundle、ad-hoc 签名）
   macos/Info.plist        bundle 标识 com.eyrie.siskin、最低 macOS 14
+  desktop/Cargo.toml      siskin-desktop：Slint + wry（仅 Windows 依赖 WebView2）
+  desktop/ui/app.slint    S3 探针：100k 行 ListView、WebView2 占位、渲染基准、IME 输入框
+  desktop/src/main.rs     行模型接入、阅读窗开关、离屏渲染基准、无人值守开关
+  desktop/src/model.rs    只缓存当前 50 行的 100k 行 Slint Model
+  desktop/src/platform/   windows.rs（wry 子窗口）、stub.rs（非 Windows 占位）
 spike/
   imap-probe/              能力探测与 1 万封压测
   rrule-probe/             重复规则（对照 dateutil）
@@ -394,6 +399,18 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
   apps/macos/dist/Siskin.app/Contents/MacOS/Siskin
 # Finder 启动不带环境变量：会走钥匙串并按 cdhash 再弹一次授权，属预期
 
+# 4.5) Windows 桌面探针（apps/desktop；S3 已通过）
+# 构建必须走脚本：签名 + 把完整性级别设为 Medium；直接 cargo build 后双击会弹“未知发布者”
+powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/build-windows-ui.ps1
+target\release\siskin-desktop.exe
+# 无人值守：滚动基准 / 打开正文 30 s 后关闭；结果写入 exe 同目录 siskin-s3-probe.log
+$env:SISKIN_S3_AUTOMATION="bench"; target\release\siskin-desktop.exe
+$env:SISKIN_S3_AUTOMATION="reading"; $env:SISKIN_S3_READING_SECONDS="30"; target\release\siskin-desktop.exe
+Get-Content target\release\siskin-s3-probe.log
+powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/measure-windows-process.ps1 -ProcessName siskin-desktop -Seconds 60 -RootOnly
+# Windows 上 clippy/test 若报 cl D8050，把 TMP/TEMP 指到仓库内可写目录再跑：
+#   $env:TMP = "$PWD\tmp\cl-tmp"; $env:TEMP = $env:TMP
+
 # 5) 选下一项：见 §9
 ```
 
@@ -427,14 +444,15 @@ SISKIN_DB=/tmp/smoke.db EYRIE_DEV_SECRET_DIR=/tmp/eyrie-dev-secrets \
 | Rust | stable MSVC 工具链（`x86_64-pc-windows-msvc`） |
 | C++ | Visual Studio 2022 Build Tools：`VCTools` 工作负载 + Windows SDK |
 | WebView2 | Evergreen Runtime |
-| 构建 | `spike/scripts/build-windows-ui.ps1`（构建后自动签名） |
+| 构建 | `spike/scripts/build-windows-ui.ps1`（构建 `apps/desktop`，签名并把完整性级别设为 Medium） |
 | 首次准备 | 每台机器执行一次 `spike/scripts/setup-dev-signing.ps1` |
+| C 构建 | `cargo clippy/test` 若报 `cl D8050`，把 `TMP`/`TEMP` 指到仓库内可写目录（如 `tmp/cl-tmp`）再跑；OpenSSL 可用 `OPENSSL_NO_VENDOR=1 OPENSSL_DIR=<prefix>` 复用本机构建 |
 
 任一 Windows 开发机首次拉取后：
 
 1. 安装 Rust（MSVC 工具链）与 VS Build Tools 的 C++ 工作负载。
 2. **双击 `build-windows.cmd`**：首次运行会自动准备本机签名证书，然后编译并签名。
-3. **双击 `target\release\siskin-windows-spike.exe`**：直接启动，不再有安全提示。
+3. **双击 `target\release\siskin-desktop.exe`**：直接启动，不再有安全提示。
 
 `setup-windows.cmd` 仍保留，用于只检查环境/只准备证书；正常构建不需要单独运行。
 
@@ -544,6 +562,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/build-windows-
 | Hub `/healthz` | 匿名 200；字段 `status/database/accounts/lastSyncAt/sync{enabled,watchers,events,sweepSeconds,idleSessions}` |
 | Hub 主密钥注入 | 空密钥目录 + `EYRIE_HUB_MASTER_KEY_FILE` 打开已有库：`healthz` 200、账户 1；不带 key 启动退出码 1，`database key does not match this file` |
 | Hub 容器（Dockerfile） | 镜像构建成功；容器内 `/healthz` 200、`docker inspect` 显示 `healthy`；仓库外挂 `/data` + `/secrets` 后后台同步自动生效，投递一封不跑 CLI：`Email/query` total 10027→10028 |
+| Windows S3：首窗（CreateProcess → `MainWindowHandle`） | 80 / 63 / 63 ms（3 次，release，1000×680） |
+| Windows S3：空闲（60 s，`WorkingSetPrivate`） | 私有工作集 min 5.52 / avg 5.59 / max 5.62 MB；私有提交 6.35 MB；工作集 26.7 MB；CPU 0.0% |
+| Windows S3：10 万行滚动 | 258.8 fps（离屏 `take_snapshot` 300 帧：均值 3.86 ms、p95 4.46 ms；另一次 260.0 fps / 3.85 ms / 4.50 ms）；软件渲染不支持 rendering notifier |
+| Windows S3：WebView2 阅读（本地 HTML，JS 关闭） | 6 个后代 `msedgewebview2.exe`，Private WS 84.05 MB @15 s；主进程 +0.82 MB；关闭后子进程 0、主进程 6.36 MB |
+| Windows S3：UIA | 根 Window + 37 个节点；按钮、列表行文本可枚举；输入法/Narrator 朗读/高 DPI 未人工验收 |
 
 完整方法与命令见 `docs/SPIKE-REPORT.md`。
 
@@ -558,7 +581,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/build-windows-
 5. **B/C 档未实跑**。**验收**：iCloud（C 档）账户实际同步，移动邮件走 COPY+删除；B 档需一台不广告 CONDSTORE 的服务器。
 6. ~~**重连未做故障注入**~~。已在 `watch_account` 下实测：4 个 IDLE 会话在 Dovecot 重启时同时断线，按 1/2/4 s 退避重连，恢复后新邮件正常入库且无重复行。未覆盖：网络分区（连接挂起而非断开）与「重连后服务端丢了 UIDVALIDITY」之外的乱序响应。
 7. **中文 1–2 字搜索走 LIKE 扫描**，现在同时扫正文列。10k 封（正文约 3,800 字/封）实测 2 字查询 137 ms；10 万封按线性外推约 1.4 s，**未验证**。**验收**：10 万封下 2 字查询 P95 < 150 ms（需要专门的分词/前缀索引，不能靠 LIKE）。
-8. **Windows/移动端零验证**。**验收**：Slint 主进程空闲私有工作集 ≤ 100 MB、空闲 CPU ≤ 0.5%、10 万封滚动 ≥ 55 fps；单 WebView2 实例 ≤ 150 MB（子进程单列）；中文输入法与 Narrator/UIA 可用。详见 `docs/ARCHITECTURE.md` §15.3。
+8. **Windows 正式 UI 未开始**。S3 已通过（主进程私有工作集 5.59 MB、空闲 CPU 0.0%、首窗 63–80 ms、10 万行离屏 258.8 fps、WebView2 84 MB、UIA 树可用）。剩余：微软拼音组合、Narrator 实际朗读、125/150/200% DPI、剪贴板与文本选择的人工验收；渲染后端回退；接入 `mail-core` 的真实 10 万封滚动。详见 `docs/ARCHITECTURE.md` §15.3 与 `docs/SPIKE-REPORT.md` §10。
 9. **POP3 语义受限**。无文件夹、无标志位、无 IDLE；本地删除仅影响本地，服务器删除通过 UIDL 列表消失检测；UIDL 以 63 位哈希映射为数字 uid。**验收**：真实 POP3 账户同步与删除行为符合预期。
 10. **发信能力窄**。仅纯文本 UTF-8；无附件、HTML、草稿；Sent 归档仅在 IMAP 账户尝试。**验收**：真实账户收到邮件，Sent 归档或明确报错。
 11. **明文端口需显式开关**。`--security plaintext` 或 `--smtp-security plaintext` 必须同时给 `--insecure-plaintext true`；QQ 的 143/110 不提供 STARTTLS。
@@ -600,7 +623,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/build-windows-
 
 10. 客户端双模式（D13）：首次运行选择本地/远程；远程填服务端地址 + 设备令牌（配对时绑定账户）；抽象 UI 数据源（FFI 本地 / JMAP 远程）；独立缓存与清缓存。远程发送已就绪（标准 `EmailSubmission/set`），客户端需在 FFI 侧暴露「按 compose 字段生成 RFC 822 + envelope」的助手，避免 Swift 再写一套 MIME。
 11. macOS SwiftUI：列表/阅读/搜索/同步/标已读/撰写（To/Cc/Bcc + 附件）/`.app` 打包完成；剩余通知、草稿、真实多账户切换。
-12. Windows/Linux Slint（`apps/desktop`，workspace 成员，单进程调用 `mail-core`；先做列表/阅读/搜索，再补撰写与设置）。栈已定（D11/D12），实现未开始。**第一步是 Spike S3**：用 `check-windows-ui-prereqs.ps1` 复查环境；构建必须走 `spike/scripts/build-windows-ui.ps1`（构建后自动签名，避免 Windows 附件管理器拦截）；再用 `measure-windows-process.ps1 -ProcessName siskin-windows-spike` 记录内存/CPU。首窗、空闲内存/CPU 基线已测，10 万行滚动、WebView2、输入法与无障碍仍待测；达标后开始 UI。
+12. Windows/Linux Slint（`apps/desktop`，workspace 成员，单进程调用 `mail-core`）。**Spike S3 已通过（2026-11-10）**：`siskin-desktop` 已有 100k 行虚拟列表、WebView2 阅读、离屏滚动基准与无人值守开关，数据见 §7 与 `docs/SPIKE-REPORT.md` §10。下一步：把合成行模型替换为 `mail-core` 分页查询，补齐列表/阅读/搜索/设置，再做撰写；输入法、Narrator、高 DPI 需人工验收。构建统一走 `spike/scripts/build-windows-ui.ps1`（签名 + Medium 完整性）。
 
 ### 远程模式部署分布（D13，推荐）
 
@@ -633,6 +656,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/build-windows-
 - **Windows 未签名 exe 启动提示**：从 Explorer 双击未签名的构建会弹“打开文件 - 安全警告 / 未知发布者”，进程挂起等待“运行”；每次重建都会因哈希变化再次触发。处理：每台开发机执行一次 `spike/scripts/setup-dev-signing.ps1`，构建统一走 `spike/scripts/build-windows-ui.ps1`（自动签名）。不要关闭系统安全提示。
 - **exe 为 Low 完整性级别时同样会弹“无法验证发布者”**：签名有效、证书已进 `CurrentUser\Root` 与 `TrustedPublisher`、`signtool verify /pa` 通过也不够；Agent 沙箱或 CI 创建的文件会继承 `Mandatory Label\Low`，Explorer 仍按不可信文件处理。`sign-windows-exe.ps1` 在验签后执行 `icacls "$exe" /setintegritylevel Medium`，不要删掉这一步。排查：`icacls <exe>` 看 mandatory label；`signtool verify /pa /v` 只验证签名链，不验证完整性级别。
 - Windows 桌面 UI 已定 Slint（D11）：不要再引入 WinUI 3 / `uniffi-bindgen-cs` / .NET，也不要让 Slint 出现在 `apps/desktop` 之外。Windows 与 Linux 共用 `.slint`，平台差异放 `src/platform/`。
+- 软件渲染后端不支持 `Window::set_rendering_notifier`（返回 “The rendering backend does not support rendering notifiers”）；S3 帧率用 `Window::take_snapshot()` 做离屏计时，不要因此改回 OpenGL（femtovg 私有工作集 118.9 MB）。
+- WebView2 由 `wry::WebViewBuilder::build_as_child` 托管为 Slint 窗口的子窗口，JS 用 `with_javascript_disabled()` 关闭；不要在 HTML/JS 层做安全兜底。`spike/windows-ui` 已删除，不要恢复成第二套 Slint 探针。
+- 测量 WebView2 内存只能汇总 `siskin-desktop` 后代进程里的 `msedgewebview2.exe`；整机同名进程包含浏览器与编辑器，求和会到 GB 级。
+- Windows 上 cargo 的 C 构建（ring/OpenSSL）若 `TMP` 指向沙箱临时目录，cl 报 `D8050 cannot execute c1.dll`；把 `TMP`/`TEMP` 指到仓库 `tmp/` 下再跑 clippy/test。
 - `keyring` 缺平台特性会静默不存，必须检查实际钥匙串。
 - SQLCipher 原始密钥只能写成 `PRAGMA key = "x'<hex>'"`；`PRAGMA key = x'<hex>'`（裸 blob 字面量）是语法错误。
 - 主密钥条目名 `master-key` 与账户密码条目 `account:<email>:password` 不同；`MASTER_KEY_REF` 或 HKDF info（`eyrie/sqlite/v1`）一旦变更，既有库永久打不开。

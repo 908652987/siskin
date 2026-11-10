@@ -13,7 +13,7 @@
     Certificate subject; must match setup-dev-signing.ps1.
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/sign-windows-exe.ps1 -Path target/release/siskin-windows-spike.exe
+    powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/sign-windows-exe.ps1 -Path target/release/siskin-desktop.exe
 #>
 [CmdletBinding()]
 param(

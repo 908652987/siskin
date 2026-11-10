@@ -199,7 +199,7 @@ flowchart LR
 │   ├── mail-hub/               # 服务端二进制
 ├── apps/                       # 各平台 UI 一律放这里，不混进 crates/
 │   ├── macos/                  # SwiftUI
-│   ├── desktop/                # Slint（Windows/Linux 共用，workspace 成员，未创建）
+│   ├── desktop/                # Slint（Windows/Linux 共用，workspace 成员）
 │   ├── ios/                    # SwiftUI
 │   └── android/                # Kotlin + Compose
 ├── docs/
@@ -782,9 +782,12 @@ CI 门禁：`fmt`、`clippy -D warnings`、`test`、`deny`、`bench`、产物体
 4. Slint 渲染后端：Windows 默认后端启动成功；失败时可回退且不崩溃；空闲 CPU 达标。
 5. 测量脚本：`powershell -NoProfile -ExecutionPolicy Bypass -File spike/scripts/measure-windows-process.ps1`（私有工作集、工作集、CPU、WebView2 子进程）。
 
+实测（2026-11-10，`apps/desktop`）：私有工作集 5.59 MB、空闲 CPU 0.0%、首窗 63–80 ms、10 万行离屏渲染 258.8 fps、WebView2 84.05 MB、UIA 树可用。方法、命令与未验证项见 `docs/SPIKE-REPORT.md` §10。
+
 ### 15.4 风险与未验证
 
-- Slint 在 Windows 的中文输入法组合、UIA 树与 WebView2 子窗口嵌入未在本仓库验证，是选型成立的前提。
+- Slint 在 Windows 的 WebView2 子窗口嵌入、UIA 树与内存/CPU 已在真机通过 S3；微软拼音组合、Narrator 实际朗读、125/150/200% DPI、剪贴板与文本选择仍未人工验收。
+- WebView2 由 `wry`（MIT/Apache-2.0，仅 `apps/desktop`、仅 Windows 目标）托管；Linux 的 HTML 阅读需要另行验证 WebKitGTK 路径，不在 S3 范围。
 - Slint 的 GPL-3.0 与 AGPL-3.0 组合可用（AGPL §13），仍需在依赖政策中登记并核对具体版本。
 - Windows 开发构建必须签名：未签名 exe 从 Explorer 启动会触发 Windows 的“未知发布者”提示，进程挂起等待放行；使用 `spike/scripts/build-windows-ui.ps1` 构建并签名。发布给用户的包必须用受信任的代码签名证书；见 `docs/HANDOFF.md` §6.1/§11。
 - 若 Slint 在 S3 任一项不达标，退回 egui（MDM 已验证），不回 WinUI 3。

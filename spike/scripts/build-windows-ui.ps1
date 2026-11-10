@@ -40,7 +40,7 @@ if ($null -eq $cargo) {
     $cargoPath = $cargo.Source
 }
 
-$arguments = @('build', '-p', 'siskin-windows-spike')
+$arguments = @('build', '-p', 'siskin-desktop')
 if ($Profile -eq 'release') {
     $arguments += '--release'
 }
@@ -52,7 +52,7 @@ try {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
 
-    $exe = Join-Path $repoRoot ('target\{0}\siskin-windows-spike.exe' -f $Profile)
+    $exe = Join-Path $repoRoot ('target\{0}\siskin-desktop.exe' -f $Profile)
     & (Join-Path $PSScriptRoot 'sign-windows-exe.ps1') -Path $exe
 } finally {
     Pop-Location

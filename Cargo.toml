@@ -15,7 +15,7 @@ members = [
   "spike/rrule-probe",
   "spike/html-probe",
   "spike/ffi-probe",
-  "spike/windows-ui",
+  "apps/desktop",
 ]
 
 [workspace.metadata]

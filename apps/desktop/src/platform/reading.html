@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>Siskin HTML probe</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 24px;
+        color: #111827;
+        background: #ffffff;
+        font: 15px/1.55 "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+      h1 { font-size: 22px; margin: 0 0 12px; }
+      p { margin: 8px 0; }
+      table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+      th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; }
+      th { background: #f3f4f6; font-weight: 600; }
+      code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <h1>Siskin S3 阅读窗</h1>
+    <p>这是 WebView2 渲染的本地 HTML：脚本已禁用，未加载任何外部资源。</p>
+    <p>用它可以测量单实例内存、文本选择、中文显示与高 DPI 缩放。</p>
+    <table>
+      <thead>
+        <tr><th>项目</th><th>预期</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>主进程增量</td><td>≤ 30 MB</td></tr>
+        <tr><td>msedgewebview2.exe 子进程</td><td>≤ 150 MB</td></tr>
+        <tr><td>关闭阅读后</td><td>回落到基线</td></tr>
+        <tr><td>脚本</td><td><code>IsScriptEnabled = false</code></td></tr>
+      </tbody>
+    </table>
+    <p>滚动条、选中文本、复制粘贴都应使用系统行为。</p>
+  </body>
+</html>
